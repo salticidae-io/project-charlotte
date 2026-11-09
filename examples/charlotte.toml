@@ -60,6 +60,11 @@ index = "index.html"
 # Optional. Falls back to --no-listing / the default of true.
 listing = false
 
+# Optional. Try candidates in order; the final entry is an internal URI
+# fallback or a status such as =404. Supported variables are $uri, $args,
+# $query_string and $is_args. For example:
+# try_files = ["$uri", "$uri/", "/index.html", "=404"]
+
 # Optional. Requires global rules supplied with --modsecurity-rules. Rule IDs
 # and inclusive ID ranges can be disabled for this vhost only; the rule-file
 # ruleset remains active for every other host. For example:

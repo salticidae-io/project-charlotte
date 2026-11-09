@@ -30,6 +30,7 @@ pub struct Config {
     pub vhost_dir: Option<PathBuf>,
     pub index: String,
     pub listing: bool,
+    pub try_files: Vec<String>,
     pub fastcgi: Vec<FastCgiBackend>,
     pub fastcgi_timeout: Duration,
     pub threads: Option<usize>,
@@ -73,6 +74,7 @@ impl Config {
         let mut root = PathBuf::from(".");
         let mut index = String::from("index.html");
         let mut listing = true;
+        let mut try_files = Vec::new();
         let mut fastcgi = Vec::new();
         let mut fastcgi_app_args = Vec::new();
         let mut fastcgi_app_env = Vec::new();
@@ -100,6 +102,7 @@ impl Config {
                 "--help" | "-h" => return Ok(ParseResult::Help),
                 "--worker" => worker = true,
                 "--no-listing" => listing = false,
+                "--try-files" => try_files.push(next_value(&mut args, "--try-files")?),
                 "--fastcgi" => {
                     let value = next_value(&mut args, "--fastcgi")?;
                     let backend = parse_fastcgi_backend(&value)?;
@@ -275,6 +278,7 @@ impl Config {
         {
             return Err("--index must be a non-empty file name".to_owned());
         }
+        validate_try_files(&try_files)?;
 
         for (extension, arg) in fastcgi_app_args {
             let Some(FastCgiBackend {
@@ -347,6 +351,7 @@ impl Config {
             vhost_dir,
             index,
             listing,
+            try_files,
             fastcgi,
             fastcgi_timeout,
             threads,
@@ -363,8 +368,66 @@ impl Config {
     }
 
     pub fn usage() -> &'static str {
-        "Usage: project-charlotte [--bind ADDRESS] [--tls-bind ADDRESS] [--root DIRECTORY] [--index NAME] [--no-listing] [--fastcgi EXT=ADDR]... [--fastcgi-app EXT=PROGRAM]... [--fastcgi-app-arg EXT=ARG]... [--fastcgi-app-env EXT=KEY=VALUE]... [--fastcgi-timeout SECS] [--threads N] [--worker-threads N] [--modsecurity-rules FILE]... [--modsecurity-body-limit BYTES] [--config FILE] [--vhost-dir DIRECTORY] [--tls-cert PATH --tls-key PATH] [--acme-directory URL|letsencrypt|letsencrypt-staging --acme-cache DIR] [--acme-contact URI]... [--acme-ca-root PEM] [--http3-bind ADDRESS] [--help]"
+        "Usage: project-charlotte [--bind ADDRESS] [--tls-bind ADDRESS] [--root DIRECTORY] [--index NAME] [--no-listing] [--try-files ENTRY]... [--fastcgi EXT=ADDR]... [--fastcgi-app EXT=PROGRAM]... [--fastcgi-app-arg EXT=ARG]... [--fastcgi-app-env EXT=KEY=VALUE]... [--fastcgi-timeout SECS] [--threads N] [--worker-threads N] [--modsecurity-rules FILE]... [--modsecurity-body-limit BYTES] [--config FILE] [--vhost-dir DIRECTORY] [--tls-cert PATH --tls-key PATH] [--acme-directory URL|letsencrypt|letsencrypt-staging --acme-cache DIR] [--acme-contact URI]... [--acme-ca-root PEM] [--http3-bind ADDRESS] [--help]"
     }
+}
+
+pub(crate) fn validate_try_files(entries: &[String]) -> Result<(), String> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    if entries.len() < 2 {
+        return Err("try_files requires at least two entries".to_owned());
+    }
+
+    for entry in entries {
+        validate_try_files_variables(entry)?;
+    }
+
+    for entry in &entries[..entries.len() - 1] {
+        if !entry.starts_with('/') && !entry.starts_with("$uri") {
+            return Err(format!("invalid try_files candidate: {entry}"));
+        }
+    }
+
+    let fallback = entries.last().expect("non-empty try_files entries");
+    if let Some(code) = fallback.strip_prefix('=') {
+        if code
+            .parse::<u16>()
+            .is_ok_and(|code| (100..=599).contains(&code))
+        {
+            return Ok(());
+        }
+        return Err(format!("invalid try_files status code: {fallback}"));
+    }
+    if !fallback.starts_with('/') || fallback.parse::<http::uri::PathAndQuery>().is_err() {
+        return Err(format!("invalid try_files fallback URI: {fallback}"));
+    }
+    Ok(())
+}
+
+fn validate_try_files_variables(entry: &str) -> Result<(), String> {
+    let bytes = entry.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'$' {
+            index += 1;
+            continue;
+        }
+        let variable = ["$uri", "$args", "$query_string", "$is_args"]
+            .into_iter()
+            .find(|variable| {
+                entry[index..].starts_with(variable)
+                    && bytes
+                        .get(index + variable.len())
+                        .is_none_or(|next| !next.is_ascii_alphanumeric() && *next != b'_')
+            });
+        let Some(variable) = variable else {
+            return Err(format!("unsupported try_files variable in: {entry}"));
+        };
+        index += variable.len();
+    }
+    Ok(())
 }
 
 pub(crate) fn parse_fastcgi_backend(value: &str) -> Result<FastCgiBackend, String> {
@@ -452,7 +515,7 @@ fn next_value(args: &mut impl Iterator<Item = String>, option: &str) -> Result<S
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, FastCgiAddress, ParseResult};
+    use super::{Config, FastCgiAddress, ParseResult, validate_try_files};
     use std::path::PathBuf;
 
     #[test]
@@ -476,6 +539,43 @@ mod tests {
         assert_eq!(config.config_file, None);
         assert_eq!(config.index, "home.htm");
         assert!(!config.listing);
+        assert!(config.try_files.is_empty());
+    }
+
+    #[test]
+    fn parses_and_validates_try_files() {
+        let parsed = Config::parse([
+            "--try-files".to_owned(),
+            "$uri".to_owned(),
+            "--try-files".to_owned(),
+            "$uri/".to_owned(),
+            "--try-files".to_owned(),
+            "/index.html?$args".to_owned(),
+        ])
+        .unwrap();
+        let ParseResult::Config(config) = parsed else {
+            panic!("expected config")
+        };
+        assert_eq!(config.try_files, ["$uri", "$uri/", "/index.html?$args"]);
+
+        assert!(validate_try_files(&[]).is_ok());
+        for entries in [
+            vec!["/only-one".to_owned()],
+            vec!["relative".to_owned(), "=404".to_owned()],
+            vec!["/$unknown".to_owned(), "=404".to_owned()],
+            vec!["/$uri_extra".to_owned(), "=404".to_owned()],
+            vec!["/$uri".to_owned(), "=99".to_owned()],
+            vec!["/$uri".to_owned(), "=600".to_owned()],
+            vec!["/$uri".to_owned(), "not-a-uri".to_owned()],
+            vec!["/$uri".to_owned(), "/bad uri".to_owned()],
+        ] {
+            assert!(validate_try_files(&entries).is_err(), "{entries:?}");
+            let args = entries
+                .iter()
+                .flat_map(|entry| ["--try-files".to_owned(), entry.clone()])
+                .collect::<Vec<_>>();
+            assert!(Config::parse(args).is_err());
+        }
     }
 
     #[test]

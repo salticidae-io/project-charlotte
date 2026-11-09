@@ -61,6 +61,7 @@ struct VhostFile {
     group: Option<String>,
     index: Option<String>,
     listing: Option<bool>,
+    try_files: Option<Vec<String>>,
     #[serde(default)]
     fastcgi: Vec<String>,
     #[serde(default)]
@@ -116,6 +117,7 @@ struct Worker {
     root: PathBuf,
     index: String,
     listing: bool,
+    try_files: Vec<String>,
     fastcgi: Vec<FastCgiBackend>,
     fastcgi_timeout: Duration,
     threads: usize,
@@ -390,6 +392,11 @@ impl Router {
             let index_name = entry.index.unwrap_or_else(|| fallback.index.clone());
             validate_index(&index_name)?;
             let listing = entry.listing.unwrap_or(fallback.listing);
+            let try_files = entry
+                .try_files
+                .unwrap_or_else(|| fallback.try_files.clone());
+            crate::config::validate_try_files(&try_files)
+                .map_err(|error| format!("vhost try_files: {error}"))?;
             let mut fastcgi = entry
                 .fastcgi
                 .iter()
@@ -475,6 +482,7 @@ impl Router {
                 root,
                 index: index_name,
                 listing,
+                try_files,
                 fastcgi,
                 fastcgi_timeout: Duration::from_secs(timeout_seconds),
                 threads,
@@ -717,6 +725,7 @@ impl Worker {
                 &self.root,
                 &self.index,
                 self.listing,
+                &self.try_files,
                 &self.fastcgi,
                 self.fastcgi_timeout,
             ))
@@ -890,6 +899,10 @@ fn validate_vhost_declarations(entries: &[VhostFile]) -> Result<(), Box<dyn Erro
             crate::config::parse_thread_count(&threads.to_string())
                 .map_err(|error| format!("vhost {} worker_threads: {error}", index + 1))?;
         }
+        if let Some(try_files) = &entry.try_files {
+            crate::config::validate_try_files(try_files)
+                .map_err(|error| format!("vhost {} try_files: {error}", index + 1))?;
+        }
         if entry.server_names.is_empty() {
             return Err(format!("vhost {} has no server_names", index + 1).into());
         }
@@ -976,6 +989,7 @@ fn build_worker_args(
     root: &Path,
     index: &str,
     listing: bool,
+    try_files: &[String],
     fastcgi: &[FastCgiBackend],
     timeout: Duration,
 ) -> Vec<OsString> {
@@ -994,6 +1008,10 @@ fn build_worker_args(
     ];
     if !listing {
         args.push("--no-listing".into());
+    }
+    for entry in try_files {
+        args.push("--try-files".into());
+        args.push(entry.clone().into());
     }
     for backend in fastcgi {
         match &backend.address {
@@ -1093,6 +1111,7 @@ mod tests {
             group: None,
             index: None,
             listing: None,
+            try_files: None,
             fastcgi: Vec::new(),
             fastcgi_app: Vec::new(),
             fastcgi_timeout: None,
@@ -1143,6 +1162,29 @@ mod tests {
             entry.worker_threads = Some(invalid);
             assert!(validate_vhost_declarations(std::slice::from_ref(&entry)).is_err());
         }
+    }
+
+    #[test]
+    fn parses_and_validates_vhost_try_files() {
+        let parsed: FileConfig = toml::from_str(
+            r#"
+                [[vhost]]
+                server_names = ["try-files.example"]
+                root = "/srv/site"
+                user = "site"
+                try_files = ["$uri", "$uri/", "/index.html", "=404"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.vhost[0].try_files.as_ref().unwrap(),
+            &["$uri", "$uri/", "/index.html", "=404"]
+        );
+        assert!(validate_vhost_declarations(&parsed.vhost).is_ok());
+
+        let mut entry = declaration(&["try-files.example"], false);
+        entry.try_files = Some(vec!["$uri".to_owned()]);
+        assert!(validate_vhost_declarations(&[entry]).is_err());
     }
 
     #[test]
@@ -1259,6 +1301,7 @@ mod tests {
             Path::new("/srv/example"),
             "home.php",
             false,
+            &["$uri".to_owned(), "=404".to_owned()],
             &[
                 FastCgiBackend {
                     extension: "php".to_owned(),
@@ -1281,6 +1324,8 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(args.windows(2).any(|pair| pair == ["--worker-uid", "1001"]));
         assert!(args.contains(&"--no-listing".to_owned()));
+        assert!(args.windows(2).any(|pair| pair == ["--try-files", "$uri"]));
+        assert!(args.windows(2).any(|pair| pair == ["--try-files", "=404"]));
         assert!(
             args.windows(2)
                 .any(|pair| pair == ["--fastcgi", "php=127.0.0.1:9000"])

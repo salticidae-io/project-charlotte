@@ -124,6 +124,7 @@ pub(crate) fn fuzz_config(root: PathBuf) -> Config {
         vhost_dir: None,
         index: "index.html".to_owned(),
         listing: true,
+        try_files: Vec::new(),
         fastcgi: vec![FastCgiBackend {
             extension: "php".to_owned(),
             address: FastCgiAddress::Tcp("127.0.0.1:9000".to_owned()),

@@ -222,9 +222,15 @@ fn build_params(
 ) -> Params<'static> {
     let path = parts.uri.path();
     let request_uri = parts
-        .uri
-        .query()
-        .map_or_else(|| path.to_owned(), |query| format!("{path}?{query}"));
+        .extensions
+        .get::<handler::OriginalUri>()
+        .map(|uri| uri.0.clone())
+        .unwrap_or_else(|| {
+            parts
+                .uri
+                .query()
+                .map_or_else(|| path.to_owned(), |query| format!("{path}?{query}"))
+        });
     let server_name = parts
         .headers
         .get(header::HOST)
@@ -579,6 +585,7 @@ mod tests {
             vhost_dir: None,
             index: "index.php".to_owned(),
             listing: true,
+            try_files: Vec::new(),
             fastcgi: vec![FastCgiBackend {
                 extension: "php".to_owned(),
                 address: FastCgiAddress::Tcp("127.0.0.1:9000".to_owned()),
@@ -687,6 +694,24 @@ mod tests {
         assert_eq!(params["HTTP_X_TEST"], "present");
         assert!(!params.contains_key("HTTP_PROXY"));
         assert_eq!(params["CONTENT_LENGTH"], "7");
+
+        let mut request = http::Request::builder()
+            .uri("/app.php/info?item=1")
+            .body(())
+            .unwrap();
+        request.extensions_mut().insert(crate::handler::OriginalUri(
+            "/front.php?original=1".to_owned(),
+        ));
+        let (parts, ()) = request.into_parts();
+        let params = build_params(
+            &parts,
+            &script,
+            &config,
+            "192.0.2.1:12345".parse().unwrap(),
+            "192.0.2.10:8080".parse().unwrap(),
+            0,
+        );
+        assert_eq!(params["REQUEST_URI"], "/front.php?original=1");
     }
 
     #[test_fuzz::test_fuzz]

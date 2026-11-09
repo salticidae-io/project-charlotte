@@ -29,6 +29,9 @@ use crate::{
 
 pub(crate) type ResponseBody = UnsyncBoxBody<Bytes, io::Error>;
 
+#[derive(Clone, Debug)]
+pub(crate) struct OriginalUri(pub(crate) String);
+
 pub async fn handle_request<B>(
     request: Request<B>,
     config: Arc<Config>,
@@ -42,29 +45,41 @@ where
     let method = request.method().clone();
     let uri = request.uri().clone();
     let is_head = method == Method::HEAD;
-    let script = match decode_request_path(uri.path()) {
-        Some(path) => fastcgi::resolve_script(&path, uri.path(), &config).await,
-        None => None,
-    };
-    let mut response = if let Some(script) = script {
-        fastcgi::handle_request(request, &config, script, peer, local).await
-    } else if method == Method::OPTIONS {
-        let mut response = response(StatusCode::NO_CONTENT, empty_body());
-        response.headers_mut().insert(
-            header::ALLOW,
-            HeaderValue::from_static("GET, HEAD, OPTIONS"),
-        );
-        response
-    } else if method != Method::GET && !is_head {
-        let mut response = error_response(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed\n");
-        response.headers_mut().insert(
-            header::ALLOW,
-            HeaderValue::from_static("GET, HEAD, OPTIONS"),
-        );
-        response
+    let mut request = request;
+    let mut try_files_response = if config.try_files.is_empty() {
+        None
     } else {
-        route_file_request(&request, &config).await
+        apply_try_files(&mut request, &config).await
     };
+    if try_files_response.is_none() {
+        let uri = request.uri().clone();
+        let script = match decode_request_path(uri.path()) {
+            Some(path) => fastcgi::resolve_script(&path, uri.path(), &config).await,
+            None => None,
+        };
+        try_files_response = Some(if let Some(script) = script {
+            fastcgi::handle_request(request, &config, script, peer, local).await
+        } else if method == Method::OPTIONS {
+            let mut response = response(StatusCode::NO_CONTENT, empty_body());
+            response.headers_mut().insert(
+                header::ALLOW,
+                HeaderValue::from_static("GET, HEAD, OPTIONS"),
+            );
+            response
+        } else if method != Method::GET && !is_head {
+            let mut response =
+                error_response(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed\n");
+            response.headers_mut().insert(
+                header::ALLOW,
+                HeaderValue::from_static("GET, HEAD, OPTIONS"),
+            );
+            response
+        } else {
+            route_file_request(&request, &config).await
+        });
+    }
+    let mut response =
+        try_files_response.expect("try_files or request routing produces a response");
 
     if is_head {
         *response.body_mut() = empty_body();
@@ -76,6 +91,148 @@ where
         .unwrap_or("-");
     eprintln!("{} {} {} {}", method, uri, response.status(), size);
     response
+}
+
+async fn apply_try_files<B>(
+    request: &mut Request<B>,
+    config: &Config,
+) -> Option<Response<ResponseBody>> {
+    if config.try_files.is_empty() {
+        return None;
+    }
+
+    let original_uri = request.uri().clone();
+    let raw_path = original_uri.path();
+    let query = original_uri.query();
+    for entry in &config.try_files[..config.try_files.len() - 1] {
+        let Some(candidate) = substitute_try_file(entry, raw_path, query) else {
+            return Some(error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Invalid try_files entry\n",
+            ));
+        };
+        let candidate_path = candidate
+            .split_once('?')
+            .map_or(candidate.as_str(), |(path, _)| path);
+        let Some(relative_path) = decode_request_path(candidate_path) else {
+            continue;
+        };
+        let Ok(canonical) = fs::canonicalize(config.root.join(relative_path)).await else {
+            continue;
+        };
+        if !canonical.starts_with(&config.root) {
+            continue;
+        }
+        let Ok(metadata) = fs::metadata(&canonical).await else {
+            continue;
+        };
+        let matched = if candidate_path.ends_with('/') {
+            metadata.is_dir()
+        } else {
+            metadata.is_file()
+        };
+        if !matched {
+            continue;
+        }
+
+        let rewritten = match uri_with_query(candidate_path, query) {
+            Some(uri) => uri,
+            None => {
+                return Some(error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Invalid rewritten URI\n",
+                ));
+            }
+        };
+        request
+            .extensions_mut()
+            .insert(OriginalUri(request_uri(&original_uri)));
+        *request.uri_mut() = rewritten;
+        return None;
+    }
+
+    let fallback = config
+        .try_files
+        .last()
+        .expect("non-empty try_files entries");
+    if let Some(code) = fallback.strip_prefix('=') {
+        let Ok(code) = code.parse::<u16>() else {
+            return Some(error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Invalid try_files status\n",
+            ));
+        };
+        return Some(match StatusCode::from_u16(code) {
+            Ok(status) => response(status, empty_body()),
+            Err(_) => error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Invalid try_files status\n",
+            ),
+        });
+    }
+
+    let Some(fallback) = substitute_try_file(fallback, raw_path, query) else {
+        return Some(error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Invalid try_files entry\n",
+        ));
+    };
+    let Ok(uri) = fallback.parse::<http::Uri>() else {
+        return Some(error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Invalid rewritten URI\n",
+        ));
+    };
+    if !uri.path().starts_with('/') || uri.authority().is_some() || uri.scheme().is_some() {
+        return Some(error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Invalid rewritten URI\n",
+        ));
+    }
+    request
+        .extensions_mut()
+        .insert(OriginalUri(request_uri(&original_uri)));
+    *request.uri_mut() = uri;
+    None
+}
+
+fn substitute_try_file(entry: &str, path: &str, query: Option<&str>) -> Option<String> {
+    let variables = [
+        ("$query_string", query.unwrap_or_default()),
+        ("$is_args", if query.is_some() { "?" } else { "" }),
+        ("$uri", path),
+        ("$args", query.unwrap_or_default()),
+    ];
+    let mut result = String::with_capacity(entry.len());
+    let mut index = 0;
+    while index < entry.len() {
+        if entry.as_bytes()[index] != b'$' {
+            let character = entry[index..].chars().next()?;
+            result.push(character);
+            index += character.len_utf8();
+            continue;
+        }
+        let (variable, value) = variables.iter().find(|(variable, _)| {
+            entry[index..].starts_with(variable)
+                && entry
+                    .as_bytes()
+                    .get(index + variable.len())
+                    .is_none_or(|next| !next.is_ascii_alphanumeric() && *next != b'_')
+        })?;
+        result.push_str(value);
+        index += variable.len();
+    }
+    Some(result)
+}
+
+fn uri_with_query(path: &str, query: Option<&str>) -> Option<http::Uri> {
+    let path_and_query = query.map_or_else(|| path.to_owned(), |query| format!("{path}?{query}"));
+    path_and_query.parse().ok()
+}
+
+fn request_uri(uri: &http::Uri) -> String {
+    uri.path_and_query()
+        .map_or_else(|| uri.path().to_owned(), |value| value.as_str().to_owned())
 }
 
 async fn route_file_request<B>(request: &Request<B>, config: &Config) -> Response<ResponseBody>
@@ -547,16 +704,58 @@ fn full_body(bytes: Bytes) -> ResponseBody {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_request_path, escape_html, parse_byte_range};
+    use super::{OriginalUri, apply_try_files, decode_request_path, escape_html, parse_byte_range};
     use std::{
-        path::{Component, Path},
-        sync::Arc,
+        path::{Component, Path, PathBuf},
+        sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        },
         time::{Duration, UNIX_EPOCH},
     };
 
-    use http_body_util::BodyExt;
+    use bytes::Bytes;
+    use http_body_util::{BodyExt, Full};
 
     use crate::fuzz_support::{self, FuzzRequest};
+
+    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+    async fn temp_root() -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "project-charlotte-try-files-{}-{}",
+            std::process::id(),
+            NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        tokio::fs::canonicalize(root).await.unwrap()
+    }
+
+    fn try_files_config(root: PathBuf, try_files: &[&str]) -> crate::config::Config {
+        let mut config = fuzz_support::fuzz_config(root);
+        config.fastcgi.clear();
+        config.try_files = try_files.iter().map(|entry| (*entry).to_owned()).collect();
+        config
+    }
+
+    async fn run_try_files(
+        root: PathBuf,
+        try_files: &[&str],
+        uri: &str,
+    ) -> http::Response<super::ResponseBody> {
+        let request = http::Request::builder()
+            .uri(uri)
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let (peer, local) = fuzz_support::addresses();
+        super::handle_request(
+            request,
+            Arc::new(try_files_config(root, try_files)),
+            peer,
+            local,
+        )
+        .await
+    }
 
     #[test]
     fn decodes_paths_and_rejects_traversal() {
@@ -568,6 +767,112 @@ mod tests {
         assert!(decode_request_path("/a/../secret").is_none());
         assert!(decode_request_path("/%00").is_none());
         assert!(decode_request_path("/%GG").is_none());
+    }
+
+    #[tokio::test]
+    async fn try_files_serves_first_existing_file_and_keeps_original_query() {
+        let root = temp_root().await;
+        tokio::fs::write(root.join("existing.txt"), b"existing file")
+            .await
+            .unwrap();
+        let config = try_files_config(root.clone(), &["$uri", "/fallback.txt", "=404"]);
+        let mut request = http::Request::builder()
+            .uri("/existing.txt?original=1")
+            .body(())
+            .unwrap();
+
+        assert!(apply_try_files(&mut request, &config).await.is_none());
+        assert_eq!(request.uri().to_string(), "/existing.txt?original=1");
+        assert_eq!(
+            request.extensions().get::<OriginalUri>().unwrap().0,
+            "/existing.txt?original=1"
+        );
+
+        let response = run_try_files(
+            root.clone(),
+            &["$uri", "/fallback.txt", "=404"],
+            "/existing.txt",
+        )
+        .await;
+        assert_eq!(response.status(), http::StatusCode::OK);
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            "existing file"
+        );
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn try_files_directory_candidate_routes_to_index() {
+        let root = temp_root().await;
+        tokio::fs::create_dir(root.join("folder")).await.unwrap();
+        tokio::fs::write(root.join("folder/index.html"), b"directory index")
+            .await
+            .unwrap();
+
+        let response = run_try_files(root.clone(), &["$uri", "$uri/", "=404"], "/folder?x=1").await;
+        assert_eq!(response.status(), http::StatusCode::OK);
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            "directory index"
+        );
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn try_files_fallback_uri_routes_to_file_with_only_entry_args() {
+        let root = temp_root().await;
+        tokio::fs::write(root.join("index.html"), b"fallback index")
+            .await
+            .unwrap();
+        for (fallback, expected) in [
+            ("/index.html$is_args$args", "/index.html?original=1"),
+            ("/index.html$is_args$query_string", "/index.html?original=1"),
+            ("/index.html", "/index.html"),
+        ] {
+            let config = try_files_config(root.clone(), &["$uri", fallback]);
+            let mut request = http::Request::builder()
+                .uri("/missing?original=1")
+                .body(())
+                .unwrap();
+            assert!(apply_try_files(&mut request, &config).await.is_none());
+            assert_eq!(request.uri().to_string(), expected);
+            assert_eq!(
+                request.extensions().get::<OriginalUri>().unwrap().0,
+                "/missing?original=1"
+            );
+        }
+
+        let response =
+            run_try_files(root.clone(), &["$uri", "/index.html", "=404"], "/missing").await;
+        assert_eq!(response.status(), http::StatusCode::OK);
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            "fallback index"
+        );
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn try_files_status_and_traversal_fallback_are_respected() {
+        let root = temp_root().await;
+        let outside = root.parent().unwrap().join(format!(
+            "project-charlotte-try-files-outside-{}",
+            NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        tokio::fs::write(&outside, b"outside file").await.unwrap();
+
+        let missing = run_try_files(root.clone(), &["$uri", "=404"], "/missing").await;
+        assert_eq!(missing.status(), http::StatusCode::NOT_FOUND);
+        let traversal = run_try_files(
+            root.clone(),
+            &["$uri", "=404"],
+            &format!("/../{}", outside.file_name().unwrap().to_string_lossy()),
+        )
+        .await;
+        assert_eq!(traversal.status(), http::StatusCode::NOT_FOUND);
+        tokio::fs::remove_file(outside).await.unwrap();
+        tokio::fs::remove_dir_all(root).await.unwrap();
     }
 
     #[test]
