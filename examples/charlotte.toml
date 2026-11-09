@@ -1,0 +1,142 @@
+# Example configuration for project-charlotte.
+#
+# Pass this file with `--config`:
+#
+#     project-charlotte --config /etc/charlotte/charlotte.toml \
+#         --bind 0.0.0.0:80 --tls-bind 0.0.0.0:443 \
+#         --tls-cert /etc/charlotte/default.pem \
+#         --tls-key  /etc/charlotte/default.key
+#
+# The file only describes virtual hosts. Listening sockets, the fallback
+# document root, the fallback TLS certificate and the ModSecurity rule set are
+# command-line options; see `project-charlotte --help`.
+#
+# Every virtual host runs in its own worker process, re-executing this binary
+# with `--worker` and dropping privileges to the configured user and group.
+# A request whose Host header matches no virtual host is served by the master
+# process from the `--root` directory, unless a virtual host is marked
+# `default = true`.
+#
+# Relative paths (root, tls_cert, tls_key, unix: FastCGI sockets) are resolved
+# against the directory containing this file, not the working directory.
+
+
+# --------------------------------------------------------------------------
+# A plain static site, marked as the catch-all for unmatched requests.
+# --------------------------------------------------------------------------
+[[vhost]]
+# Required. One or more host names. A leading "*." makes it a wildcard that
+# matches one or more labels in place of the star; "*.example.com" matches
+# "www.example.com" but not "example.com" itself. Ports are not allowed, and a
+# name may only appear once across the whole file. Exact matches beat
+# wildcards, and a longer wildcard suffix beats a shorter one.
+server_names = ["example.com", "www.example.com"]
+
+# Required. Document root served by this virtual host's worker.
+root = "/srv/www/example.com/public"
+
+# Required. The worker drops to this user. The account must exist.
+user = "www-example"
+
+# Optional. Defaults to the user's primary group.
+group = "www-data"
+
+# Optional. Falls back to the --index value (default "index.html").
+# Must be a bare file name: no "/", no "\", not "." or "..".
+index = "index.html"
+
+# Optional. Falls back to --no-listing / the default of true.
+listing = false
+
+# Optional. At most one virtual host in the file may set this. It receives
+# every request that matches no other host (and supplies the fallback
+# certificate for TLS clients that send no SNI).
+default = true
+
+# Optional, but required together. The certificate presented for these server
+# names via SNI. PEM encoded; the key may be PKCS#8, PKCS#1 or SEC1.
+tls_cert = "tls/example.com.pem"
+tls_key = "tls/example.com.key"
+
+
+# --------------------------------------------------------------------------
+# PHP over an existing FastCGI pool (php-fpm), reached over a Unix socket.
+# --------------------------------------------------------------------------
+[[vhost]]
+server_names = ["blog.example.com"]
+root = "/srv/www/blog/public"
+user = "www-blog"
+index = "index.php"
+listing = false
+
+# Each entry is "EXTENSION=ADDRESS". The extension is matched
+# case-insensitively and a leading dot is optional, so "php", ".php" and
+# ".PHP" are the same backend; an extension may only be declared once per
+# virtual host. The address is either "unix:/path/to/socket" or "HOST:PORT"
+# (bracket IPv6 literals, e.g. "[::1]:9000").
+fastcgi = ["php=unix:/run/php/php8.4-fpm.sock"]
+
+# Optional. Seconds to wait for the FastCGI backend before giving up.
+# Falls back to --fastcgi-timeout (default 60). Must be greater than zero.
+fastcgi_timeout = 30
+
+tls_cert = "tls/blog.example.com.pem"
+tls_key = "tls/blog.example.com.key"
+
+
+# --------------------------------------------------------------------------
+# A wildcard host where charlotte spawns and supervises the FastCGI process
+# itself, instead of connecting to a pool someone else manages.
+# --------------------------------------------------------------------------
+[[vhost]]
+server_names = ["*.customers.example.com"]
+root = "/srv/www/customers/public"
+user = "www-customers"
+group = "www-customers"
+index = "index.php"
+listing = false
+fastcgi_timeout = 120
+
+# Backends charlotte connects to, alongside the spawned apps below. A TCP
+# pool on the loopback interface:
+fastcgi = ["cgi=127.0.0.1:9001"]
+
+# Processes charlotte starts and keeps running for this virtual host. Each app
+# receives a private FastCGI listening socket on file descriptor 0, using the
+# FCGI_LISTENSOCK_FILENO convention; do not pass php-cgi's `-b` option. Apps run
+# as this vhost's user with the document root as their working directory. Their
+# environment is cleared except for PATH and variables configured below. If an
+# app exits (including after PHP_FCGI_MAX_REQUESTS), charlotte restarts it.
+# Extensions must not collide with one declared in `fastcgi` above or another
+# `fastcgi_app` entry.
+[[vhost.fastcgi_app]]
+extension = "php"
+
+# argv for the child process: the program first, then its arguments. Must not
+# be empty.
+command = ["/usr/bin/php8.4-cgi"]
+
+# Optional environment for the child. Keys must look like shell identifiers:
+# a letter or underscore, then letters, digits or underscores.
+[vhost.fastcgi_app.env]
+PHP_FCGI_CHILDREN = "8"
+PHP_FCGI_MAX_REQUESTS = "1000"
+APP_ENV = "production"
+
+# A second independently supervised app can map another extension to the same
+# executable, with its own listening socket and environment.
+[[vhost.fastcgi_app]]
+extension = "phtml"
+command = ["/usr/bin/php8.4-cgi"]
+env = { PHP_FCGI_CHILDREN = "4", APP_ENV = "production" }
+
+
+# --------------------------------------------------------------------------
+# A host with no TLS of its own: reachable over plaintext, and over TLS only
+# through the default host's certificate.
+# --------------------------------------------------------------------------
+[[vhost]]
+server_names = ["internal.example.com"]
+root = "/srv/www/internal"
+user = "www-internal"
+listing = true
