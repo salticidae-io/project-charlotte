@@ -97,6 +97,11 @@ fastcgi = ["php=unix:/run/php/php8.4-fpm.sock"]
 # Falls back to --fastcgi-timeout (default 60). Must be greater than zero.
 fastcgi_timeout = 30
 
+# Optional. Number of Tokio runtime threads in this vhost's worker process
+# (1-1024). Falls back to --worker-threads (default 2). The master process
+# thread count is set with --threads (default: one per CPU core).
+worker_threads = 4
+
 tls_cert = "tls/blog.example.com.pem"
 tls_key = "tls/blog.example.com.key"
 

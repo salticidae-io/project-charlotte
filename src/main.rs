@@ -53,14 +53,16 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     if config.worker {
         worker::drop_privileges(&config)?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
+            .worker_threads(config.worker_threads)
             .enable_all()
             .build()?;
         return runtime.block_on(worker::run(config));
     }
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    if let Some(threads) = config.threads {
+        builder.worker_threads(threads);
+    }
+    let runtime = builder.enable_all().build()?;
     runtime.block_on(run_master(config))
 }
 

@@ -32,6 +32,8 @@ pub struct Config {
     pub listing: bool,
     pub fastcgi: Vec<FastCgiBackend>,
     pub fastcgi_timeout: Duration,
+    pub threads: Option<usize>,
+    pub worker_threads: usize,
     pub modsecurity_rules: Vec<PathBuf>,
     pub modsecurity_body_limit: usize,
     pub modsecurity_response_body_limit: usize,
@@ -75,6 +77,8 @@ impl Config {
         let mut fastcgi_app_args = Vec::new();
         let mut fastcgi_app_env = Vec::new();
         let mut fastcgi_timeout = Duration::from_secs(60);
+        let mut threads = None;
+        let mut worker_threads = DEFAULT_WORKER_THREADS;
         let mut modsecurity_rules = Vec::new();
         let mut modsecurity_body_limit = 16 * 1024 * 1024;
         let mut modsecurity_response_body_limit = 1024 * 1024;
@@ -160,6 +164,13 @@ impl Config {
                         .filter(|seconds| *seconds > 0)
                         .ok_or_else(|| format!("invalid FastCGI timeout: {value}"))?;
                     fastcgi_timeout = Duration::from_secs(seconds);
+                }
+                "--threads" => {
+                    threads = Some(parse_thread_count(&next_value(&mut args, "--threads")?)?)
+                }
+                "--worker-threads" => {
+                    worker_threads =
+                        parse_thread_count(&next_value(&mut args, "--worker-threads")?)?
                 }
                 "--modsecurity-rules" => {
                     modsecurity_rules
@@ -338,6 +349,8 @@ impl Config {
             listing,
             fastcgi,
             fastcgi_timeout,
+            threads,
+            worker_threads,
             modsecurity_rules,
             modsecurity_body_limit,
             modsecurity_response_body_limit,
@@ -350,7 +363,7 @@ impl Config {
     }
 
     pub fn usage() -> &'static str {
-        "Usage: project-charlotte [--bind ADDRESS] [--tls-bind ADDRESS] [--root DIRECTORY] [--index NAME] [--no-listing] [--fastcgi EXT=ADDR]... [--fastcgi-app EXT=PROGRAM]... [--fastcgi-app-arg EXT=ARG]... [--fastcgi-app-env EXT=KEY=VALUE]... [--fastcgi-timeout SECS] [--modsecurity-rules FILE]... [--modsecurity-body-limit BYTES] [--config FILE] [--vhost-dir DIRECTORY] [--tls-cert PATH --tls-key PATH] [--acme-directory URL|letsencrypt|letsencrypt-staging --acme-cache DIR] [--acme-contact URI]... [--acme-ca-root PEM] [--http3-bind ADDRESS] [--help]"
+        "Usage: project-charlotte [--bind ADDRESS] [--tls-bind ADDRESS] [--root DIRECTORY] [--index NAME] [--no-listing] [--fastcgi EXT=ADDR]... [--fastcgi-app EXT=PROGRAM]... [--fastcgi-app-arg EXT=ARG]... [--fastcgi-app-env EXT=KEY=VALUE]... [--fastcgi-timeout SECS] [--threads N] [--worker-threads N] [--modsecurity-rules FILE]... [--modsecurity-body-limit BYTES] [--config FILE] [--vhost-dir DIRECTORY] [--tls-cert PATH --tls-key PATH] [--acme-directory URL|letsencrypt|letsencrypt-staging --acme-cache DIR] [--acme-contact URI]... [--acme-ca-root PEM] [--http3-bind ADDRESS] [--help]"
     }
 }
 
@@ -419,6 +432,17 @@ pub(crate) fn validate_env_key(key: &str) -> Result<(), String> {
         return Err(format!("invalid FastCGI app environment key: {key}"));
     }
     Ok(())
+}
+
+pub const DEFAULT_WORKER_THREADS: usize = 2;
+pub const MAX_THREADS: usize = 1024;
+
+pub fn parse_thread_count(value: &str) -> Result<usize, String> {
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|threads| (1..=MAX_THREADS).contains(threads))
+        .ok_or_else(|| format!("invalid thread count: {value}; expected 1-{MAX_THREADS}"))
 }
 
 fn next_value(args: &mut impl Iterator<Item = String>, option: &str) -> Result<String, String> {
@@ -644,6 +668,32 @@ mod tests {
             .is_err()
         );
         assert!(Config::parse(["--acme-cache".to_owned(), "/tmp/acme".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn parses_thread_options_and_rejects_invalid_counts() {
+        let ParseResult::Config(defaults) = Config::parse(Vec::<String>::new()).unwrap() else {
+            panic!("expected config")
+        };
+        assert_eq!(defaults.threads, None);
+        assert_eq!(defaults.worker_threads, 2);
+
+        let parsed = Config::parse([
+            "--threads".to_owned(),
+            "8".to_owned(),
+            "--worker-threads".to_owned(),
+            "3".to_owned(),
+        ])
+        .unwrap();
+        let ParseResult::Config(config) = parsed else {
+            panic!("expected config")
+        };
+        assert_eq!(config.threads, Some(8));
+        assert_eq!(config.worker_threads, 3);
+        for invalid in ["0", "-1", "abc", "1025"] {
+            assert!(Config::parse(["--threads".to_owned(), invalid.to_owned()]).is_err());
+            assert!(Config::parse(["--worker-threads".to_owned(), invalid.to_owned()]).is_err());
+        }
     }
 
     #[test]

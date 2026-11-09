@@ -66,6 +66,7 @@ struct VhostFile {
     #[serde(default)]
     fastcgi_app: Vec<FastCgiAppFile>,
     fastcgi_timeout: Option<u64>,
+    worker_threads: Option<usize>,
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
     #[serde(default)]
@@ -117,6 +118,7 @@ struct Worker {
     listing: bool,
     fastcgi: Vec<FastCgiBackend>,
     fastcgi_timeout: Duration,
+    threads: usize,
     process: Mutex<Option<WorkerProcess>>,
 }
 
@@ -449,6 +451,11 @@ impl Router {
             if timeout_seconds == 0 {
                 return Err("vhost FastCGI timeout must be greater than zero".into());
             }
+            let threads = match entry.worker_threads {
+                Some(threads) => crate::config::parse_thread_count(&threads.to_string())
+                    .map_err(|error| format!("vhost worker_threads: {error}"))?,
+                None => fallback.worker_threads,
+            };
             let tls = match (entry.tls_cert, entry.tls_key) {
                 (Some(cert), Some(key)) => Some(TlsFiles {
                     cert: resolve_config_path(cert, config_dir),
@@ -470,6 +477,7 @@ impl Router {
                 listing,
                 fastcgi,
                 fastcgi_timeout: Duration::from_secs(timeout_seconds),
+                threads,
                 process: Mutex::new(None),
             });
             let process = worker.spawn_process().await?;
@@ -712,6 +720,8 @@ impl Worker {
                 &self.fastcgi,
                 self.fastcgi_timeout,
             ))
+            .arg("--worker-threads")
+            .arg(self.threads.to_string())
             .stdin(Stdio::from(OwnedFd::from(child_socket)))
             .current_dir("/");
 
@@ -875,6 +885,10 @@ fn validate_vhost_declarations(entries: &[VhostFile]) -> Result<(), Box<dyn Erro
             return Err(
                 format!("vhost {} must provide both tls_cert and tls_key", index + 1).into(),
             );
+        }
+        if let Some(threads) = entry.worker_threads {
+            crate::config::parse_thread_count(&threads.to_string())
+                .map_err(|error| format!("vhost {} worker_threads: {error}", index + 1))?;
         }
         if entry.server_names.is_empty() {
             return Err(format!("vhost {} has no server_names", index + 1).into());
@@ -1082,6 +1096,7 @@ mod tests {
             fastcgi: Vec::new(),
             fastcgi_app: Vec::new(),
             fastcgi_timeout: None,
+            worker_threads: None,
             tls_cert: None,
             tls_key: None,
             default: is_default,
@@ -1117,6 +1132,17 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn validates_vhost_worker_threads() {
+        let mut entry = declaration(&["threads.example"], false);
+        entry.worker_threads = Some(8);
+        assert!(validate_vhost_declarations(std::slice::from_ref(&entry)).is_ok());
+        for invalid in [0, 1025] {
+            entry.worker_threads = Some(invalid);
+            assert!(validate_vhost_declarations(std::slice::from_ref(&entry)).is_err());
+        }
     }
 
     #[test]

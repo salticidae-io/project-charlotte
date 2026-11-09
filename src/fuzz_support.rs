@@ -129,6 +129,8 @@ pub(crate) fn fuzz_config(root: PathBuf) -> Config {
             address: FastCgiAddress::Tcp("127.0.0.1:9000".to_owned()),
         }],
         fastcgi_timeout: std::time::Duration::from_secs(1),
+        threads: None,
+        worker_threads: 2,
         modsecurity_rules: Vec::new(),
         modsecurity_body_limit: 16 * 1024 * 1024,
         modsecurity_response_body_limit: 1024 * 1024,
