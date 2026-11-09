@@ -587,6 +587,7 @@ mod tests {
             modsecurity_body_limit: 16 * 1024 * 1024,
             modsecurity_response_body_limit: 1024 * 1024,
             tls: None,
+            acme: None,
             worker: false,
             worker_uid: None,
             worker_gid: None,

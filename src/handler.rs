@@ -512,6 +512,16 @@ pub(crate) fn error_response(status: StatusCode, message: &'static str) -> Respo
     response
 }
 
+pub(crate) fn text_response(status: StatusCode, text: String) -> Response<ResponseBody> {
+    let bytes = Bytes::from(text);
+    let mut response = response(status, full_body(bytes));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    response
+}
+
 fn add_validators(response: &mut Response<ResponseBody>, etag: &str, last_modified: &str) {
     response
         .headers_mut()

@@ -35,9 +35,18 @@ pub struct Config {
     pub modsecurity_body_limit: usize,
     pub modsecurity_response_body_limit: usize,
     pub tls: Option<TlsFiles>,
+    pub acme: Option<AcmeSettings>,
     pub worker: bool,
     pub worker_uid: Option<u32>,
     pub worker_gid: Option<u32>,
+}
+
+#[derive(Clone, Debug)]
+pub struct AcmeSettings {
+    pub directory: String,
+    pub cache: PathBuf,
+    pub contacts: Vec<String>,
+    pub ca_root: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -70,6 +79,10 @@ impl Config {
         let mut modsecurity_response_body_limit = 1024 * 1024;
         let mut tls_cert = None;
         let mut tls_key = None;
+        let mut acme_directory = None;
+        let mut acme_cache = None;
+        let mut acme_contacts = Vec::new();
+        let mut acme_ca_root = None;
         let mut config_file = None;
         let mut worker = false;
         let mut worker_uid = None;
@@ -164,6 +177,35 @@ impl Config {
                     tls_cert = Some(PathBuf::from(next_value(&mut args, "--tls-cert")?))
                 }
                 "--tls-key" => tls_key = Some(PathBuf::from(next_value(&mut args, "--tls-key")?)),
+                "--acme-directory" => {
+                    let value = next_value(&mut args, "--acme-directory")?;
+                    let directory = match value.as_str() {
+                        "letsencrypt" => "https://acme-v02.api.letsencrypt.org/directory",
+                        "letsencrypt-staging" => {
+                            "https://acme-staging-v02.api.letsencrypt.org/directory"
+                        }
+                        _ => value.as_str(),
+                    };
+                    if !(directory.starts_with("https://") || directory.starts_with("http://")) {
+                        return Err(
+                            "--acme-directory must be an HTTP(S) URL or a known alias".to_owned()
+                        );
+                    }
+                    acme_directory = Some(directory.to_owned());
+                }
+                "--acme-cache" => {
+                    acme_cache = Some(PathBuf::from(next_value(&mut args, "--acme-cache")?))
+                }
+                "--acme-contact" => {
+                    let value = next_value(&mut args, "--acme-contact")?;
+                    if value.is_empty() || !value.contains(':') || value.contains('\0') {
+                        return Err(format!("invalid ACME contact URI: {value}"));
+                    }
+                    acme_contacts.push(value);
+                }
+                "--acme-ca-root" => {
+                    acme_ca_root = Some(PathBuf::from(next_value(&mut args, "--acme-ca-root")?))
+                }
                 "--http3-bind" => {
                     let value = next_value(&mut args, "--http3-bind")?;
                     http3_bind = Some(
@@ -255,6 +297,21 @@ impl Config {
             _ => return Err("--tls-cert and --tls-key must be supplied together".to_owned()),
         };
 
+        let acme = match (acme_directory, acme_cache) {
+            (Some(directory), Some(cache)) => Some(AcmeSettings {
+                directory,
+                cache,
+                contacts: acme_contacts,
+                ca_root: acme_ca_root,
+            }),
+            (Some(_), None) => return Err("--acme-directory requires --acme-cache".to_owned()),
+            (None, Some(_)) => return Err("--acme-cache requires --acme-directory".to_owned()),
+            (None, None) if !acme_contacts.is_empty() || acme_ca_root.is_some() => {
+                return Err("ACME contact and CA options require --acme-directory".to_owned());
+            }
+            (None, None) => None,
+        };
+
         if worker_uid.is_some() != worker_gid.is_some() {
             return Err("--worker-uid and --worker-gid must be supplied together".to_owned());
         }
@@ -279,6 +336,7 @@ impl Config {
             modsecurity_body_limit,
             modsecurity_response_body_limit,
             tls,
+            acme,
             worker,
             worker_uid,
             worker_gid,
@@ -286,7 +344,7 @@ impl Config {
     }
 
     pub fn usage() -> &'static str {
-        "Usage: project-charlotte [--bind ADDRESS] [--tls-bind ADDRESS] [--root DIRECTORY] [--index NAME] [--no-listing] [--fastcgi EXT=ADDR]... [--fastcgi-app EXT=PROGRAM]... [--fastcgi-app-arg EXT=ARG]... [--fastcgi-app-env EXT=KEY=VALUE]... [--fastcgi-timeout SECS] [--modsecurity-rules FILE]... [--modsecurity-body-limit BYTES] [--config FILE] [--tls-cert PATH --tls-key PATH] [--http3-bind ADDRESS] [--help]"
+        "Usage: project-charlotte [--bind ADDRESS] [--tls-bind ADDRESS] [--root DIRECTORY] [--index NAME] [--no-listing] [--fastcgi EXT=ADDR]... [--fastcgi-app EXT=PROGRAM]... [--fastcgi-app-arg EXT=ARG]... [--fastcgi-app-env EXT=KEY=VALUE]... [--fastcgi-timeout SECS] [--modsecurity-rules FILE]... [--modsecurity-body-limit BYTES] [--config FILE] [--tls-cert PATH --tls-key PATH] [--acme-directory URL|letsencrypt|letsencrypt-staging --acme-cache DIR] [--acme-contact URI]... [--acme-ca-root PEM] [--http3-bind ADDRESS] [--help]"
     }
 }
 
@@ -546,6 +604,40 @@ mod tests {
         assert!(Config::parse(["--tls-key".to_owned(), "server-key.pem".to_owned()]).is_err());
         assert!(Config::parse(["--http3-bind".to_owned(), "localhost".to_owned()]).is_err());
         assert!(Config::parse(["--tls-bind".to_owned(), "localhost".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn parses_acme_options_and_requires_cache() {
+        let parsed = Config::parse([
+            "--acme-directory".to_owned(),
+            "letsencrypt-staging".to_owned(),
+            "--acme-cache".to_owned(),
+            "/var/lib/charlotte/acme".to_owned(),
+            "--acme-contact".to_owned(),
+            "mailto:admin@example.test".to_owned(),
+            "--acme-ca-root".to_owned(),
+            "pebble.pem".to_owned(),
+        ])
+        .unwrap();
+        let ParseResult::Config(config) = parsed else {
+            panic!("expected config")
+        };
+        let acme = config.acme.unwrap();
+        assert_eq!(
+            acme.directory,
+            "https://acme-staging-v02.api.letsencrypt.org/directory"
+        );
+        assert_eq!(acme.cache, PathBuf::from("/var/lib/charlotte/acme"));
+        assert_eq!(acme.contacts, ["mailto:admin@example.test"]);
+        assert_eq!(acme.ca_root, Some(PathBuf::from("pebble.pem")));
+        assert!(
+            Config::parse([
+                "--acme-directory".to_owned(),
+                "https://ca.test/dir".to_owned()
+            ])
+            .is_err()
+        );
+        assert!(Config::parse(["--acme-cache".to_owned(), "/tmp/acme".to_owned()]).is_err());
     }
 
     #[test]

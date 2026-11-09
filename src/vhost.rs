@@ -22,6 +22,7 @@ use serde::Deserialize;
 use tokio::{io::AsyncReadExt, net::UnixStream, sync::Mutex, time::timeout};
 
 use crate::{
+    acme::AcmeManager,
     config::{Config, FastCgiAddress, FastCgiBackend, TlsFiles},
     handler::{self, ResponseBody},
     waf::{RuleIdSpec, Waf},
@@ -62,6 +63,7 @@ struct VhostFile {
     default: bool,
     #[serde(default)]
     modsecurity_disable_rules: Vec<RuleIdFile>,
+    acme: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -92,6 +94,7 @@ struct FastCgiAppFile {
 struct Vhost {
     names: Vec<String>,
     tls: Option<TlsFiles>,
+    acme: bool,
     waf: Option<Waf>,
     worker: Arc<Worker>,
 }
@@ -124,6 +127,7 @@ pub(crate) struct Router {
     vhosts: Vec<Vhost>,
     default: Option<usize>,
     waf: Option<Waf>,
+    acme: Option<AcmeManager>,
 }
 
 #[derive(Clone, Debug)]
@@ -141,6 +145,7 @@ impl Router {
                 vhosts: Vec::new(),
                 default: None,
                 waf,
+                acme: None,
             });
         };
         let content = std::fs::read_to_string(path)?;
@@ -284,6 +289,7 @@ impl Router {
             vhosts.push(Vhost {
                 names: normalized_names,
                 tls,
+                acme: entry.acme.unwrap_or(true),
                 waf: vhost_waf,
                 worker,
             });
@@ -294,7 +300,28 @@ impl Router {
             vhosts,
             default,
             waf,
+            acme: None,
         })
+    }
+
+    pub(crate) fn acme_names(&self) -> Vec<String> {
+        self.vhosts
+            .iter()
+            .filter(|vhost| vhost.acme && vhost.tls.is_none())
+            .flat_map(|vhost| vhost.names.iter())
+            .filter(|name| !name.starts_with("*."))
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn document_roots(&self) -> Vec<PathBuf> {
+        std::iter::once(self.fallback.root.clone())
+            .chain(self.vhosts.iter().map(|vhost| vhost.worker.root.clone()))
+            .collect()
+    }
+
+    pub(crate) fn set_acme_manager(&mut self, acme: Option<AcmeManager>) {
+        self.acme = acme;
     }
 
     pub(crate) async fn dispatch<B>(
@@ -307,6 +334,20 @@ impl Router {
         B: Body<Data = Bytes> + Send + 'static,
         B::Error: Into<Box<dyn Error + Send + Sync>>,
     {
+        if let Some(acme) = &self.acme {
+            let host = request_host(&request);
+            if request.method() == http::Method::GET
+                && let Some(host) = host.as_deref()
+                && let Some(body) = acme.challenge_response(host, request.uri().path()).await
+            {
+                return handler::text_response(StatusCode::OK, body);
+            }
+            if request.extensions().get::<TlsSni>().is_none()
+                && let Some(host) = host.as_deref()
+            {
+                acme.maybe_provision(host);
+            }
+        }
         let selected = request_host(&request)
             .as_deref()
             .and_then(|host| self.select_vhost(host))
@@ -808,6 +849,7 @@ mod tests {
             tls_key: None,
             default: is_default,
             modsecurity_disable_rules: Vec::new(),
+            acme: None,
         }
     }
 

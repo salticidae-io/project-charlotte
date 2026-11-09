@@ -7,6 +7,13 @@
 #         --tls-cert /etc/charlotte/default.pem \
 #         --tls-key  /etc/charlotte/default.key
 #
+# To enable automatic HTTP-01 certificates for eligible virtual hosts without
+# a per-vhost TLS certificate, add:
+#     --acme-directory letsencrypt --acme-cache /var/lib/charlotte/acme
+# The ACME server must be able to reach this server on port 80; renewals are
+# triggered by plaintext requests when a cached certificate is within 30 days
+# of expiry. Use `letsencrypt-staging` or a custom directory URL for testing.
+#
 # The file only describes virtual hosts. Listening sockets, the fallback
 # document root, the fallback TLS certificate and the ModSecurity rule set are
 # command-line options; see `project-charlotte --help`.
@@ -145,3 +152,6 @@ server_names = ["internal.example.com"]
 root = "/srv/www/internal"
 user = "www-internal"
 listing = true
+# Optional. Set false to exclude this virtual host from automatic ACME
+# provisioning; it is enabled by default when --acme-directory is configured.
+# For example, set `acme = false` here to opt out.

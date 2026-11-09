@@ -7,6 +7,7 @@ use rustls::{
 };
 
 use crate::{
+    acme::AcmeCertificateStore,
     config::{Config, TlsFiles},
     vhost::{Router, match_score, normalize_host},
 };
@@ -20,16 +21,18 @@ pub(crate) struct TlsSetup {
 struct SniResolver {
     entries: Vec<(String, Arc<CertifiedKey>)>,
     fallback: Option<Arc<CertifiedKey>>,
+    acme: Option<AcmeCertificateStore>,
 }
 
 impl TlsSetup {
     pub(crate) fn load(
         config: &Config,
         router: &Router,
+        acme: Option<AcmeCertificateStore>,
     ) -> Result<Option<Self>, Box<dyn Error + Send + Sync>> {
         let (certificate_entries, default_certificate) = router.sni_certificates();
         let fallback_files = config.tls.as_ref().or(default_certificate.as_ref());
-        if certificate_entries.is_empty() && fallback_files.is_none() {
+        if certificate_entries.is_empty() && fallback_files.is_none() && acme.is_none() {
             return Ok(None);
         }
 
@@ -38,7 +41,11 @@ impl TlsSetup {
             .map(|(name, files)| Ok((name, load_certified_key(&files)?)))
             .collect::<Result<Vec<_>, Box<dyn Error + Send + Sync>>>()?;
         let fallback = fallback_files.map(load_certified_key).transpose()?;
-        let resolver = Arc::new(SniResolver { entries, fallback });
+        let resolver = Arc::new(SniResolver {
+            entries,
+            fallback,
+            acme,
+        });
         let tcp = server_config(
             resolver.clone(),
             &[b"h2".to_vec(), b"http/1.1".to_vec()],
@@ -51,12 +58,19 @@ impl TlsSetup {
 
 impl ResolvesServerCert for SniResolver {
     fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        select_key(
-            &self.entries,
-            self.fallback.as_ref(),
-            client_hello.server_name(),
-        )
-        .cloned()
+        self.resolve_name(client_hello.server_name())
+    }
+}
+
+impl SniResolver {
+    fn resolve_name(&self, server_name: Option<&str>) -> Option<Arc<CertifiedKey>> {
+        if let Some(key) = server_name
+            .and_then(normalize_host)
+            .and_then(|host| self.acme.as_ref().and_then(|store| store.get(&host)))
+        {
+            return Some(key);
+        }
+        select_key(&self.entries, self.fallback.as_ref(), server_name).cloned()
     }
 }
 
@@ -81,7 +95,9 @@ fn select_key<'a, T>(
         .or(fallback)
 }
 
-fn load_certified_key(files: &TlsFiles) -> Result<Arc<CertifiedKey>, Box<dyn Error + Send + Sync>> {
+pub(crate) fn load_certified_key(
+    files: &TlsFiles,
+) -> Result<Arc<CertifiedKey>, Box<dyn Error + Send + Sync>> {
     let cert_file = File::open(&files.cert)?;
     let certs = rustls_pemfile::certs(&mut BufReader::new(cert_file))
         .collect::<Result<Vec<CertificateDer<'static>>, _>>()?;
@@ -121,7 +137,33 @@ fn server_config(
 
 #[cfg(test)]
 mod tests {
-    use super::{select_index, select_key};
+    use std::{
+        path::PathBuf,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    use super::{SniResolver, load_certified_key, select_index, select_key};
+    use crate::{acme::AcmeCertificateStore, config::TlsFiles};
+
+    static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
+
+    fn certificate_files(name: &str) -> (PathBuf, TlsFiles, Vec<u8>) {
+        let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "project-charlotte-tls-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let generated = rcgen::generate_simple_self_signed(vec![name.to_owned()]).unwrap();
+        let certificate = generated.cert.der().to_vec();
+        let files = TlsFiles {
+            cert: directory.join("cert.pem"),
+            key: directory.join("key.pem"),
+        };
+        std::fs::write(&files.cert, generated.cert.pem()).unwrap();
+        std::fs::write(&files.key, generated.key_pair.serialize_pem()).unwrap();
+        (directory, files, certificate)
+    }
 
     #[test]
     fn selects_exact_and_longest_wildcard_then_falls_back() {
@@ -156,5 +198,36 @@ mod tests {
         assert_eq!(select_key(&entries, Some(&fallback), None), Some(&fallback));
         assert_eq!(select_key(&entries, None, Some("unknown.test")), None);
         assert_eq!(select_key(&entries, None, None), None);
+    }
+
+    #[test]
+    fn acme_certificate_takes_precedence_over_static_and_fallback_certificates() {
+        let (dynamic_dir, dynamic_files, dynamic_der) = certificate_files("alpha.test");
+        let (static_dir, static_files, _) = certificate_files("alpha.test");
+        let (fallback_dir, fallback_files, _) = certificate_files("fallback.test");
+        let store = AcmeCertificateStore::new();
+        store
+            .insert(
+                "alpha.test".to_owned(),
+                load_certified_key(&dynamic_files).unwrap(),
+            )
+            .unwrap();
+        let resolver = SniResolver {
+            entries: vec![(
+                "alpha.test".to_owned(),
+                load_certified_key(&static_files).unwrap(),
+            )],
+            fallback: Some(load_certified_key(&fallback_files).unwrap()),
+            acme: Some(store),
+        };
+
+        assert_eq!(
+            resolver.resolve_name(Some("ALPHA.TEST.")).unwrap().cert[0].as_ref(),
+            dynamic_der
+        );
+
+        std::fs::remove_dir_all(dynamic_dir).unwrap();
+        std::fs::remove_dir_all(static_dir).unwrap();
+        std::fs::remove_dir_all(fallback_dir).unwrap();
     }
 }

@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod acme;
 mod config;
 mod fastcgi;
 mod fastcgi_app;
@@ -32,6 +33,7 @@ use tokio::{
 use tokio_rustls::TlsAcceptor;
 
 use crate::{
+    acme::AcmeManager,
     config::{Config, FastCgiAddress, ParseResult},
     tls::TlsSetup,
     vhost::{Router, TlsSni},
@@ -78,11 +80,32 @@ async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> 
             config.modsecurity_response_body_limit,
         )?)
     };
-    let router =
-        Arc::new(Router::load(Arc::new(config.clone()), config.config_file.as_ref(), waf).await?);
-    let tls_setup = TlsSetup::load(&config, &router)?;
+    let mut router =
+        Router::load(Arc::new(config.clone()), config.config_file.as_ref(), waf).await?;
+    let acme = match config.acme.clone() {
+        Some(settings) => Some(AcmeManager::load(settings, router.acme_names()).await?),
+        None => None,
+    };
+    if let Some(settings) = &config.acme {
+        let cache = tokio::fs::canonicalize(&settings.cache).await?;
+        for root in router.document_roots() {
+            let root = tokio::fs::canonicalize(root).await?;
+            if cache.starts_with(root) {
+                return Err("ACME cache must be outside every served document root".into());
+            }
+        }
+    }
+    router.set_acme_manager(acme.clone());
+    let router = Arc::new(router);
+    let acme_store = acme.as_ref().map(AcmeManager::certificate_store);
+    let tls_setup = TlsSetup::load(&config, &router, acme_store)?;
     if config.tls_bind.is_some() && tls_setup.is_none() {
         return Err("--tls-bind requires a global or virtual-host TLS certificate".into());
+    }
+    if config.acme.is_some() {
+        eprintln!(
+            "ACME enabled; eligible virtual-host certificates will be provisioned on plaintext traffic"
+        );
     }
     let tls_listener = match (config.tls_bind, tls_setup.as_ref()) {
         (Some(address), Some(_)) => Some(TcpListener::bind(address).await?),
