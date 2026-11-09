@@ -1,0 +1,675 @@
+use std::{
+    collections::HashSet,
+    fmt::Display,
+    io,
+    net::SocketAddr,
+    path::{Component, Path, PathBuf},
+    time::Duration,
+};
+
+use bytes::{Bytes, BytesMut};
+use fastcgi_client::{Client, Params, Request as FastCgiRequest, response::Content};
+use futures_util::{Stream, StreamExt, stream};
+use http::{HeaderMap, HeaderName, HeaderValue, Response, StatusCode, header, request::Parts};
+use http_body::{Body, Frame};
+use http_body_util::{BodyExt, Limited, StreamBody};
+use tokio::{
+    fs,
+    io::{AsyncRead, AsyncWrite},
+    net::TcpStream,
+};
+
+use crate::{
+    config::{Config, FastCgiAddress, FastCgiBackend},
+    handler::{self, ResponseBody},
+};
+
+const MAX_REQUEST_BODY: usize = 16 * 1024 * 1024;
+const MAX_CGI_HEADER: usize = 64 * 1024;
+
+pub struct ResolvedScript {
+    path: PathBuf,
+    script_name: String,
+    path_info: String,
+    backend: FastCgiBackend,
+}
+
+pub async fn resolve_script(
+    relative_path: &Path,
+    raw_path: &str,
+    config: &Config,
+) -> Option<ResolvedScript> {
+    let segments = relative_path
+        .components()
+        .map(|component| match component {
+            Component::Normal(segment) => segment.to_str(),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+
+    if raw_path.ends_with('/')
+        && let Ok(directory) = fs::canonicalize(config.root.join(relative_path)).await
+        && directory.starts_with(&config.root)
+        && fs::metadata(&directory)
+            .await
+            .is_ok_and(|metadata| metadata.is_dir())
+        && let Some(backend) = backend_for_name(&config.index, config)
+        && let Ok(index_path) = fs::canonicalize(directory.join(&config.index)).await
+        && index_path.starts_with(&config.root)
+        && fs::metadata(&index_path)
+            .await
+            .is_ok_and(|metadata| metadata.is_file())
+    {
+        let mut script_segments = segments.clone();
+        script_segments.push(&config.index);
+        return Some(ResolvedScript {
+            path: index_path,
+            script_name: uri_path(&script_segments),
+            path_info: String::new(),
+            backend: backend.clone(),
+        });
+    }
+
+    for script_length in 1..=segments.len() {
+        let Some(backend) = backend_for_name(segments[script_length - 1], config) else {
+            continue;
+        };
+        let mut candidate = config.root.clone();
+        for segment in &segments[..script_length] {
+            candidate.push(segment);
+        }
+        let Ok(path) = fs::canonicalize(candidate).await else {
+            continue;
+        };
+        if !path.starts_with(&config.root)
+            || !fs::metadata(&path)
+                .await
+                .is_ok_and(|metadata| metadata.is_file())
+        {
+            continue;
+        }
+
+        let path_info = if segments.len() == script_length {
+            String::new()
+        } else {
+            decoded_path(&segments[script_length..])
+        };
+        let path_info = if path_info.is_empty() && raw_path.ends_with('/') {
+            "/".to_owned()
+        } else if path_info.is_empty() {
+            String::new()
+        } else if raw_path.ends_with('/') {
+            format!("{path_info}/")
+        } else {
+            path_info
+        };
+        return Some(ResolvedScript {
+            path,
+            script_name: uri_path(&segments[..script_length]),
+            path_info,
+            backend: backend.clone(),
+        });
+    }
+    None
+}
+
+fn backend_for_name<'a>(name: &str, config: &'a Config) -> Option<&'a FastCgiBackend> {
+    let extension = Path::new(name).extension()?.to_str()?.to_ascii_lowercase();
+    config
+        .fastcgi
+        .iter()
+        .find(|backend| backend.extension == extension)
+}
+
+fn uri_path(segments: &[&str]) -> String {
+    let mut path = String::new();
+    for segment in segments {
+        path.push('/');
+        for byte in segment.bytes() {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+                path.push(char::from(byte));
+            } else {
+                path.push_str(&format!("%{byte:02X}"));
+            }
+        }
+    }
+    path
+}
+
+fn decoded_path(segments: &[&str]) -> String {
+    if segments.is_empty() {
+        String::new()
+    } else {
+        format!("/{}", segments.join("/"))
+    }
+}
+
+pub async fn handle_request<B>(
+    request: http::Request<B>,
+    config: &Config,
+    script: ResolvedScript,
+    peer: SocketAddr,
+    local: SocketAddr,
+) -> Response<ResponseBody>
+where
+    B: Body<Data = Bytes> + Send + 'static,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let (parts, request_body) = request.into_parts();
+    let collected = match Limited::new(request_body, MAX_REQUEST_BODY).collect().await {
+        Ok(body) => body,
+        Err(error) if error.is::<http_body_util::LengthLimitError>() => {
+            return handler::error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "Request body too large\n",
+            );
+        }
+        Err(_) => {
+            return handler::error_response(StatusCode::BAD_REQUEST, "Invalid request body\n");
+        }
+    };
+    let request_body = collected.to_bytes();
+    let params = build_params(&parts, &script, config, peer, local, request_body.len());
+    let timeout = config.fastcgi_timeout;
+    let operation = async move {
+        match script.backend.address {
+            FastCgiAddress::Tcp(address) => {
+                let stream = TcpStream::connect(address.as_str())
+                    .await
+                    .map_err(|error| error.to_string())?;
+                execute(stream, params, request_body, timeout).await
+            }
+            FastCgiAddress::Unix(path) => {
+                #[cfg(unix)]
+                {
+                    let stream = tokio::net::UnixStream::connect(path)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    execute(stream, params, request_body, timeout).await
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = (path, params, request_body);
+                    Err("Unix FastCGI sockets are not supported on this platform".to_owned())
+                }
+            }
+        }
+    };
+
+    match tokio::time::timeout(timeout, operation).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => {
+            eprintln!("FastCGI request failed: {error}");
+            handler::error_response(StatusCode::BAD_GATEWAY, "FastCGI backend failed\n")
+        }
+        Err(_) => {
+            handler::error_response(StatusCode::GATEWAY_TIMEOUT, "FastCGI backend timed out\n")
+        }
+    }
+}
+
+fn build_params(
+    parts: &Parts,
+    script: &ResolvedScript,
+    config: &Config,
+    peer: SocketAddr,
+    local: SocketAddr,
+    content_length: usize,
+) -> Params<'static> {
+    let path = parts.uri.path();
+    let request_uri = parts
+        .uri
+        .query()
+        .map_or_else(|| path.to_owned(), |query| format!("{path}?{query}"));
+    let server_name = parts
+        .headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<http::uri::Authority>().ok())
+        .map(|authority| authority.host().to_owned())
+        .or_else(|| {
+            parts
+                .uri
+                .authority()
+                .map(|authority| authority.host().to_owned())
+        })
+        .unwrap_or_else(|| local.ip().to_string());
+    let protocol = match parts.version {
+        http::Version::HTTP_09 => "HTTP/0.9",
+        http::Version::HTTP_10 => "HTTP/1.0",
+        http::Version::HTTP_11 => "HTTP/1.1",
+        http::Version::HTTP_2 => "HTTP/2.0",
+        http::Version::HTTP_3 => "HTTP/3.0",
+        _ => "HTTP/1.1",
+    };
+    let content_type = parts
+        .headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    let mut params = Params::default()
+        .custom("GATEWAY_INTERFACE", "CGI/1.1")
+        .custom("SERVER_SOFTWARE", "project-charlotte")
+        .custom("SERVER_PROTOCOL", protocol.to_owned())
+        .custom("REQUEST_METHOD", parts.method.as_str().to_owned())
+        .custom(
+            "SCRIPT_FILENAME",
+            script.path.to_string_lossy().into_owned(),
+        )
+        .custom("SCRIPT_NAME", script.script_name.clone())
+        .custom("PATH_INFO", script.path_info.clone())
+        .custom(
+            "PATH_TRANSLATED",
+            if script.path_info.is_empty() {
+                String::new()
+            } else {
+                config
+                    .root
+                    .join(script.path_info.trim_start_matches('/'))
+                    .to_string_lossy()
+                    .into_owned()
+            },
+        )
+        .custom(
+            "QUERY_STRING",
+            parts.uri.query().unwrap_or_default().to_owned(),
+        )
+        .custom("REQUEST_URI", request_uri)
+        .custom("DOCUMENT_ROOT", config.root.to_string_lossy().into_owned())
+        .custom("DOCUMENT_URI", path.to_owned())
+        .custom("REMOTE_ADDR", peer.ip().to_string())
+        .custom("REMOTE_PORT", peer.port().to_string())
+        .custom("SERVER_ADDR", local.ip().to_string())
+        .custom("SERVER_PORT", local.port().to_string())
+        .custom("SERVER_NAME", server_name)
+        .custom("CONTENT_TYPE", content_type)
+        .custom("CONTENT_LENGTH", content_length.to_string())
+        .custom("REDIRECT_STATUS", "200");
+
+    let connection_headers = parts
+        .headers
+        .get_all(header::CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(|name| name.trim().to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    for name in parts.headers.keys() {
+        if is_cgi_excluded_header(name, &connection_headers) {
+            continue;
+        }
+        let key = format!(
+            "HTTP_{}",
+            name.as_str()
+                .bytes()
+                .map(|byte| match byte {
+                    b'a'..=b'z' => char::from(byte - b'a' + b'A'),
+                    b'-' => '_',
+                    _ => char::from(byte),
+                })
+                .collect::<String>()
+        );
+        let separator = if name == header::COOKIE { "; " } else { ", " };
+        let value = parts
+            .headers
+            .get_all(name)
+            .iter()
+            .map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned())
+            .collect::<Vec<_>>()
+            .join(separator);
+        params = params.custom(key, value);
+    }
+    params
+}
+
+fn is_cgi_excluded_header(name: &HeaderName, connection_headers: &HashSet<String>) -> bool {
+    name == header::CONTENT_TYPE
+        || name == header::CONTENT_LENGTH
+        || name == header::CONNECTION
+        || name.as_str() == "keep-alive"
+        || name == header::PROXY_AUTHENTICATE
+        || name == header::PROXY_AUTHORIZATION
+        || name == header::TE
+        || name == header::TRAILER
+        || name == header::TRANSFER_ENCODING
+        || name == header::UPGRADE
+        || name.as_str() == "proxy"
+        || connection_headers.contains(name.as_str())
+}
+
+async fn execute<S>(
+    stream: S,
+    params: Params<'static>,
+    request_body: Bytes,
+    timeout: Duration,
+) -> Result<Response<ResponseBody>, String>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let client = Client::new_tokio(stream);
+    let stdin = tokio::io::BufReader::new(std::io::Cursor::new(request_body));
+    let request = FastCgiRequest::new_tokio(params, stdin);
+    let mut output = client
+        .execute_once_stream(request)
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut stdout = BytesMut::new();
+
+    loop {
+        match output.next().await {
+            Some(Ok(Content::Stdout(chunk))) => {
+                stdout.extend_from_slice(&chunk);
+                if let Some((header_end, delimiter_length)) = find_header_end(&stdout) {
+                    if header_end > MAX_CGI_HEADER {
+                        return Err("FastCGI response headers exceeded the limit".to_owned());
+                    }
+                    let parsed = parse_cgi_headers(&stdout[..header_end])?;
+                    let body_start = header_end + delimiter_length;
+                    let initial_body = Bytes::copy_from_slice(&stdout[body_start..]);
+                    let body = response_body(output, initial_body, timeout);
+                    let mut response = handler::response(parsed.status, body);
+                    for (name, value) in &parsed.headers {
+                        response.headers_mut().append(name.clone(), value.clone());
+                    }
+                    return Ok(response);
+                }
+                if stdout.len() > MAX_CGI_HEADER {
+                    return Err("FastCGI response headers exceeded the limit".to_owned());
+                }
+            }
+            Some(Ok(Content::Stderr(chunk))) => log_stderr(&chunk),
+            Some(Err(error)) => return Err(error.to_string()),
+            None => return Err("FastCGI response ended before CGI headers".to_owned()),
+        }
+    }
+}
+
+struct ParsedHeaders {
+    status: StatusCode,
+    headers: HeaderMap,
+}
+
+fn parse_cgi_headers(bytes: &[u8]) -> Result<ParsedHeaders, String> {
+    let mut fields = Vec::new();
+    let mut connection_headers = HashSet::new();
+    for line in bytes.split(|byte| *byte == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() {
+            continue;
+        }
+        let colon = line
+            .iter()
+            .position(|byte| *byte == b':')
+            .ok_or_else(|| "malformed FastCGI response header".to_owned())?;
+        let name = HeaderName::from_bytes(&line[..colon])
+            .map_err(|_| "invalid FastCGI response header name".to_owned())?;
+        let value = trim_ascii(&line[colon + 1..]);
+        if name == header::CONNECTION {
+            for token in value.split(|byte| *byte == b',') {
+                if let Ok(token) = std::str::from_utf8(trim_ascii(token)) {
+                    connection_headers.insert(token.to_ascii_lowercase());
+                }
+            }
+        }
+        fields.push((name, value.to_vec()));
+    }
+
+    let mut status = None;
+    let mut location = false;
+    let mut headers = HeaderMap::new();
+    for (name, value) in fields {
+        if name.as_str().eq_ignore_ascii_case("status") {
+            let value = std::str::from_utf8(&value)
+                .map_err(|_| "invalid FastCGI status header".to_owned())?;
+            let code = value
+                .split_ascii_whitespace()
+                .next()
+                .ok_or_else(|| "empty FastCGI status header".to_owned())?
+                .parse::<u16>()
+                .map_err(|_| "invalid FastCGI status code".to_owned())?;
+            if !(100..=599).contains(&code) {
+                return Err("invalid FastCGI status code".to_owned());
+            }
+            status = Some(
+                StatusCode::from_u16(code).map_err(|_| "invalid FastCGI status code".to_owned())?,
+            );
+            continue;
+        }
+        if name == header::LOCATION {
+            location = true;
+        }
+        if is_hop_by_hop_response_header(&name, &connection_headers)
+            || name == header::SERVER
+            || name == header::DATE
+        {
+            continue;
+        }
+        let value = HeaderValue::from_bytes(&value)
+            .map_err(|_| "invalid FastCGI response header value".to_owned())?;
+        headers.append(name, value);
+    }
+
+    Ok(ParsedHeaders {
+        status: status.unwrap_or(if location {
+            StatusCode::FOUND
+        } else {
+            StatusCode::OK
+        }),
+        headers,
+    })
+}
+
+fn is_hop_by_hop_response_header(name: &HeaderName, connection_headers: &HashSet<String>) -> bool {
+    name == header::CONNECTION
+        || name.as_str() == "keep-alive"
+        || name == header::PROXY_AUTHENTICATE
+        || name == header::PROXY_AUTHORIZATION
+        || name == header::TE
+        || name == header::TRAILER
+        || name == header::TRANSFER_ENCODING
+        || name == header::UPGRADE
+        || connection_headers.contains(name.as_str())
+}
+
+fn find_header_end(bytes: &[u8]) -> Option<(usize, usize)> {
+    bytes
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|offset| (offset, 4))
+        .or_else(|| {
+            bytes
+                .windows(2)
+                .position(|window| window == b"\n\n")
+                .map(|offset| (offset, 2))
+        })
+}
+
+fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
+    while bytes.first().is_some_and(u8::is_ascii_whitespace) {
+        bytes = &bytes[1..];
+    }
+    while bytes.last().is_some_and(u8::is_ascii_whitespace) {
+        bytes = &bytes[..bytes.len() - 1];
+    }
+    bytes
+}
+
+fn response_body<S, E>(output: S, initial_body: Bytes, timeout: Duration) -> ResponseBody
+where
+    S: Stream<Item = Result<Content, E>> + Unpin + Send + 'static,
+    E: Display + Send + 'static,
+{
+    let chunks = stream::unfold(
+        (Some(initial_body), output),
+        move |(initial_body, mut output)| async move {
+            if let Some(bytes) = initial_body
+                && !bytes.is_empty()
+            {
+                return Some((Ok(Frame::data(bytes)), (None, output)));
+            }
+            loop {
+                match tokio::time::timeout(timeout, output.next()).await {
+                    Err(_) => {
+                        return Some((
+                            Err(io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                "FastCGI response timed out",
+                            )),
+                            (None, output),
+                        ));
+                    }
+                    Ok(Some(Ok(Content::Stdout(bytes)))) if !bytes.is_empty() => {
+                        return Some((Ok(Frame::data(bytes)), (None, output)));
+                    }
+                    Ok(Some(Ok(Content::Stdout(_)))) => {}
+                    Ok(Some(Ok(Content::Stderr(bytes)))) => log_stderr(&bytes),
+                    Ok(Some(Err(error))) => {
+                        return Some((Err(io::Error::other(error.to_string())), (None, output)));
+                    }
+                    Ok(None) => return None,
+                }
+            }
+        },
+    );
+    StreamBody::new(chunks).boxed_unsync()
+}
+
+fn log_stderr(bytes: &[u8]) {
+    if !bytes.is_empty() {
+        eprintln!(
+            "FastCGI stderr: {}",
+            String::from_utf8_lossy(bytes).trim_end()
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_cgi_headers, resolve_script};
+    use crate::{
+        config::{Config, FastCgiAddress, FastCgiBackend},
+        handler::decode_request_path,
+    };
+    use http::StatusCode;
+    use std::{
+        net::SocketAddr,
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
+        time::Duration,
+    };
+
+    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+    fn test_config(root: PathBuf) -> Config {
+        Config {
+            bind: "127.0.0.1:8080".parse::<SocketAddr>().unwrap(),
+            http3_bind: "127.0.0.1:8080".parse::<SocketAddr>().unwrap(),
+            root,
+            config_file: None,
+            index: "index.php".to_owned(),
+            listing: true,
+            fastcgi: vec![FastCgiBackend {
+                extension: "php".to_owned(),
+                address: FastCgiAddress::Tcp("127.0.0.1:9000".to_owned()),
+            }],
+            fastcgi_timeout: Duration::from_secs(60),
+            tls: None,
+            worker: false,
+            worker_uid: None,
+            worker_gid: None,
+        }
+    }
+
+    fn temp_root() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "project-charlotte-fastcgi-{}-{}",
+            std::process::id(),
+            NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    #[test]
+    fn parses_status_location_and_rejects_malformed_cgi_headers() {
+        let status = parse_cgi_headers(b"Status: 201 Created\r\nX-Test: value\r\n\r\n").unwrap();
+        assert_eq!(status.status, StatusCode::CREATED);
+        assert_eq!(status.headers["x-test"], "value");
+
+        let redirect = parse_cgi_headers(b"Location: /next\r\n\r\n").unwrap();
+        assert_eq!(redirect.status, StatusCode::FOUND);
+
+        assert!(parse_cgi_headers(b"Broken header\r\n\r\n").is_err());
+        assert!(parse_cgi_headers(b"Status: 999 Nope\r\n\r\n").is_err());
+    }
+
+    #[tokio::test]
+    async fn resolves_script_path_info_index_and_rejects_traversal() {
+        let root = temp_root();
+        tokio::fs::create_dir_all(root.join("folder"))
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("app.php"), "<?php")
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("folder/index.php"), "<?php")
+            .await
+            .unwrap();
+        let config = test_config(tokio::fs::canonicalize(&root).await.unwrap());
+
+        let relative = decode_request_path("/app.php/extra/path").unwrap();
+        let script = resolve_script(&relative, "/app.php/extra/path", &config)
+            .await
+            .unwrap();
+        assert_eq!(script.script_name, "/app.php");
+        assert_eq!(script.path_info, "/extra/path");
+
+        let relative = decode_request_path("/folder/").unwrap();
+        let script = resolve_script(&relative, "/folder/", &config)
+            .await
+            .unwrap();
+        assert_eq!(script.script_name, "/folder/index.php");
+        assert!(script.path_info.is_empty());
+        assert!(decode_request_path("/%2e%2e/secret.php").is_none());
+
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[test]
+    fn builds_cgi_parameters_and_omits_http_proxy() {
+        use super::{ResolvedScript, build_params};
+
+        let config = test_config(PathBuf::from("/var/www"));
+        let script = ResolvedScript {
+            path: PathBuf::from("/var/www/app.php"),
+            script_name: "/app.php".to_owned(),
+            path_info: "/info".to_owned(),
+            backend: config.fastcgi[0].clone(),
+        };
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("/app.php/info?item=1")
+            .header("Host", "example.test")
+            .header("Content-Type", "text/plain")
+            .header("X-Test", "present")
+            .header("Proxy", "untrusted")
+            .body(())
+            .unwrap();
+        let (parts, ()) = request.into_parts();
+        let params = build_params(
+            &parts,
+            &script,
+            &config,
+            "192.0.2.1:12345".parse().unwrap(),
+            "192.0.2.10:8080".parse().unwrap(),
+            7,
+        );
+
+        assert_eq!(params["REQUEST_METHOD"], "POST");
+        assert_eq!(params["QUERY_STRING"], "item=1");
+        assert_eq!(params["PATH_INFO"], "/info");
+        assert_eq!(params["PATH_TRANSLATED"], "/var/www/info");
+        assert_eq!(params["HTTP_X_TEST"], "present");
+        assert!(!params.contains_key("HTTP_PROXY"));
+        assert_eq!(params["CONTENT_LENGTH"], "7");
+    }
+}
