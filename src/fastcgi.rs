@@ -568,6 +568,7 @@ mod tests {
     fn test_config(root: PathBuf) -> Config {
         Config {
             bind: "127.0.0.1:8080".parse::<SocketAddr>().unwrap(),
+            tls_bind: None,
             http3_bind: "127.0.0.1:8080".parse::<SocketAddr>().unwrap(),
             root,
             config_file: None,

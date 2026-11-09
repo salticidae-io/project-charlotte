@@ -6,6 +6,7 @@ mod handler;
 mod http3;
 mod httpdate;
 mod mime;
+mod tls;
 mod vhost;
 mod waf;
 mod worker;
@@ -13,18 +14,26 @@ mod worker;
 #[cfg(test)]
 mod fuzz_support;
 
-use std::{error::Error, net::SocketAddr, sync::Arc};
+use std::{error::Error, net::SocketAddr, sync::Arc, time::Duration};
 
 use hyper::{Request, service::service_fn};
 use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto,
 };
-use tokio::{net::TcpListener, sync::watch, task::JoinSet};
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    net::TcpListener,
+    sync::watch,
+    task::JoinSet,
+    time::timeout,
+};
+use tokio_rustls::TlsAcceptor;
 
 use crate::{
     config::{Config, FastCgiAddress, ParseResult},
-    vhost::Router,
+    tls::TlsSetup,
+    vhost::{Router, TlsSni},
     waf::Waf,
 };
 
@@ -56,18 +65,8 @@ async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> 
     if !tokio::fs::metadata(&root).await?.is_dir() {
         return Err(format!("document root is not a directory: {}", root.display()).into());
     }
-    let mut config = Config { root, ..config };
+    let config = Config { root, ..config };
     let listener = TcpListener::bind(config.bind).await?;
-    let http3_endpoint = if let Some(tls) = &config.tls {
-        let endpoint = http3::bind(config.http3_bind, tls)?;
-        Some(endpoint)
-    } else {
-        None
-    };
-    if let Some((_, address)) = &http3_endpoint {
-        config.http3_bind = *address;
-    }
-    let config = Arc::new(config);
     let waf = if config.modsecurity_rules.is_empty() {
         None
     } else {
@@ -78,12 +77,32 @@ async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> 
         )?)
     };
     let router =
-        Arc::new(Router::load(Arc::clone(&config), config.config_file.as_ref(), waf).await?);
+        Arc::new(Router::load(Arc::new(config.clone()), config.config_file.as_ref(), waf).await?);
+    let tls_setup = TlsSetup::load(&config, &router)?;
+    if config.tls_bind.is_some() && tls_setup.is_none() {
+        return Err("--tls-bind requires a global or virtual-host TLS certificate".into());
+    }
+    let tls_listener = match (config.tls_bind, tls_setup.as_ref()) {
+        (Some(address), Some(_)) => Some(TcpListener::bind(address).await?),
+        _ => None,
+    };
+    let http3_endpoint = if let Some(tls) = &tls_setup {
+        Some(http3::bind(config.http3_bind, &tls.http3)?)
+    } else {
+        None
+    };
+    let alt_svc_port = http3_endpoint.as_ref().map(|(_, address)| address.port());
+    let tls_acceptor = tls_setup
+        .as_ref()
+        .map(|tls| TlsAcceptor::from(Arc::clone(&tls.tcp)));
     eprintln!(
         "Listening on http://{} with root {}",
         config.bind,
         config.root.display()
     );
+    if let Some(listener) = &tls_listener {
+        eprintln!("Listening on https://{}", listener.local_addr()?);
+    }
     if let Some((_, address)) = &http3_endpoint {
         eprintln!("Listening on {} (HTTP/3)", address);
     }
@@ -120,13 +139,59 @@ async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> 
             _ = shutdown_rx.changed() => break,
             accepted = listener.accept() => {
                 let (stream, peer) = accepted?;
-                let config = Arc::clone(&config);
                 let router = Arc::clone(&router);
                 let connection_shutdown = shutdown_rx.clone();
                 let local = stream.local_addr()?;
                 connections.spawn(async move {
-                    if let Err(error) = serve_connection(stream, peer, local, config, router, connection_shutdown).await {
+                    if let Err(error) = serve_connection(
+                        stream,
+                        peer,
+                        local,
+                        router,
+                        connection_shutdown,
+                        alt_svc_port,
+                        None,
+                    ).await {
                         eprintln!("Connection from {peer} failed: {error}");
+                    }
+                });
+            }
+            accepted = async {
+                match &tls_listener {
+                    Some(listener) => listener.accept().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                let (stream, peer) = accepted?;
+                let local = stream.local_addr()?;
+                let router = Arc::clone(&router);
+                let connection_shutdown = shutdown_rx.clone();
+                let acceptor = tls_acceptor
+                    .as_ref()
+                    .expect("TLS listener requires a TLS acceptor")
+                    .clone();
+                connections.spawn(async move {
+                    match timeout(Duration::from_secs(10), acceptor.accept(stream)).await {
+                        Ok(Ok(stream)) => {
+                            let sni = stream.get_ref().1.server_name().map(str::to_owned);
+                            if let Err(error) = serve_connection(
+                                stream,
+                                peer,
+                                local,
+                                router,
+                                connection_shutdown,
+                                alt_svc_port,
+                                Some(sni),
+                            )
+                            .await
+                            {
+                                eprintln!("TLS connection from {peer} failed: {error}");
+                            }
+                        }
+                        Ok(Err(error)) => {
+                            eprintln!("TLS handshake from {peer} failed: {error}");
+                        }
+                        Err(_) => eprintln!("TLS handshake from {peer} timed out"),
                     }
                 });
             }
@@ -149,21 +214,28 @@ async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> 
     Ok(())
 }
 
-async fn serve_connection(
-    stream: tokio::net::TcpStream,
+async fn serve_connection<I>(
+    stream: I,
     peer: SocketAddr,
     local: SocketAddr,
-    config: Arc<Config>,
     router: Arc<Router>,
     mut shutdown: watch::Receiver<bool>,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
+    alt_svc_port: Option<u16>,
+    sni: Option<Option<String>>,
+) -> Result<(), Box<dyn Error + Send + Sync>>
+where
+    I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let io = TokioIo::new(stream);
-    let http3_port = config.tls.as_ref().map(|_| config.http3_bind.port());
-    let service = service_fn(move |request: Request<hyper::body::Incoming>| {
+    let service = service_fn(move |mut request: Request<hyper::body::Incoming>| {
         let router = Arc::clone(&router);
+        let sni = sni.clone();
         async move {
+            if let Some(sni) = sni {
+                request.extensions_mut().insert(TlsSni(sni));
+            }
             let mut response = router.dispatch(request, peer, local).await;
-            if let Some(port) = http3_port
+            if let Some(port) = alt_svc_port
                 && let Ok(value) = format!("h3=\":{port}\"").parse()
             {
                 response.headers_mut().insert(http::header::ALT_SVC, value);

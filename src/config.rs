@@ -15,6 +15,7 @@ pub enum FastCgiAddress {
 #[derive(Clone, Debug)]
 pub struct Config {
     pub bind: SocketAddr,
+    pub tls_bind: Option<SocketAddr>,
     pub http3_bind: SocketAddr,
     pub root: PathBuf,
     pub config_file: Option<PathBuf>,
@@ -47,6 +48,7 @@ impl Config {
         let mut bind = "127.0.0.1:8080"
             .parse()
             .expect("valid default socket address");
+        let mut tls_bind = None;
         let mut http3_bind = None;
         let mut root = PathBuf::from(".");
         let mut index = String::from("index.html");
@@ -118,6 +120,14 @@ impl Config {
                             .map_err(|_| format!("invalid HTTP/3 socket address: {value}"))?,
                     );
                 }
+                "--tls-bind" => {
+                    let value = next_value(&mut args, "--tls-bind")?;
+                    tls_bind = Some(
+                        value
+                            .parse()
+                            .map_err(|_| format!("invalid TLS socket address: {value}"))?,
+                    );
+                }
                 "--bind" => {
                     let value = next_value(&mut args, "--bind")?;
                     bind = value
@@ -174,7 +184,8 @@ impl Config {
 
         Ok(ParseResult::Config(Box::new(Self {
             bind,
-            http3_bind: http3_bind.unwrap_or(bind),
+            tls_bind,
+            http3_bind: http3_bind.unwrap_or_else(|| tls_bind.unwrap_or(bind)),
             root,
             config_file,
             index,
@@ -192,7 +203,7 @@ impl Config {
     }
 
     pub fn usage() -> &'static str {
-        "Usage: project-charlotte [--bind ADDRESS] [--root DIRECTORY] [--index NAME] [--no-listing] [--fastcgi EXT=ADDR]... [--fastcgi-timeout SECS] [--modsecurity-rules FILE]... [--modsecurity-body-limit BYTES] [--config FILE] [--tls-cert PATH --tls-key PATH] [--http3-bind ADDRESS] [--help]"
+        "Usage: project-charlotte [--bind ADDRESS] [--tls-bind ADDRESS] [--root DIRECTORY] [--index NAME] [--no-listing] [--fastcgi EXT=ADDR]... [--fastcgi-timeout SECS] [--modsecurity-rules FILE]... [--modsecurity-body-limit BYTES] [--config FILE] [--tls-cert PATH --tls-key PATH] [--http3-bind ADDRESS] [--help]"
     }
 }
 
@@ -319,6 +330,7 @@ mod tests {
             panic!("expected config")
         };
         assert_eq!(config.http3_bind.to_string(), "127.0.0.1:8443");
+        assert_eq!(config.tls_bind, None);
         assert_eq!(
             config.tls.as_ref().unwrap().cert,
             PathBuf::from("server.pem")
@@ -330,10 +342,39 @@ mod tests {
     }
 
     #[test]
+    fn tls_bind_defaults_http3_bind_when_not_overridden() {
+        let parsed = Config::parse([
+            "--bind".to_owned(),
+            "127.0.0.1:8080".to_owned(),
+            "--tls-bind".to_owned(),
+            "127.0.0.1:8443".to_owned(),
+        ])
+        .unwrap();
+        let ParseResult::Config(config) = parsed else {
+            panic!("expected config")
+        };
+        assert_eq!(config.tls_bind.unwrap().to_string(), "127.0.0.1:8443");
+        assert_eq!(config.http3_bind.to_string(), "127.0.0.1:8443");
+
+        let parsed = Config::parse([
+            "--tls-bind".to_owned(),
+            "127.0.0.1:8443".to_owned(),
+            "--http3-bind".to_owned(),
+            "127.0.0.1:9443".to_owned(),
+        ])
+        .unwrap();
+        let ParseResult::Config(config) = parsed else {
+            panic!("expected config")
+        };
+        assert_eq!(config.http3_bind.to_string(), "127.0.0.1:9443");
+    }
+
+    #[test]
     fn rejects_incomplete_tls_options_and_invalid_http3_bind() {
         assert!(Config::parse(["--tls-cert".to_owned(), "server.pem".to_owned()]).is_err());
         assert!(Config::parse(["--tls-key".to_owned(), "server-key.pem".to_owned()]).is_err());
         assert!(Config::parse(["--http3-bind".to_owned(), "localhost".to_owned()]).is_err());
+        assert!(Config::parse(["--tls-bind".to_owned(), "localhost".to_owned()]).is_err());
     }
 
     #[test]

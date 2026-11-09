@@ -1,10 +1,4 @@
-use std::{
-    error::Error,
-    fs::File,
-    io::{self, BufReader},
-    net::SocketAddr,
-    sync::Arc,
-};
+use std::{error::Error, io, net::SocketAddr, sync::Arc};
 
 use bytes::{Buf, Bytes};
 use futures_util::stream;
@@ -15,32 +9,15 @@ use http_body_util::{BodyExt, StreamBody};
 use quinn::{Endpoint, VarInt};
 use tokio::{sync::watch, task::JoinSet};
 
-use crate::{config::TlsFiles, vhost::Router};
+use crate::vhost::{Router, TlsSni};
 
 type H3Resolver = RequestResolver<h3_quinn::Connection, Bytes>;
 
 pub(crate) fn bind(
     address: SocketAddr,
-    tls_files: &TlsFiles,
+    tls_config: &Arc<rustls::ServerConfig>,
 ) -> Result<(Endpoint, SocketAddr), Box<dyn Error + Send + Sync>> {
-    let cert_file = File::open(&tls_files.cert)?;
-    let certs =
-        rustls_pemfile::certs(&mut BufReader::new(cert_file)).collect::<Result<Vec<_>, _>>()?;
-    if certs.is_empty() {
-        return Err("TLS certificate file contains no certificates".into());
-    }
-
-    let key_file = File::open(&tls_files.key)?;
-    let key = rustls_pemfile::private_key(&mut BufReader::new(key_file))?
-        .ok_or("TLS private-key file contains no private key")?;
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let mut tls_config = rustls::ServerConfig::builder_with_provider(provider)
-        .with_protocol_versions(&[&rustls::version::TLS13])?
-        .with_no_client_auth()
-        .with_single_cert(certs, key)?;
-    tls_config.alpn_protocols = vec![b"h3".to_vec()];
-
-    let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls_config)?;
+    let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls_config.as_ref().clone())?;
     let server_config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
     let endpoint = Endpoint::server(server_config, address)?;
     let local_address = endpoint.local_addr()?;
@@ -93,6 +70,10 @@ async fn serve_connection(
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let connection = incoming.await?;
     let peer = connection.remote_address();
+    let sni = connection
+        .handshake_data()
+        .and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
+        .and_then(|data| data.server_name);
     let mut h3_connection = h3::server::builder()
         .build(h3_quinn::Connection::new(connection))
         .await?;
@@ -104,8 +85,11 @@ async fn serve_connection(
                 match accepted? {
                     Some(resolver) => {
                         let router = Arc::clone(&router);
+                        let sni = sni.clone();
                         requests.spawn(async move {
-                            if let Err(error) = serve_request(resolver, router, peer, local).await {
+                            if let Err(error) =
+                                serve_request(resolver, router, peer, local, sni).await
+                            {
                                 eprintln!("HTTP/3 request failed: {error}");
                             }
                         });
@@ -133,8 +117,10 @@ async fn serve_request(
     router: Arc<Router>,
     peer: SocketAddr,
     local: SocketAddr,
+    sni: Option<String>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let (request, request_stream) = resolver.resolve_request().await?;
+    let (mut request, request_stream) = resolver.resolve_request().await?;
+    request.extensions_mut().insert(TlsSni(sni));
     let (mut send_stream, recv_stream) = request_stream.split();
     let body_stream = stream::unfold(recv_stream, |mut recv_stream| async move {
         match recv_stream.recv_data().await {

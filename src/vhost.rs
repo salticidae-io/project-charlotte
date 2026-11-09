@@ -21,7 +21,7 @@ use serde::Deserialize;
 use tokio::{io::AsyncReadExt, net::UnixStream, sync::Mutex, time::timeout};
 
 use crate::{
-    config::{Config, FastCgiAddress, FastCgiBackend},
+    config::{Config, FastCgiAddress, FastCgiBackend, TlsFiles},
     handler::{self, ResponseBody},
     waf::Waf,
 };
@@ -53,12 +53,15 @@ struct VhostFile {
     #[serde(default)]
     fastcgi: Vec<String>,
     fastcgi_timeout: Option<u64>,
+    tls_cert: Option<PathBuf>,
+    tls_key: Option<PathBuf>,
     #[serde(default)]
     default: bool,
 }
 
 struct Vhost {
     names: Vec<String>,
+    tls: Option<TlsFiles>,
     worker: Arc<Worker>,
 }
 
@@ -91,6 +94,9 @@ pub(crate) struct Router {
     default: Option<usize>,
     waf: Option<Waf>,
 }
+
+#[derive(Clone, Debug)]
+pub(crate) struct TlsSni(pub Option<String>);
 
 impl Router {
     pub(crate) async fn load(
@@ -175,6 +181,14 @@ impl Router {
             if timeout_seconds == 0 {
                 return Err("vhost FastCGI timeout must be greater than zero".into());
             }
+            let tls = match (entry.tls_cert, entry.tls_key) {
+                (Some(cert), Some(key)) => Some(TlsFiles {
+                    cert: resolve_config_path(cert, config_dir),
+                    key: resolve_config_path(key, config_dir),
+                }),
+                (None, None) => None,
+                _ => return Err("vhost tls_cert and tls_key must be supplied together".into()),
+            };
             let root = if entry.root.is_absolute() {
                 entry.root
             } else {
@@ -194,6 +208,7 @@ impl Router {
             *worker.process.lock().await = Some(process);
             vhosts.push(Vhost {
                 names: normalized_names,
+                tls,
                 worker,
             });
         }
@@ -226,6 +241,28 @@ impl Router {
         self.route(request, peer, local).await
     }
 
+    pub(crate) fn sni_certificates(&self) -> (Vec<(String, TlsFiles)>, Option<TlsFiles>) {
+        let entries = self
+            .vhosts
+            .iter()
+            .filter_map(|vhost| {
+                vhost.tls.as_ref().map(|tls| {
+                    vhost
+                        .names
+                        .iter()
+                        .cloned()
+                        .map(|name| (name, tls.clone()))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .flatten()
+            .collect();
+        let fallback = self
+            .default
+            .and_then(|index| self.vhosts[index].tls.clone());
+        (entries, fallback)
+    }
+
     async fn route<B>(
         &self,
         mut request: Request<B>,
@@ -237,6 +274,21 @@ impl Router {
         B::Error: Into<Box<dyn Error + Send + Sync>>,
     {
         let host = request_host(&request);
+        if let (Some(TlsSni(Some(sni))), Some(host)) =
+            (request.extensions().get::<TlsSni>(), host.as_deref())
+        {
+            let sni_selected = normalize_host(sni)
+                .as_deref()
+                .and_then(|sni| self.select_vhost(sni))
+                .or(self.default);
+            let host_selected = self.select_vhost(host).or(self.default);
+            if sni_selected != host_selected {
+                return handler::error_response(
+                    StatusCode::MISDIRECTED_REQUEST,
+                    "Request authority does not match TLS server name\n",
+                );
+            }
+        }
         let selected = host
             .as_deref()
             .and_then(|host| self.select_vhost(host))
@@ -423,7 +475,7 @@ fn request_host<B>(request: &Request<B>) -> Option<String> {
     normalize_host(authority.host())
 }
 
-fn normalize_host(value: &str) -> Option<String> {
+pub(crate) fn normalize_host(value: &str) -> Option<String> {
     let host = value.trim().trim_end_matches('.');
     if host.is_empty()
         || host
@@ -460,7 +512,7 @@ fn normalize_server_name(value: &str) -> Option<String> {
     Some(host)
 }
 
-fn match_score(pattern: &str, host: &str) -> Option<usize> {
+pub(crate) fn match_score(pattern: &str, host: &str) -> Option<usize> {
     if pattern == host {
         return Some(usize::MAX);
     }
@@ -487,6 +539,11 @@ fn validate_vhost_declarations(entries: &[VhostFile]) -> Result<(), Box<dyn Erro
     let mut names = std::collections::HashSet::new();
     let mut has_default = false;
     for (index, entry) in entries.iter().enumerate() {
+        if entry.tls_cert.is_some() != entry.tls_key.is_some() {
+            return Err(
+                format!("vhost {} must provide both tls_cert and tls_key", index + 1).into(),
+            );
+        }
         if entry.server_names.is_empty() {
             return Err(format!("vhost {} has no server_names", index + 1).into());
         }
@@ -505,6 +562,14 @@ fn validate_vhost_declarations(entries: &[VhostFile]) -> Result<(), Box<dyn Erro
         }
     }
     Ok(())
+}
+
+fn resolve_config_path(path: PathBuf, config_dir: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        config_dir.join(path)
+    }
 }
 
 fn resolve_identity(
@@ -620,6 +685,8 @@ mod tests {
             listing: None,
             fastcgi: Vec::new(),
             fastcgi_timeout: None,
+            tls_cert: None,
+            tls_key: None,
             default: is_default,
         }
     }
@@ -651,6 +718,17 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn validates_vhost_tls_certificate_pair() {
+        let mut entry = declaration(&["example.test"], false);
+        entry.tls_cert = Some("cert.pem".into());
+        assert!(validate_vhost_declarations(&[entry]).is_err());
+        let mut entry = declaration(&["example.test"], false);
+        entry.tls_cert = Some("cert.pem".into());
+        entry.tls_key = Some("key.pem".into());
+        assert!(validate_vhost_declarations(&[entry]).is_ok());
     }
 
     #[test]
