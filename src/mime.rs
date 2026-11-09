@@ -47,4 +47,15 @@ mod tests {
         assert_eq!(for_path(Path::new("asset.webp")), "image/webp");
         assert_eq!(for_path(Path::new("unknown")), "application/octet-stream");
     }
+
+    #[test_fuzz::test_fuzz]
+    fn mime_for_path(path: String) {
+        let _ = for_path(Path::new(&path));
+    }
+
+    #[test]
+    fn fuzz_seed_mime_for_path() {
+        mime_for_path("assets/style.CSS".to_owned());
+        mime_for_path("no-extension".to_owned());
+    }
 }

@@ -23,6 +23,7 @@ use tokio::{io::AsyncReadExt, net::UnixStream, sync::Mutex, time::timeout};
 use crate::{
     config::{Config, FastCgiAddress, FastCgiBackend},
     handler::{self, ResponseBody},
+    waf::Waf,
 };
 
 const META_PEER: HeaderName = HeaderName::from_static("x-charlotte-peer");
@@ -88,18 +89,21 @@ pub(crate) struct Router {
     fallback: Arc<Config>,
     vhosts: Vec<Vhost>,
     default: Option<usize>,
+    waf: Option<Waf>,
 }
 
 impl Router {
     pub(crate) async fn load(
         fallback: Arc<Config>,
         path: Option<&PathBuf>,
+        waf: Option<Waf>,
     ) -> Result<Self, Box<dyn Error + Send + Sync>> {
         let Some(path) = path else {
             return Ok(Self {
                 fallback,
                 vhosts: Vec::new(),
                 default: None,
+                waf,
             });
         };
         let content = std::fs::read_to_string(path)?;
@@ -114,13 +118,14 @@ impl Router {
         } else {
             current_dir.join(config_dir)
         };
-        Self::from_file(fallback, file, &config_dir).await
+        Self::from_file(fallback, file, &config_dir, waf).await
     }
 
     async fn from_file(
         fallback: Arc<Config>,
         file: FileConfig,
         config_dir: &Path,
+        waf: Option<Waf>,
     ) -> Result<Self, Box<dyn Error + Send + Sync>> {
         validate_vhost_declarations(&file.vhost)?;
         let mut vhosts = Vec::with_capacity(file.vhost.len());
@@ -197,10 +202,31 @@ impl Router {
             fallback,
             vhosts,
             default,
+            waf,
         })
     }
 
     pub(crate) async fn dispatch<B>(
+        &self,
+        request: Request<B>,
+        peer: SocketAddr,
+        local: SocketAddr,
+    ) -> Response<ResponseBody>
+    where
+        B: Body<Data = Bytes> + Send + 'static,
+        B::Error: Into<Box<dyn Error + Send + Sync>>,
+    {
+        if let Some(waf) = self.waf {
+            return waf
+                .inspect(request, peer, local, |request| {
+                    self.route(request, peer, local)
+                })
+                .await;
+        }
+        self.route(request, peer, local).await
+    }
+
+    async fn route<B>(
         &self,
         mut request: Request<B>,
         peer: SocketAddr,
@@ -550,11 +576,16 @@ fn version_name(version: Version) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        FileConfig, VhostFile, build_worker_args, match_score, normalize_host,
-        normalize_server_name, resolve_identity, validate_vhost_declarations,
+        FileConfig, Router, VhostFile, build_worker_args, match_score, normalize_host,
+        normalize_server_name, request_host, resolve_identity, validate_vhost_declarations,
     };
-    use crate::config::{FastCgiAddress, FastCgiBackend};
-    use std::{path::Path, time::Duration};
+    use crate::{
+        config::{FastCgiAddress, FastCgiBackend},
+        fuzz_support::{self, FuzzRequest},
+    };
+    use http::{HeaderValue, Request};
+    use http_body_util::BodyExt;
+    use std::{path::Path, sync::Arc, time::Duration};
 
     #[test]
     fn normalizes_authority_hosts() {
@@ -647,5 +678,96 @@ mod tests {
             args.windows(2)
                 .any(|pair| pair == ["--fastcgi", "php=127.0.0.1:9000"])
         );
+    }
+
+    #[test_fuzz::test_fuzz]
+    fn host_selection(host: String, uri: String, names: Vec<String>) {
+        let Ok(mut request) = Request::builder().uri(uri).body(()) else {
+            return;
+        };
+        if let Ok(value) = HeaderValue::from_str(&host) {
+            request.headers_mut().insert("host", value);
+        }
+        let Some(host) = request_host(&request) else {
+            return;
+        };
+        for name in names {
+            let Some(pattern) = normalize_server_name(&name) else {
+                continue;
+            };
+            if match_score(&pattern, &host).is_some() {
+                let wildcard_match = pattern.strip_prefix("*.").is_some_and(|suffix| {
+                    host.len() > suffix.len()
+                        && host.ends_with(suffix)
+                        && host.as_bytes().get(host.len() - suffix.len() - 1) == Some(&b'.')
+                });
+                assert!(pattern == host || wildcard_match);
+            }
+        }
+    }
+
+    #[test]
+    fn fuzz_seed_host_selection() {
+        host_selection(
+            "Api.Example.test:8443".to_owned(),
+            "/path".to_owned(),
+            vec!["api.example.test".to_owned(), "*.example.test".to_owned()],
+        );
+        host_selection(
+            "[2001:db8::1]:8080".to_owned(),
+            "/".to_owned(),
+            vec!["2001:db8::1".to_owned()],
+        );
+    }
+
+    #[test_fuzz::test_fuzz]
+    fn vhost_toml(input: String) {
+        if let Ok(file) = toml::from_str::<FileConfig>(&input) {
+            let _ = validate_vhost_declarations(&file.vhost);
+        }
+    }
+
+    #[test]
+    fn fuzz_seed_vhost_toml() {
+        vhost_toml(
+            "[[vhost]]\nserver_names = [\"example.test\"]\nroot = \"/tmp/site\"\nuser = \"user\"\n"
+                .to_owned(),
+        );
+        vhost_toml("[[vhost]]\nserver_names = [\"*..\"]\n".to_owned());
+    }
+
+    #[test_fuzz::test_fuzz]
+    fn router_request(input: FuzzRequest) {
+        let Some(request) = input.build() else {
+            return;
+        };
+        let fixture = fuzz_support::fixture();
+        let mut config = fuzz_support::fuzz_config(fixture.root.clone());
+        config.fastcgi.clear();
+        let (peer, local) = fuzz_support::addresses();
+        let response = fuzz_support::run(async {
+            let router = Router::load(Arc::new(config), None, None)
+                .await
+                .expect("fallback router loads");
+            router.dispatch(request, peer, local).await
+        });
+        assert!((100..=599).contains(&response.status().as_u16()));
+        let body = fuzz_support::run(async { response.into_body().collect().await })
+            .expect("router response body should be readable")
+            .to_bytes();
+        assert!(
+            !body
+                .windows(fixture.outside_secret.len())
+                .any(|window| window == fixture.outside_secret)
+        );
+    }
+
+    #[test]
+    fn fuzz_seed_router_request() {
+        router_request(FuzzRequest::default());
+        router_request(FuzzRequest {
+            uri: "/escape.txt".to_owned(),
+            ..FuzzRequest::default()
+        });
     }
 }

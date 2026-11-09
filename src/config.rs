@@ -22,6 +22,9 @@ pub struct Config {
     pub listing: bool,
     pub fastcgi: Vec<FastCgiBackend>,
     pub fastcgi_timeout: Duration,
+    pub modsecurity_rules: Vec<PathBuf>,
+    pub modsecurity_body_limit: usize,
+    pub modsecurity_response_body_limit: usize,
     pub tls: Option<TlsFiles>,
     pub worker: bool,
     pub worker_uid: Option<u32>,
@@ -50,6 +53,9 @@ impl Config {
         let mut listing = true;
         let mut fastcgi = Vec::new();
         let mut fastcgi_timeout = Duration::from_secs(60);
+        let mut modsecurity_rules = Vec::new();
+        let mut modsecurity_body_limit = 16 * 1024 * 1024;
+        let mut modsecurity_response_body_limit = 1024 * 1024;
         let mut tls_cert = None;
         let mut tls_key = None;
         let mut config_file = None;
@@ -85,6 +91,20 @@ impl Config {
                         .filter(|seconds| *seconds > 0)
                         .ok_or_else(|| format!("invalid FastCGI timeout: {value}"))?;
                     fastcgi_timeout = Duration::from_secs(seconds);
+                }
+                "--modsecurity-rules" => {
+                    modsecurity_rules
+                        .push(PathBuf::from(next_value(&mut args, "--modsecurity-rules")?));
+                }
+                "--modsecurity-body-limit" => {
+                    let value = next_value(&mut args, "--modsecurity-body-limit")?;
+                    let limit = value
+                        .parse::<usize>()
+                        .ok()
+                        .filter(|limit| *limit > 0)
+                        .ok_or_else(|| format!("invalid ModSecurity body limit: {value}"))?;
+                    modsecurity_body_limit = limit;
+                    modsecurity_response_body_limit = limit;
                 }
                 "--tls-cert" => {
                     tls_cert = Some(PathBuf::from(next_value(&mut args, "--tls-cert")?))
@@ -161,6 +181,9 @@ impl Config {
             listing,
             fastcgi,
             fastcgi_timeout,
+            modsecurity_rules,
+            modsecurity_body_limit,
+            modsecurity_response_body_limit,
             tls,
             worker,
             worker_uid,
@@ -169,7 +192,7 @@ impl Config {
     }
 
     pub fn usage() -> &'static str {
-        "Usage: project-charlotte [--bind ADDRESS] [--root DIRECTORY] [--index NAME] [--no-listing] [--fastcgi EXT=ADDR]... [--fastcgi-timeout SECS] [--config FILE] [--tls-cert PATH --tls-key PATH] [--http3-bind ADDRESS] [--help]"
+        "Usage: project-charlotte [--bind ADDRESS] [--root DIRECTORY] [--index NAME] [--no-listing] [--fastcgi EXT=ADDR]... [--fastcgi-timeout SECS] [--modsecurity-rules FILE]... [--modsecurity-body-limit BYTES] [--config FILE] [--tls-cert PATH --tls-key PATH] [--http3-bind ADDRESS] [--help]"
     }
 }
 
@@ -335,6 +358,40 @@ mod tests {
     }
 
     #[test]
+    fn parses_modsecurity_rules_and_body_limit() {
+        let parsed = Config::parse([
+            "--modsecurity-rules".to_owned(),
+            "base.conf".to_owned(),
+            "--modsecurity-rules".to_owned(),
+            "local.conf".to_owned(),
+            "--modsecurity-body-limit".to_owned(),
+            "4096".to_owned(),
+        ])
+        .unwrap();
+        let ParseResult::Config(config) = parsed else {
+            panic!("expected config")
+        };
+        assert_eq!(
+            config.modsecurity_rules,
+            [PathBuf::from("base.conf"), PathBuf::from("local.conf")]
+        );
+        assert_eq!(config.modsecurity_body_limit, 4096);
+        assert_eq!(config.modsecurity_response_body_limit, 4096);
+    }
+
+    #[test]
+    fn rejects_invalid_modsecurity_body_limit() {
+        assert!(Config::parse(["--modsecurity-body-limit".to_owned(), "0".to_owned()]).is_err());
+        assert!(
+            Config::parse([
+                "--modsecurity-body-limit".to_owned(),
+                "not-a-number".to_owned()
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn rejects_worker_identity_without_worker_mode() {
         assert!(
             Config::parse([
@@ -345,5 +402,32 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test_fuzz::test_fuzz]
+    fn cli_args(args: Vec<String>) {
+        let _ = Config::parse(args);
+    }
+
+    #[test]
+    fn fuzz_seed_cli_args() {
+        cli_args(vec!["--help".to_owned()]);
+        cli_args(vec![
+            "--bind".to_owned(),
+            "127.0.0.1:8080".to_owned(),
+            "--fastcgi".to_owned(),
+            "php=127.0.0.1:9000".to_owned(),
+        ]);
+    }
+
+    #[test_fuzz::test_fuzz]
+    fn fastcgi_backend(value: &str) {
+        let _ = super::parse_fastcgi_backend(value);
+    }
+
+    #[test]
+    fn fuzz_seed_fastcgi_backend() {
+        fastcgi_backend("php=127.0.0.1:9000");
+        fastcgi_backend("php=unix:/run/php.sock");
     }
 }

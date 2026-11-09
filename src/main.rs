@@ -7,7 +7,11 @@ mod http3;
 mod httpdate;
 mod mime;
 mod vhost;
+mod waf;
 mod worker;
+
+#[cfg(test)]
+mod fuzz_support;
 
 use std::{error::Error, net::SocketAddr, sync::Arc};
 
@@ -21,6 +25,7 @@ use tokio::{net::TcpListener, sync::watch, task::JoinSet};
 use crate::{
     config::{Config, FastCgiAddress, ParseResult},
     vhost::Router,
+    waf::Waf,
 };
 
 fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -63,7 +68,17 @@ async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> 
         config.http3_bind = *address;
     }
     let config = Arc::new(config);
-    let router = Arc::new(Router::load(Arc::clone(&config), config.config_file.as_ref()).await?);
+    let waf = if config.modsecurity_rules.is_empty() {
+        None
+    } else {
+        Some(Waf::load(
+            &config.modsecurity_rules,
+            config.modsecurity_body_limit,
+            config.modsecurity_response_body_limit,
+        )?)
+    };
+    let router =
+        Arc::new(Router::load(Arc::clone(&config), config.config_file.as_ref(), waf).await?);
     eprintln!(
         "Listening on http://{} with root {}",
         config.bind,
@@ -78,6 +93,12 @@ async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> 
             FastCgiAddress::Unix(path) => format!("unix:{}", path.display()),
         };
         eprintln!("FastCGI .{} -> {address}", backend.extension);
+    }
+    if !config.modsecurity_rules.is_empty() {
+        eprintln!(
+            "ModSecurity enabled with {} rule file(s)",
+            config.modsecurity_rules.len()
+        );
     }
 
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);

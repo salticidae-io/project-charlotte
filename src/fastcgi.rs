@@ -546,18 +546,22 @@ fn log_stderr(bytes: &[u8]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_cgi_headers, resolve_script};
+    use super::{build_params, execute, parse_cgi_headers, resolve_script};
     use crate::{
         config::{Config, FastCgiAddress, FastCgiBackend},
+        fuzz_support::{self, FuzzRequest},
         handler::decode_request_path,
     };
     use http::StatusCode;
+    use http_body::Body;
+    use http_body_util::BodyExt;
     use std::{
         net::SocketAddr,
         path::PathBuf,
         sync::atomic::{AtomicU64, Ordering},
         time::Duration,
     };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -574,6 +578,9 @@ mod tests {
                 address: FastCgiAddress::Tcp("127.0.0.1:9000".to_owned()),
             }],
             fastcgi_timeout: Duration::from_secs(60),
+            modsecurity_rules: Vec::new(),
+            modsecurity_body_limit: 16 * 1024 * 1024,
+            modsecurity_response_body_limit: 1024 * 1024,
             tls: None,
             worker: false,
             worker_uid: None,
@@ -636,7 +643,7 @@ mod tests {
 
     #[test]
     fn builds_cgi_parameters_and_omits_http_proxy() {
-        use super::{ResolvedScript, build_params};
+        use super::ResolvedScript;
 
         let config = test_config(PathBuf::from("/var/www"));
         let script = ResolvedScript {
@@ -671,5 +678,143 @@ mod tests {
         assert_eq!(params["HTTP_X_TEST"], "present");
         assert!(!params.contains_key("HTTP_PROXY"));
         assert_eq!(params["CONTENT_LENGTH"], "7");
+    }
+
+    #[test_fuzz::test_fuzz]
+    fn cgi_headers(stdout: Vec<u8>) {
+        let _ = parse_cgi_headers(&stdout);
+    }
+
+    #[test]
+    fn fuzz_seed_cgi_headers() {
+        cgi_headers(b"Status: 201 Created\r\nContent-Type: text/plain\r\n\r\n".to_vec());
+        cgi_headers(b"malformed header\r\n".to_vec());
+    }
+
+    #[test_fuzz::test_fuzz]
+    fn fastcgi_request(request: FuzzRequest, stdout_chunks: Vec<Vec<u8>>, stderr: Vec<u8>) {
+        let Some(request) = request.build() else {
+            return;
+        };
+        let fixture = fuzz_support::fixture();
+        let Ok(root) = std::fs::canonicalize(&fixture.root) else {
+            return;
+        };
+        let config = fuzz_support::fuzz_config(root.clone());
+        let uri = request.uri().clone();
+        let Some(relative) = decode_request_path(uri.path()) else {
+            return;
+        };
+        let Some(script) = fuzz_support::run(resolve_script(&relative, uri.path(), &config)) else {
+            return;
+        };
+        assert!(script.path.starts_with(&root));
+
+        let (peer, local) = fuzz_support::addresses();
+        let request_body = request.body().clone();
+        let (parts, _) = request.into_parts();
+        let params = build_params(
+            &parts,
+            &script,
+            &config,
+            peer,
+            local,
+            request_body.size_hint().exact().unwrap_or_default() as usize,
+        );
+        assert!(!params.contains_key("HTTP_PROXY"));
+        assert_eq!(params["SCRIPT_FILENAME"], script.path.to_string_lossy());
+
+        fuzz_support::run(async move {
+            let (client, mut server) = tokio::io::duplex(1024 * 1024);
+            let responder = tokio::spawn(async move {
+                loop {
+                    let mut header = [0; 8];
+                    if server.read_exact(&mut header).await.is_err() {
+                        return;
+                    }
+                    let content_length = usize::from(u16::from_be_bytes([header[4], header[5]]));
+                    let padding_length = usize::from(header[6]);
+                    let mut content = vec![0; content_length];
+                    if server.read_exact(&mut content).await.is_err() {
+                        return;
+                    }
+                    if padding_length > 0 {
+                        let mut padding = vec![0; padding_length];
+                        if server.read_exact(&mut padding).await.is_err() {
+                            return;
+                        }
+                    }
+                    if header[1] == 5 && content.is_empty() {
+                        break;
+                    }
+                }
+                for chunk in stdout_chunks {
+                    write_records(&mut server, 6, &chunk).await;
+                }
+                for chunk in stderr.chunks(60_000) {
+                    write_record(&mut server, 7, chunk).await;
+                }
+                write_record(&mut server, 6, &[]).await;
+                write_record(&mut server, 3, &[0; 8]).await;
+                let _ = server.flush().await;
+            });
+            let body = request_body
+                .collect()
+                .await
+                .map(|collected| collected.to_bytes())
+                .unwrap_or_default();
+            let result = execute(client, params, body, Duration::from_secs(1)).await;
+            if let Ok(response) = result {
+                let _ = response.into_body().collect().await;
+            }
+            let _ = responder.await;
+        });
+    }
+
+    #[test]
+    fn fuzz_seed_fastcgi_request() {
+        fastcgi_request(
+            FuzzRequest {
+                uri: "/app.php/extra?x=1".to_owned(),
+                headers: vec![
+                    ("Host".to_owned(), b"example.test".to_vec()),
+                    ("Proxy".to_owned(), b"untrusted".to_vec()),
+                ],
+                ..FuzzRequest::default()
+            },
+            vec![b"Content-Type: text/plain\r\n\r\nresponse".to_vec()],
+            Vec::new(),
+        );
+        fastcgi_request(FuzzRequest::default(), Vec::new(), Vec::new());
+    }
+
+    async fn write_records<W>(writer: &mut W, record_type: u8, content: &[u8])
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        for chunk in content.chunks(60_000) {
+            write_record(writer, record_type, chunk).await;
+        }
+        if content.is_empty() {
+            write_record(writer, record_type, &[]).await;
+        }
+    }
+
+    async fn write_record<W>(writer: &mut W, record_type: u8, content: &[u8])
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        let header = [
+            1,
+            record_type,
+            0,
+            1,
+            (content.len() >> 8) as u8,
+            content.len() as u8,
+            0,
+            0,
+        ];
+        let _ = writer.write_all(&header).await;
+        let _ = writer.write_all(content).await;
     }
 }

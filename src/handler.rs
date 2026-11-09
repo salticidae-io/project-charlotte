@@ -538,7 +538,15 @@ fn full_body(bytes: Bytes) -> ResponseBody {
 #[cfg(test)]
 mod tests {
     use super::{decode_request_path, escape_html, parse_byte_range};
-    use std::path::Path;
+    use std::{
+        path::{Component, Path},
+        sync::Arc,
+        time::{Duration, UNIX_EPOCH},
+    };
+
+    use http_body_util::BodyExt;
+
+    use crate::fuzz_support::{self, FuzzRequest};
 
     #[test]
     fn decodes_paths_and_rejects_traversal() {
@@ -567,5 +575,96 @@ mod tests {
             escape_html("<a x=\"&'\">"),
             "&lt;a x=&quot;&amp;&#39;&quot;&gt;"
         );
+    }
+
+    #[test_fuzz::test_fuzz]
+    fn request_path(path: String) {
+        if let Some(decoded) = decode_request_path(&path) {
+            assert!(
+                decoded
+                    .components()
+                    .all(|component| matches!(component, Component::Normal(_)))
+            );
+        }
+    }
+
+    #[test]
+    fn fuzz_seed_request_path() {
+        request_path("/subdir/index.html".to_owned());
+        request_path("/%2e%2e/secret".to_owned());
+    }
+
+    #[test_fuzz::test_fuzz]
+    fn byte_range(value: &str, size: u64) {
+        if let Ok(Some((start, end))) = parse_byte_range(value, size) {
+            assert!(start <= end);
+            assert!(end < size);
+        }
+    }
+
+    #[test]
+    fn fuzz_seed_byte_range() {
+        byte_range("bytes=2-5", 10);
+        byte_range("bytes=-3", 10);
+    }
+
+    #[test_fuzz::test_fuzz]
+    fn if_range(value: &str, etag: &str) {
+        let _ = super::if_range_matches(value, etag, UNIX_EPOCH + Duration::from_secs(784_111_777));
+    }
+
+    #[test]
+    fn fuzz_seed_if_range() {
+        if_range("\"tag\"", "\"tag\"");
+        if_range("invalid", "\"tag\"");
+    }
+
+    #[test_fuzz::test_fuzz]
+    fn html_escape(value: &str) {
+        let escaped = escape_html(value);
+        for character in ['<', '>', '"', '\''] {
+            assert!(!escaped.contains(character));
+        }
+    }
+
+    #[test]
+    fn fuzz_seed_html_escape() {
+        html_escape("<script>alert('&')</script>");
+        html_escape("ordinary text");
+    }
+
+    #[test_fuzz::test_fuzz]
+    fn static_request(request: FuzzRequest) {
+        let Some(request) = request.build() else {
+            return;
+        };
+        let fixture = fuzz_support::fixture();
+        let mut config = fuzz_support::fuzz_config(fixture.root.clone());
+        config.fastcgi.clear();
+        let (peer, local) = fuzz_support::addresses();
+        let response = fuzz_support::run(super::handle_request(
+            request,
+            Arc::new(config),
+            peer,
+            local,
+        ));
+        assert!((100..=599).contains(&response.status().as_u16()));
+        let body = fuzz_support::run(async { response.into_body().collect().await })
+            .expect("static response body should be readable")
+            .to_bytes();
+        assert!(
+            !body
+                .windows(fixture.outside_secret.len())
+                .any(|window| window == fixture.outside_secret)
+        );
+    }
+
+    #[test]
+    fn fuzz_seed_static_request() {
+        static_request(FuzzRequest::default());
+        static_request(FuzzRequest {
+            uri: "/escape.txt".to_owned(),
+            ..FuzzRequest::default()
+        });
     }
 }

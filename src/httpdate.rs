@@ -241,4 +241,18 @@ mod tests {
         );
         assert_eq!(parse_http_date("Sun Nov  6 08:49:37 1994"), Some(expected));
     }
+
+    #[test_fuzz::test_fuzz]
+    fn http_date(value: &str) {
+        if let Some(time) = parse_http_date(value) {
+            let formatted = format_http_date(time);
+            assert_eq!(parse_http_date(&formatted), Some(time));
+        }
+    }
+
+    #[test]
+    fn fuzz_seed_http_date() {
+        http_date("Sun, 06 Nov 1994 08:49:37 GMT");
+        http_date("not a date");
+    }
 }

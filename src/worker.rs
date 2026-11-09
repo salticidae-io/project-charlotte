@@ -62,18 +62,37 @@ async fn dispatch(
     mut request: Request<hyper::body::Incoming>,
     config: Arc<Config>,
 ) -> http::Response<handler::ResponseBody> {
-    let Some(peer) = take_socket_addr(&mut request, "x-charlotte-peer") else {
-        return handler::error_response(StatusCode::BAD_REQUEST, "Invalid worker metadata\n");
+    let (peer, local) = match prepare_request(&mut request) {
+        Ok(addresses) => addresses,
+        Err(PrepareError::Metadata) => {
+            return handler::error_response(StatusCode::BAD_REQUEST, "Invalid worker metadata\n");
+        }
+        Err(PrepareError::Uri) => {
+            return handler::error_response(StatusCode::BAD_REQUEST, "Invalid URI\n");
+        }
     };
-    let Some(local) = take_socket_addr(&mut request, "x-charlotte-local") else {
-        return handler::error_response(StatusCode::BAD_REQUEST, "Invalid worker metadata\n");
+    handler::handle_request(request, config, peer, local).await
+}
+
+#[derive(Clone, Copy)]
+enum PrepareError {
+    Metadata,
+    Uri,
+}
+
+fn prepare_request<B>(request: &mut Request<B>) -> Result<(SocketAddr, SocketAddr), PrepareError> {
+    let Some(peer) = take_socket_addr(request, "x-charlotte-peer") else {
+        return Err(PrepareError::Metadata);
+    };
+    let Some(local) = take_socket_addr(request, "x-charlotte-local") else {
+        return Err(PrepareError::Metadata);
     };
     let Some(version) = request
         .headers_mut()
         .remove("x-charlotte-version")
         .and_then(|value| value.to_str().ok().and_then(parse_version))
     else {
-        return handler::error_response(StatusCode::BAD_REQUEST, "Invalid worker metadata\n");
+        return Err(PrepareError::Metadata);
     };
 
     let path_and_query = request
@@ -82,11 +101,11 @@ async fn dispatch(
         .map_or("/", |value| value.as_str());
     let uri = match Uri::builder().path_and_query(path_and_query).build() {
         Ok(uri) => uri,
-        Err(_) => return handler::error_response(StatusCode::BAD_REQUEST, "Invalid URI\n"),
+        Err(_) => return Err(PrepareError::Uri),
     };
     *request.uri_mut() = uri;
     *request.version_mut() = version;
-    handler::handle_request(request, config, peer, local).await
+    Ok((peer, local))
 }
 
 fn take_socket_addr<B>(request: &mut Request<B>, name: &str) -> Option<SocketAddr> {
@@ -104,5 +123,43 @@ fn parse_version(value: &str) -> Option<Version> {
         "HTTP/2.0" => Some(Version::HTTP_2),
         "HTTP/3.0" => Some(Version::HTTP_3),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prepare_request;
+    use crate::fuzz_support::FuzzRequest;
+
+    #[test_fuzz::test_fuzz]
+    fn worker_metadata(request: FuzzRequest) {
+        let Some(mut request) = request.build() else {
+            return;
+        };
+        if prepare_request(&mut request).is_ok() {
+            for name in [
+                "x-charlotte-peer",
+                "x-charlotte-local",
+                "x-charlotte-version",
+            ] {
+                assert!(!request.headers().contains_key(name));
+            }
+            assert!(request.uri().path().starts_with('/'));
+        }
+    }
+
+    #[test]
+    fn fuzz_seed_worker_metadata() {
+        worker_metadata(FuzzRequest {
+            uri: "http://example.test/a.php?x=1".to_owned(),
+            version: "HTTP/2.0".to_owned(),
+            headers: vec![
+                ("x-charlotte-peer".to_owned(), b"127.0.0.1:12345".to_vec()),
+                ("x-charlotte-local".to_owned(), b"127.0.0.1:8080".to_vec()),
+                ("x-charlotte-version".to_owned(), b"HTTP/1.1".to_vec()),
+            ],
+            ..FuzzRequest::default()
+        });
+        worker_metadata(FuzzRequest::default());
     }
 }
