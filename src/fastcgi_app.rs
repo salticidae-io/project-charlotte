@@ -8,10 +8,17 @@ use std::{
     },
     path::{Path, PathBuf},
     process::Stdio,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU32, AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
+use nix::{
+    sys::signal::{Signal, kill},
+    unistd::Pid,
+};
 use tokio::{
     process::{Child, Command},
     task::JoinHandle,
@@ -27,11 +34,25 @@ const RESTART_DELAY: Duration = Duration::from_secs(1);
 pub(crate) struct AppHandle {
     supervisor: JoinHandle<()>,
     socket_dir: PathBuf,
+    pid: Arc<AtomicU32>,
 }
 
 impl Drop for AppHandle {
     fn drop(&mut self) {
+        // Stop the supervisor first so that it cannot restart the app in
+        // response to the kill below.
         self.supervisor.abort();
+        // Aborting drops the supervisor's `Child`, and `kill_on_drop` would then
+        // reap the app, but only once the runtime polls the task again. Signal
+        // the process directly so that the descriptors it inherited - notably
+        // stderr, which keeps a piped parent's output pipe open - are released
+        // even when the runtime never gets another chance to run.
+        let pid = self.pid.swap(0, Ordering::SeqCst);
+        if let Ok(pid) = i32::try_from(pid)
+            && pid > 0
+        {
+            let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
+        }
         if let Err(error) = fs::remove_dir_all(&self.socket_dir)
             && error.kind() != io::ErrorKind::NotFound
         {
@@ -55,7 +76,8 @@ pub(crate) async fn start_apps(
         let extension = backend.extension.clone();
         let app = app.clone();
         let (socket_dir, socket_path, listener) = create_listener()?;
-        let child = match spawn_app(&app, &root, &listener) {
+        let pid = Arc::new(AtomicU32::new(0));
+        let child = match spawn_app(&app, &root, &listener, &pid) {
             Ok(child) => child,
             Err(error) => {
                 drop(listener);
@@ -67,11 +89,18 @@ pub(crate) async fn start_apps(
             "Started FastCGI app .{extension}: {}",
             app.program.display()
         );
-        let supervisor = tokio::spawn(supervise(listener, app, root.clone(), child));
+        let supervisor = tokio::spawn(supervise(
+            listener,
+            app,
+            root.clone(),
+            child,
+            Arc::clone(&pid),
+        ));
         backend.address = FastCgiAddress::Unix(socket_path);
         handles.push(AppHandle {
             supervisor,
             socket_dir,
+            pid,
         });
     }
     Ok(handles)
@@ -102,7 +131,12 @@ fn create_listener() -> io::Result<(PathBuf, PathBuf, UnixListener)> {
     }
 }
 
-fn spawn_app(app: &FastCgiApp, root: &Path, listener: &UnixListener) -> io::Result<Child> {
+fn spawn_app(
+    app: &FastCgiApp,
+    root: &Path,
+    listener: &UnixListener,
+    pid: &AtomicU32,
+) -> io::Result<Child> {
     let path = std::env::var_os("PATH").unwrap_or_default();
     let listener_fd = listener.as_fd().try_clone_to_owned()?;
     let mut command = Command::new(&app.program);
@@ -117,13 +151,25 @@ fn spawn_app(app: &FastCgiApp, root: &Path, listener: &UnixListener) -> io::Resu
         .stderr(Stdio::inherit())
         .current_dir(root)
         .kill_on_drop(true);
-    command.spawn()
+    let child = command.spawn()?;
+    // Recorded with no intervening await so that `AppHandle` never observes a
+    // pid that has already been reaped and possibly recycled.
+    pid.store(child.id().unwrap_or(0), Ordering::SeqCst);
+    Ok(child)
 }
 
-async fn supervise(listener: UnixListener, app: FastCgiApp, root: PathBuf, mut child: Child) {
+async fn supervise(
+    listener: UnixListener,
+    app: FastCgiApp,
+    root: PathBuf,
+    mut child: Child,
+    pid: Arc<AtomicU32>,
+) {
     loop {
         let started = Instant::now();
-        match child.wait().await {
+        let status = child.wait().await;
+        pid.store(0, Ordering::SeqCst);
+        match status {
             Ok(status) => eprintln!("FastCGI app {} exited with {status}", app.program.display()),
             Err(error) => eprintln!(
                 "could not wait for FastCGI app {}: {error}",
@@ -135,7 +181,7 @@ async fn supervise(listener: UnixListener, app: FastCgiApp, root: PathBuf, mut c
         }
 
         loop {
-            match spawn_app(&app, &root, &listener) {
+            match spawn_app(&app, &root, &listener, &pid) {
                 Ok(restarted) => {
                     child = restarted;
                     break;

@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+mod common;
+
 use std::{
     io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -189,8 +191,7 @@ fn make_directory_certificate() -> (rcgen::Certificate, KeyPair) {
 impl Drop for Fixture {
     fn drop(&mut self) {
         self.mock.abort();
-        let _ = self.server.kill();
-        let _ = self.server.wait();
+        common::shutdown(&mut self.server);
         let _ = std::fs::remove_dir_all(&self.root);
         let _ = std::fs::remove_dir_all(&self.cache);
     }

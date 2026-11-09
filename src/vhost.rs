@@ -7,8 +7,9 @@ use std::{
     os::{fd::OwnedFd, unix::net::UnixStream as StdUnixStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::Arc,
-    time::Duration,
+    sync::{Arc, RwLock},
+    thread,
+    time::{Duration, Instant},
 };
 
 use bytes::Bytes;
@@ -17,7 +18,10 @@ use http_body::Body;
 use http_body_util::{BodyExt, combinators::UnsyncBoxBody};
 use hyper::{body::Incoming, client::conn::http2::SendRequest};
 use hyper_util::rt::{TokioExecutor, TokioIo};
-use nix::unistd::{Group, User};
+use nix::{
+    sys::signal::{Signal, kill},
+    unistd::{Group, Pid, User},
+};
 use serde::Deserialize;
 use tokio::{io::AsyncReadExt, net::UnixStream, sync::Mutex, time::timeout};
 
@@ -32,18 +36,23 @@ const META_PEER: HeaderName = HeaderName::from_static("x-charlotte-peer");
 const META_LOCAL: HeaderName = HeaderName::from_static("x-charlotte-local");
 const META_VERSION: HeaderName = HeaderName::from_static("x-charlotte-version");
 const WORKER_READY_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a worker is given to shut down on its own before it is killed.
+const WORKER_SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
+const WORKER_SHUTDOWN_POLL: Duration = Duration::from_millis(5);
 
 type WorkerRequestBody = UnsyncBoxBody<Bytes, io::Error>;
 type WorkerSender = SendRequest<WorkerRequestBody>;
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileConfig {
     #[serde(default)]
     vhost: Vec<VhostFile>,
+    #[serde(default)]
+    vhost_dir: Option<PathBuf>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct VhostFile {
     server_names: Vec<String>,
@@ -66,7 +75,7 @@ struct VhostFile {
     acme: Option<bool>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(untagged)]
 enum RuleIdFile {
     Integer(u64),
@@ -82,7 +91,7 @@ impl RuleIdFile {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FastCgiAppFile {
     extension: String,
@@ -95,6 +104,7 @@ struct Vhost {
     names: Vec<String>,
     tls: Option<TlsFiles>,
     acme: bool,
+    default: bool,
     waf: Option<Waf>,
     worker: Arc<Worker>,
 }
@@ -117,6 +127,28 @@ struct WorkerProcess {
 
 impl Drop for WorkerProcess {
     fn drop(&mut self) {
+        // SIGKILL alone would stop the worker before it could drop the handles
+        // that stop its FastCGI apps, orphaning those apps along with every
+        // descriptor they inherited. Ask for an orderly exit first, and fall
+        // back to SIGKILL only if the worker does not take it. The wait is
+        // bounded and short because this runs on whichever thread drops the
+        // worker, which may be a runtime thread.
+        if let Ok(pid) = i32::try_from(self.child.id())
+            && kill(Pid::from_raw(pid), Signal::SIGTERM).is_ok()
+        {
+            let deadline = Instant::now() + WORKER_SHUTDOWN_GRACE;
+            loop {
+                match self.child.try_wait() {
+                    Ok(Some(_)) => return,
+                    Ok(None) => {}
+                    Err(_) => break,
+                }
+                if Instant::now() >= deadline {
+                    break;
+                }
+                thread::sleep(WORKER_SHUTDOWN_POLL);
+            }
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -124,10 +156,28 @@ impl Drop for WorkerProcess {
 
 pub(crate) struct Router {
     fallback: Arc<Config>,
-    vhosts: Vec<Vhost>,
-    default: Option<usize>,
+    table: RwLock<Arc<VhostTable>>,
+    sources: Mutex<SourceState>,
+    dir: Option<PathBuf>,
     waf: Option<Waf>,
     acme: Option<AcmeManager>,
+}
+
+struct VhostTable {
+    vhosts: Vec<Arc<Vhost>>,
+    default: Option<usize>,
+}
+
+struct SourceState {
+    main_entries: Vec<VhostFile>,
+    main_vhosts: Option<Vec<Arc<Vhost>>>,
+    files: BTreeMap<PathBuf, LoadedSource>,
+}
+
+struct LoadedSource {
+    content: String,
+    entries: Vec<VhostFile>,
+    vhosts: Vec<Arc<Vhost>>,
 }
 
 #[derive(Clone, Debug)]
@@ -139,28 +189,165 @@ impl Router {
         path: Option<&PathBuf>,
         waf: Option<Waf>,
     ) -> Result<Self, Box<dyn Error + Send + Sync>> {
-        let Some(path) = path else {
-            return Ok(Self {
-                fallback,
-                vhosts: Vec::new(),
-                default: None,
-                waf,
-                acme: None,
-            });
-        };
-        let content = std::fs::read_to_string(path)?;
-        let file: FileConfig = toml::from_str(&content)?;
         let current_dir = std::env::current_dir()?;
-        let config_dir = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or(std::path::Path::new("."));
-        let config_dir = if config_dir.is_absolute() {
-            config_dir.to_path_buf()
+        let config_dir = if let Some(path) = path {
+            let config_dir = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or(std::path::Path::new("."));
+            if config_dir.is_absolute() {
+                config_dir.to_path_buf()
+            } else {
+                current_dir.join(config_dir)
+            }
         } else {
-            current_dir.join(config_dir)
+            current_dir.clone()
         };
-        Self::from_file(fallback, file, &config_dir, waf).await
+        let file = if let Some(path) = path {
+            let content = std::fs::read_to_string(path)?;
+            toml::from_str(&content)?
+        } else {
+            FileConfig {
+                vhost: Vec::new(),
+                vhost_dir: None,
+            }
+        };
+        let dir = fallback
+            .vhost_dir
+            .clone()
+            .or_else(|| {
+                file.vhost_dir
+                    .clone()
+                    .map(|dir| resolve_config_path(dir, &config_dir))
+            })
+            .map(|dir| resolve_config_path(dir, &current_dir));
+        let mut router = Self::from_file(Arc::clone(&fallback), file, &config_dir, waf).await?;
+        router.dir = dir;
+        if router.dir.is_some() {
+            router.reload_dir().await?;
+        }
+        Ok(router)
+    }
+
+    pub(crate) async fn reload_dir(&self) -> Result<bool, Box<dyn Error + Send + Sync>> {
+        let Some(dir) = &self.dir else {
+            return Ok(false);
+        };
+        let mut sources = self.sources.lock().await;
+        let paths = scan_vhost_files(dir)?;
+        let mut candidates = Vec::with_capacity(paths.len());
+        for path in paths {
+            let content = std::fs::read_to_string(&path)?;
+            let old = sources.files.get(&path);
+            let entries = if old.is_some_and(|source| source.content == content) {
+                old.expect("checked source exists").entries.clone()
+            } else {
+                let file: FileConfig = toml::from_str(&content)?;
+                file.vhost
+            };
+            candidates.push((path, content, entries));
+        }
+
+        let mut all_entries = sources.main_entries.clone();
+        for (_, _, entries) in &candidates {
+            all_entries.extend(entries.iter().cloned());
+        }
+        validate_vhost_declarations(&all_entries)?;
+        validate_vhost_waf_declarations(&all_entries, self.waf.is_some())?;
+
+        let mut changed = sources.main_vhosts.is_none()
+            || sources.files.len() != candidates.len()
+            || candidates.iter().any(|(path, content, _)| {
+                sources
+                    .files
+                    .get(path)
+                    .is_none_or(|source| source.content != *content)
+            });
+        let main_vhosts = match &sources.main_vhosts {
+            Some(vhosts) => vhosts.clone(),
+            None => {
+                let file = FileConfig {
+                    vhost: sources.main_entries.clone(),
+                    vhost_dir: None,
+                };
+                let router = Self::from_file(
+                    Arc::clone(&self.fallback),
+                    file,
+                    &std::env::current_dir()?,
+                    self.waf,
+                )
+                .await?;
+                router.snapshot().vhosts.clone()
+            }
+        };
+
+        let mut loaded = BTreeMap::new();
+        for (path, content, entries) in candidates {
+            if let Some(old) = sources.files.get(&path)
+                && old.content == content
+            {
+                loaded.insert(
+                    path,
+                    LoadedSource {
+                        content,
+                        entries,
+                        vhosts: old.vhosts.clone(),
+                    },
+                );
+                continue;
+            }
+            let config_dir = path.parent().unwrap_or(dir);
+            let mut vhosts = Vec::with_capacity(entries.len());
+            for entry in &entries {
+                let router = Self::from_file(
+                    Arc::clone(&self.fallback),
+                    FileConfig {
+                        vhost: vec![entry.clone()],
+                        vhost_dir: None,
+                    },
+                    config_dir,
+                    self.waf,
+                )
+                .await?;
+                vhosts.extend(router.snapshot().vhosts.iter().cloned());
+            }
+            loaded.insert(
+                path,
+                LoadedSource {
+                    content,
+                    entries,
+                    vhosts,
+                },
+            );
+        }
+
+        let mut vhosts = main_vhosts.clone();
+        for source in loaded.values() {
+            vhosts.extend(source.vhosts.iter().cloned());
+        }
+        let default = vhosts.iter().position(|vhost| vhost.default);
+        let new_table = Arc::new(VhostTable { vhosts, default });
+        if !changed {
+            changed = new_table.vhosts.len() != self.snapshot().vhosts.len();
+        }
+        sources.main_vhosts = Some(main_vhosts);
+        sources.files = loaded;
+        if changed {
+            *self
+                .table
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = new_table;
+        }
+        Ok(changed)
+    }
+
+    fn snapshot(&self) -> Arc<VhostTable> {
+        Arc::clone(
+            &self
+                .table
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
     }
 
     async fn from_file(
@@ -171,6 +358,7 @@ impl Router {
     ) -> Result<Self, Box<dyn Error + Send + Sync>> {
         validate_vhost_declarations(&file.vhost)?;
         validate_vhost_waf_declarations(&file.vhost, waf.is_some())?;
+        let main_entries = file.vhost.clone();
         let mut vhosts = Vec::with_capacity(file.vhost.len());
         let default = file.vhost.iter().position(|entry| entry.default);
 
@@ -290,22 +478,33 @@ impl Router {
                 names: normalized_names,
                 tls,
                 acme: entry.acme.unwrap_or(true),
+                default: entry.default,
                 waf: vhost_waf,
                 worker,
             });
         }
 
+        let vhosts = vhosts.into_iter().map(Arc::new).collect::<Vec<_>>();
         Ok(Self {
             fallback,
-            vhosts,
-            default,
+            table: RwLock::new(Arc::new(VhostTable {
+                vhosts: vhosts.clone(),
+                default,
+            })),
+            sources: Mutex::new(SourceState {
+                main_entries,
+                main_vhosts: Some(vhosts),
+                files: BTreeMap::new(),
+            }),
+            dir: None,
             waf,
             acme: None,
         })
     }
 
     pub(crate) fn acme_names(&self) -> Vec<String> {
-        self.vhosts
+        self.snapshot()
+            .vhosts
             .iter()
             .filter(|vhost| vhost.acme && vhost.tls.is_none())
             .flat_map(|vhost| vhost.names.iter())
@@ -315,13 +514,18 @@ impl Router {
     }
 
     pub(crate) fn document_roots(&self) -> Vec<PathBuf> {
+        let table = self.snapshot();
         std::iter::once(self.fallback.root.clone())
-            .chain(self.vhosts.iter().map(|vhost| vhost.worker.root.clone()))
+            .chain(table.vhosts.iter().map(|vhost| vhost.worker.root.clone()))
             .collect()
     }
 
     pub(crate) fn set_acme_manager(&mut self, acme: Option<AcmeManager>) {
         self.acme = acme;
+    }
+
+    pub(crate) fn vhost_dir(&self) -> Option<PathBuf> {
+        self.dir.clone()
     }
 
     pub(crate) async fn dispatch<B>(
@@ -334,6 +538,7 @@ impl Router {
         B: Body<Data = Bytes> + Send + 'static,
         B::Error: Into<Box<dyn Error + Send + Sync>>,
     {
+        let table = self.snapshot();
         if let Some(acme) = &self.acme {
             let host = request_host(&request);
             if request.method() == http::Method::GET
@@ -350,23 +555,24 @@ impl Router {
         }
         let selected = request_host(&request)
             .as_deref()
-            .and_then(|host| self.select_vhost(host))
-            .or(self.default);
+            .and_then(|host| Self::select_vhost(&table, host))
+            .or(table.default);
         let waf = selected
-            .and_then(|index| self.vhosts[index].waf)
+            .and_then(|index| table.vhosts[index].waf)
             .or(self.waf);
         if let Some(waf) = waf {
             return waf
                 .inspect(request, peer, local, |request| {
-                    self.route(request, peer, local)
+                    self.route(request, peer, local, Arc::clone(&table))
                 })
                 .await;
         }
-        self.route(request, peer, local).await
+        self.route(request, peer, local, table).await
     }
 
     pub(crate) fn sni_certificates(&self) -> (Vec<(String, TlsFiles)>, Option<TlsFiles>) {
-        let entries = self
+        let table = self.snapshot();
+        let entries = table
             .vhosts
             .iter()
             .filter_map(|vhost| {
@@ -381,9 +587,9 @@ impl Router {
             })
             .flatten()
             .collect();
-        let fallback = self
+        let fallback = table
             .default
-            .and_then(|index| self.vhosts[index].tls.clone());
+            .and_then(|index| table.vhosts[index].tls.clone());
         (entries, fallback)
     }
 
@@ -392,6 +598,7 @@ impl Router {
         mut request: Request<B>,
         peer: SocketAddr,
         local: SocketAddr,
+        table: Arc<VhostTable>,
     ) -> Response<ResponseBody>
     where
         B: Body<Data = Bytes> + Send + 'static,
@@ -403,9 +610,9 @@ impl Router {
         {
             let sni_selected = normalize_host(sni)
                 .as_deref()
-                .and_then(|sni| self.select_vhost(sni))
-                .or(self.default);
-            let host_selected = self.select_vhost(host).or(self.default);
+                .and_then(|sni| Self::select_vhost(&table, sni))
+                .or(table.default);
+            let host_selected = Self::select_vhost(&table, host).or(table.default);
             if sni_selected != host_selected {
                 return handler::error_response(
                     StatusCode::MISDIRECTED_REQUEST,
@@ -415,8 +622,8 @@ impl Router {
         }
         let selected = host
             .as_deref()
-            .and_then(|host| self.select_vhost(host))
-            .or(self.default);
+            .and_then(|host| Self::select_vhost(&table, host))
+            .or(table.default);
         let Some(index) = selected else {
             return handler::handle_request(request, Arc::clone(&self.fallback), peer, local).await;
         };
@@ -459,7 +666,7 @@ impl Router {
             body.map_err(|error| io::Error::other(error.into()))
                 .boxed_unsync()
         });
-        match self.vhosts[index].worker.dispatch(request).await {
+        match table.vhosts[index].worker.dispatch(request).await {
             Ok(response) => {
                 let (parts, body) = response.into_parts();
                 let body = body.map_err(io::Error::other).boxed_unsync();
@@ -472,8 +679,9 @@ impl Router {
         }
     }
 
-    fn select_vhost(&self, host: &str) -> Option<usize> {
-        self.vhosts
+    fn select_vhost(table: &VhostTable, host: &str) -> Option<usize> {
+        table
+            .vhosts
             .iter()
             .enumerate()
             .filter_map(|(index, vhost)| {
@@ -713,6 +921,25 @@ fn resolve_config_path(path: PathBuf, config_dir: &Path) -> PathBuf {
     }
 }
 
+fn scan_vhost_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path
+            .file_name()
+            .is_some_and(|name| !name.to_string_lossy().starts_with('.'))
+            && path
+                .extension()
+                .is_some_and(|extension| extension == "toml")
+            && path.is_file()
+        {
+            files.push(path);
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
 fn resolve_identity(
     user_name: &str,
     group_name: Option<&str>,
@@ -800,8 +1027,8 @@ fn version_name(version: Version) -> &'static str {
 mod tests {
     use super::{
         FileConfig, Router, VhostFile, build_worker_args, match_score, normalize_host,
-        normalize_server_name, request_host, resolve_identity, validate_vhost_declarations,
-        validate_vhost_waf_declarations,
+        normalize_server_name, request_host, resolve_identity, scan_vhost_files,
+        validate_vhost_declarations, validate_vhost_waf_declarations,
     };
     use crate::{
         config::{FastCgiAddress, FastCgiApp, FastCgiBackend},
@@ -809,7 +1036,17 @@ mod tests {
     };
     use http::{HeaderValue, Request};
     use http_body_util::BodyExt;
-    use std::{collections::BTreeMap, path::Path, sync::Arc, time::Duration};
+    use std::{
+        collections::BTreeMap,
+        path::Path,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
+
+    static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
 
     #[test]
     fn normalizes_authority_hosts() {
@@ -944,9 +1181,36 @@ mod tests {
     fn example_config_parses_and_validates() {
         let parsed: FileConfig = toml::from_str(include_str!("../examples/charlotte.toml"))
             .expect("example configuration should parse");
-        validate_vhost_declarations(&parsed.vhost)
+        let directory_entry: FileConfig =
+            toml::from_str(include_str!("../examples/vhosts.d/example.toml"))
+                .expect("example per-vhost file should parse");
+        let mut entries = parsed.vhost;
+        entries.extend(directory_entry.vhost);
+        validate_vhost_declarations(&entries)
             .expect("example virtual host declarations should be valid");
-        assert_eq!(parsed.vhost[2].fastcgi_app.len(), 2);
+        assert_eq!(entries[2].fastcgi_app.len(), 2);
+        assert_eq!(parsed.vhost_dir.as_deref(), Some(Path::new("vhosts.d")));
+    }
+
+    #[test]
+    fn scans_only_visible_toml_files_in_sorted_order() {
+        let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "project-charlotte-vhost-scan-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        for name in ["b.toml", "a.toml", ".hidden.toml", "swap.toml~", "temp.tmp"] {
+            std::fs::write(directory.join(name), "").unwrap();
+        }
+        std::fs::create_dir(directory.join("directory.toml")).unwrap();
+
+        let files = scan_vhost_files(&directory).unwrap();
+        assert_eq!(
+            files,
+            vec![directory.join("a.toml"), directory.join("b.toml")]
+        );
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

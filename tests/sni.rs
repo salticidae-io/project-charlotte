@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+mod common;
+
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener as StdTcpListener, UdpSocket},
     path::{Path, PathBuf},
@@ -191,8 +193,7 @@ impl Fixture {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        let _ = self.server.kill();
-        let _ = self.server.wait();
+        common::shutdown(&mut self.server);
         let _ = std::fs::remove_dir_all(&self.root);
     }
 }
@@ -703,8 +704,7 @@ async fn tls_listener_requires_a_configured_certificate() {
     let status = match result {
         Ok(status) => status,
         Err(_) => {
-            let _ = server.kill();
-            let _ = server.wait();
+            common::shutdown(&mut server);
             let _ = std::fs::remove_dir_all(&root);
             panic!("server did not reject --tls-bind without a certificate");
         }

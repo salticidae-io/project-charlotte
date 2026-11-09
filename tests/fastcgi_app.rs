@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+mod common;
+
 use std::{
     collections::HashMap,
     io,
@@ -12,10 +14,7 @@ use std::{
     time::Duration,
 };
 
-use nix::{
-    sys::signal::{Signal, kill},
-    unistd::{Pid, User, geteuid},
-};
+use nix::unistd::{User, geteuid};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream, UnixListener},
@@ -96,10 +95,7 @@ impl Fixture {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        if let Some(pid) = self.server.id().try_into().ok().map(Pid::from_raw) {
-            let _ = kill(pid, Signal::SIGINT);
-        }
-        let _ = self.server.wait();
+        common::shutdown(&mut self.server);
         let _ = std::fs::remove_dir_all(&self.root);
     }
 }

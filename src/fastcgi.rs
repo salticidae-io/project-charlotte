@@ -576,6 +576,7 @@ mod tests {
             http3_bind: "127.0.0.1:8080".parse::<SocketAddr>().unwrap(),
             root,
             config_file: None,
+            vhost_dir: None,
             index: "index.php".to_owned(),
             listing: true,
             fastcgi: vec![FastCgiBackend {

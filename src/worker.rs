@@ -9,7 +9,11 @@ use http::{Request, StatusCode, Uri, Version};
 use hyper::{server::conn::http2, service::service_fn};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use nix::unistd::{Gid, Uid, getegid, geteuid, getgroups, setgid, setgroups, setuid};
-use tokio::{io::AsyncWriteExt, net::UnixStream};
+use tokio::{
+    io::AsyncWriteExt,
+    net::UnixStream,
+    signal::unix::{SignalKind, signal},
+};
 
 use crate::{config::Config, fastcgi_app, handler};
 
@@ -53,10 +57,37 @@ pub(crate) async fn run(mut config: Config) -> Result<(), Box<dyn Error + Send +
         async move { Ok::<_, std::convert::Infallible>(dispatch(request, config).await) }
     });
     let io = TokioIo::new(socket);
-    http2::Builder::new(TokioExecutor::new())
-        .serve_connection(io, service)
-        .await?;
+    let connection = http2::Builder::new(TokioExecutor::new()).serve_connection(io, service);
+    // A worker that is killed outright cannot drop `_fastcgi_apps`, which would
+    // orphan every app it spawned and leak the descriptors they inherited. Shut
+    // down on a signal instead so that those handles run their cleanup.
+    tokio::select! {
+        result = connection => result?,
+        () = terminated() => {}
+    }
     Ok(())
+}
+
+/// Resolves once the worker is asked to shut down.
+async fn terminated() {
+    let mut interrupt = match signal(SignalKind::interrupt()) {
+        Ok(stream) => stream,
+        Err(error) => {
+            eprintln!("virtual host worker could not listen for SIGINT: {error}");
+            return std::future::pending().await;
+        }
+    };
+    let mut terminate = match signal(SignalKind::terminate()) {
+        Ok(stream) => stream,
+        Err(error) => {
+            eprintln!("virtual host worker could not listen for SIGTERM: {error}");
+            return std::future::pending().await;
+        }
+    };
+    tokio::select! {
+        _ = interrupt.recv() => {}
+        _ = terminate.recv() => {}
+    }
 }
 
 async fn dispatch(

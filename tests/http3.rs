@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+mod common;
+
 use std::{
     collections::HashMap,
     io,
@@ -108,8 +110,7 @@ impl Fixture {
                 panic!("webserver exited before becoming ready: {status}");
             }
             if tokio::time::Instant::now() >= deadline {
-                let _ = self.server.kill();
-                let _ = self.server.wait();
+                common::shutdown(&mut self.server);
                 panic!("webserver did not become ready");
             }
             sleep(Duration::from_millis(20)).await;
@@ -120,8 +121,7 @@ impl Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         self.backend_task.abort();
-        let _ = self.server.kill();
-        let _ = self.server.wait();
+        common::shutdown(&mut self.server);
         let _ = std::fs::remove_dir_all(&self.root);
     }
 }

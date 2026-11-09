@@ -26,6 +26,11 @@
 #
 # Relative paths (root, tls_cert, tls_key, unix: FastCGI sockets) are resolved
 # against the directory containing this file, not the working directory.
+# `vhost_dir` is also relative to this file; visible `*.toml` files in that
+# directory are watched for additions, changes, deletions and atomic renames.
+# Invalid updates are rejected and the last valid configuration remains active.
+
+vhost_dir = "vhosts.d"
 
 
 # --------------------------------------------------------------------------

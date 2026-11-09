@@ -8,6 +8,7 @@ mod handler;
 mod http3;
 mod httpdate;
 mod mime;
+mod reload;
 mod tls;
 mod vhost;
 mod waf;
@@ -152,6 +153,19 @@ async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> 
         let shutdown = shutdown_rx.clone();
         tokio::spawn(async move { http3::serve(endpoint, address, router, shutdown).await })
     });
+    let reload_task = router
+        .vhost_dir()
+        .map(|dir| {
+            reload::spawn_watcher(
+                Arc::clone(&router),
+                dir,
+                config.clone(),
+                tls_setup.as_ref().map(|tls| tls.sni.clone()),
+                acme.clone(),
+                shutdown_rx.clone(),
+            )
+        })
+        .transpose()?;
     let mut connections = JoinSet::new();
     let signal_tx = shutdown_tx.clone();
     tokio::spawn(async move {
@@ -225,6 +239,11 @@ async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> 
     }
 
     let _ = shutdown_tx.send(true);
+    if let Some(task) = reload_task
+        && let Err(error) = task.await
+    {
+        eprintln!("vhost watcher task failed: {error}");
+    }
     while let Some(result) = connections.join_next().await {
         if let Err(error) = result {
             eprintln!("Connection task failed: {error}");

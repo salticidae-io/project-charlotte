@@ -27,6 +27,7 @@ pub struct Config {
     pub http3_bind: SocketAddr,
     pub root: PathBuf,
     pub config_file: Option<PathBuf>,
+    pub vhost_dir: Option<PathBuf>,
     pub index: String,
     pub listing: bool,
     pub fastcgi: Vec<FastCgiBackend>,
@@ -84,6 +85,7 @@ impl Config {
         let mut acme_contacts = Vec::new();
         let mut acme_ca_root = None;
         let mut config_file = None;
+        let mut vhost_dir = None;
         let mut worker = false;
         let mut worker_uid = None;
         let mut worker_gid = None;
@@ -231,6 +233,9 @@ impl Config {
                 "--root" => root = PathBuf::from(next_value(&mut args, "--root")?),
                 "--index" => index = next_value(&mut args, "--index")?,
                 "--config" => config_file = Some(PathBuf::from(next_value(&mut args, "--config")?)),
+                "--vhost-dir" => {
+                    vhost_dir = Some(PathBuf::from(next_value(&mut args, "--vhost-dir")?))
+                }
                 "--worker-uid" => {
                     let value = next_value(&mut args, "--worker-uid")?;
                     worker_uid = Some(
@@ -328,6 +333,7 @@ impl Config {
             http3_bind: http3_bind.unwrap_or_else(|| tls_bind.unwrap_or(bind)),
             root,
             config_file,
+            vhost_dir,
             index,
             listing,
             fastcgi,
@@ -344,7 +350,7 @@ impl Config {
     }
 
     pub fn usage() -> &'static str {
-        "Usage: project-charlotte [--bind ADDRESS] [--tls-bind ADDRESS] [--root DIRECTORY] [--index NAME] [--no-listing] [--fastcgi EXT=ADDR]... [--fastcgi-app EXT=PROGRAM]... [--fastcgi-app-arg EXT=ARG]... [--fastcgi-app-env EXT=KEY=VALUE]... [--fastcgi-timeout SECS] [--modsecurity-rules FILE]... [--modsecurity-body-limit BYTES] [--config FILE] [--tls-cert PATH --tls-key PATH] [--acme-directory URL|letsencrypt|letsencrypt-staging --acme-cache DIR] [--acme-contact URI]... [--acme-ca-root PEM] [--http3-bind ADDRESS] [--help]"
+        "Usage: project-charlotte [--bind ADDRESS] [--tls-bind ADDRESS] [--root DIRECTORY] [--index NAME] [--no-listing] [--fastcgi EXT=ADDR]... [--fastcgi-app EXT=PROGRAM]... [--fastcgi-app-arg EXT=ARG]... [--fastcgi-app-env EXT=KEY=VALUE]... [--fastcgi-timeout SECS] [--modsecurity-rules FILE]... [--modsecurity-body-limit BYTES] [--config FILE] [--vhost-dir DIRECTORY] [--tls-cert PATH --tls-key PATH] [--acme-directory URL|letsencrypt|letsencrypt-staging --acme-cache DIR] [--acme-contact URI]... [--acme-ca-root PEM] [--http3-bind ADDRESS] [--help]"
     }
 }
 
@@ -638,6 +644,22 @@ mod tests {
             .is_err()
         );
         assert!(Config::parse(["--acme-cache".to_owned(), "/tmp/acme".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn parses_vhost_directory_option() {
+        let parsed = Config::parse([
+            "--vhost-dir".to_owned(),
+            "/etc/charlotte/vhosts.d".to_owned(),
+        ])
+        .unwrap();
+        let ParseResult::Config(config) = parsed else {
+            panic!("expected config")
+        };
+        assert_eq!(
+            config.vhost_dir,
+            Some(PathBuf::from("/etc/charlotte/vhosts.d"))
+        );
     }
 
     #[test]

@@ -17,6 +17,7 @@ hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
 instant-acme = { version = "0.8.5", default-features = false, features = ["ring", "hyper-rustls", "rcgen"] }
 modsecurity-rs = { path = "../modsecurity-rs" }
 nix = { version = "0.29", features = ["signal", "user"] }
+notify = { version = "8", default-features = false }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2"

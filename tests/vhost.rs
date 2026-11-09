@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+mod common;
+
 use std::{
     collections::HashMap,
     io,
@@ -79,8 +81,7 @@ impl Drop for Fixture {
         if let Some(backend) = self.backend.take() {
             backend.abort();
         }
-        let _ = self.server.kill();
-        let _ = self.server.wait();
+        common::shutdown(&mut self.server);
         let _ = std::fs::remove_dir_all(&self.root);
     }
 }

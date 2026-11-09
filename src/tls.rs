@@ -15,13 +15,24 @@ use crate::{
 pub(crate) struct TlsSetup {
     pub(crate) tcp: Arc<rustls::ServerConfig>,
     pub(crate) http3: Arc<rustls::ServerConfig>,
+    pub(crate) sni: SniHandle,
 }
 
 #[derive(Debug)]
 struct SniResolver {
+    static_entries: std::sync::RwLock<StaticCertificates>,
+    acme: Option<AcmeCertificateStore>,
+}
+
+#[derive(Debug)]
+struct StaticCertificates {
     entries: Vec<(String, Arc<CertifiedKey>)>,
     fallback: Option<Arc<CertifiedKey>>,
-    acme: Option<AcmeCertificateStore>,
+}
+
+#[derive(Clone)]
+pub(crate) struct SniHandle {
+    resolver: Arc<SniResolver>,
 }
 
 impl TlsSetup {
@@ -32,18 +43,17 @@ impl TlsSetup {
     ) -> Result<Option<Self>, Box<dyn Error + Send + Sync>> {
         let (certificate_entries, default_certificate) = router.sni_certificates();
         let fallback_files = config.tls.as_ref().or(default_certificate.as_ref());
-        if certificate_entries.is_empty() && fallback_files.is_none() && acme.is_none() {
+        if certificate_entries.is_empty()
+            && fallback_files.is_none()
+            && acme.is_none()
+            && !(config.tls_bind.is_some() && router.vhost_dir().is_some())
+        {
             return Ok(None);
         }
 
-        let entries = certificate_entries
-            .into_iter()
-            .map(|(name, files)| Ok((name, load_certified_key(&files)?)))
-            .collect::<Result<Vec<_>, Box<dyn Error + Send + Sync>>>()?;
-        let fallback = fallback_files.map(load_certified_key).transpose()?;
+        let static_certificates = load_static_certificates(certificate_entries, fallback_files)?;
         let resolver = Arc::new(SniResolver {
-            entries,
-            fallback,
+            static_entries: std::sync::RwLock::new(static_certificates),
             acme,
         });
         let tcp = server_config(
@@ -51,8 +61,16 @@ impl TlsSetup {
             &[b"h2".to_vec(), b"http/1.1".to_vec()],
             &[&rustls::version::TLS13, &rustls::version::TLS12],
         )?;
-        let http3 = server_config(resolver, &[b"h3".to_vec()], &[&rustls::version::TLS13])?;
-        Ok(Some(Self { tcp, http3 }))
+        let http3 = server_config(
+            resolver.clone(),
+            &[b"h3".to_vec()],
+            &[&rustls::version::TLS13],
+        )?;
+        Ok(Some(Self {
+            tcp,
+            http3,
+            sni: SniHandle { resolver },
+        }))
     }
 }
 
@@ -70,8 +88,47 @@ impl SniResolver {
         {
             return Some(key);
         }
-        select_key(&self.entries, self.fallback.as_ref(), server_name).cloned()
+        let static_entries = self
+            .static_entries
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        select_key(
+            &static_entries.entries,
+            static_entries.fallback.as_ref(),
+            server_name,
+        )
+        .cloned()
     }
+}
+
+impl SniHandle {
+    pub(crate) fn update(
+        &self,
+        config: &Config,
+        router: &Router,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let (certificate_entries, default_certificate) = router.sni_certificates();
+        let fallback_files = config.tls.as_ref().or(default_certificate.as_ref());
+        let updated = load_static_certificates(certificate_entries, fallback_files)?;
+        *self
+            .resolver
+            .static_entries
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = updated;
+        Ok(())
+    }
+}
+
+fn load_static_certificates(
+    certificate_entries: Vec<(String, TlsFiles)>,
+    fallback_files: Option<&TlsFiles>,
+) -> Result<StaticCertificates, Box<dyn Error + Send + Sync>> {
+    let entries = certificate_entries
+        .into_iter()
+        .map(|(name, files)| Ok((name, load_certified_key(&files)?)))
+        .collect::<Result<Vec<_>, Box<dyn Error + Send + Sync>>>()?;
+    let fallback = fallback_files.map(load_certified_key).transpose()?;
+    Ok(StaticCertificates { entries, fallback })
 }
 
 fn select_index<T>(entries: &[(String, T)], host: &str) -> Option<usize> {
@@ -142,7 +199,7 @@ mod tests {
         sync::atomic::{AtomicUsize, Ordering},
     };
 
-    use super::{SniResolver, load_certified_key, select_index, select_key};
+    use super::{SniResolver, StaticCertificates, load_certified_key, select_index, select_key};
     use crate::{acme::AcmeCertificateStore, config::TlsFiles};
 
     static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
@@ -213,11 +270,13 @@ mod tests {
             )
             .unwrap();
         let resolver = SniResolver {
-            entries: vec![(
-                "alpha.test".to_owned(),
-                load_certified_key(&static_files).unwrap(),
-            )],
-            fallback: Some(load_certified_key(&fallback_files).unwrap()),
+            static_entries: std::sync::RwLock::new(StaticCertificates {
+                entries: vec![(
+                    "alpha.test".to_owned(),
+                    load_certified_key(&static_files).unwrap(),
+                )],
+                fallback: Some(load_certified_key(&fallback_files).unwrap()),
+            }),
             acme: Some(store),
         };
 

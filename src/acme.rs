@@ -88,6 +88,13 @@ impl AcmeCertificateStore {
             .insert(host, CachedCertificate { key, not_after });
         Ok(())
     }
+
+    fn retain_hosts(&self, hosts: &HashSet<String>) {
+        self.entries
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|host, _| hosts.contains(host));
+    }
 }
 
 #[derive(Clone)]
@@ -97,7 +104,7 @@ pub(crate) struct AcmeManager {
 
 struct AcmeInner {
     settings: AcmeSettings,
-    eligible: HashSet<String>,
+    eligible: RwLock<HashSet<String>>,
     store: AcmeCertificateStore,
     challenges: Mutex<HashMap<(String, String), String>>,
     in_flight: Mutex<HashSet<String>>,
@@ -143,7 +150,7 @@ impl AcmeManager {
         Ok(Self {
             inner: Arc::new(AcmeInner {
                 settings,
-                eligible,
+                eligible: RwLock::new(eligible),
                 store,
                 challenges: Mutex::new(HashMap::new()),
                 in_flight: Mutex::new(HashSet::new()),
@@ -157,11 +164,55 @@ impl AcmeManager {
         self.inner.store.clone()
     }
 
+    pub(crate) async fn set_eligible(
+        &self,
+        names: Vec<String>,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let eligible: HashSet<_> = names
+            .into_iter()
+            .filter(|name| acme_dns_name(name))
+            .collect();
+        for name in &eligible {
+            if self.inner.store.get(name).is_some() {
+                continue;
+            }
+            let files = cache_files(&self.inner.settings.cache, name);
+            let cert_exists = secure_existing_cache_file(&files.cert, 0o644).await?;
+            let key_exists = secure_existing_cache_file(&files.key, 0o600).await?;
+            if cert_exists && key_exists {
+                match tls::load_certified_key(&files) {
+                    Ok(key) => {
+                        if let Err(error) = self.inner.store.insert(name.clone(), key) {
+                            eprintln!("ACME cached certificate for {name} is invalid: {error}");
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("ACME cached certificate for {name} could not be loaded: {error}")
+                    }
+                }
+            }
+        }
+        self.inner.store.retain_hosts(&eligible);
+        *self
+            .inner
+            .eligible
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = eligible;
+        Ok(())
+    }
+
     pub(crate) fn maybe_provision(&self, host: &str) {
         let Some(host) = normalize_host(host) else {
             return;
         };
-        if !self.inner.eligible.contains(&host) || !self.inner.store.needs_renewal(&host) {
+        if !self
+            .inner
+            .eligible
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&host)
+            || !self.inner.store.needs_renewal(&host)
+        {
             return;
         }
 
@@ -265,7 +316,14 @@ async fn provision(inner: &AcmeInner, host: &str) -> Result<(), Box<dyn Error + 
     write_cache_file(&files.cert, certificate.as_bytes(), 0o644).await?;
     write_cache_file(&files.key, private_key.as_bytes(), 0o600).await?;
     let key = tls::load_certified_key(&files)?;
-    inner.store.insert(host.to_owned(), key)?;
+    if inner
+        .eligible
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(host)
+    {
+        inner.store.insert(host.to_owned(), key)?;
+    }
     Ok(())
 }
 

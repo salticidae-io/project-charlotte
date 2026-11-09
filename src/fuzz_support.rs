@@ -121,6 +121,7 @@ pub(crate) fn fuzz_config(root: PathBuf) -> Config {
         http3_bind: "127.0.0.1:8443".parse().expect("valid fuzz HTTP/3 bind"),
         root,
         config_file: None,
+        vhost_dir: None,
         index: "index.html".to_owned(),
         listing: true,
         fastcgi: vec![FastCgiBackend {

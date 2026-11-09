@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+mod common;
+
 use std::{
     net::SocketAddr,
     path::PathBuf,
@@ -148,8 +150,7 @@ impl Drop for Fixture {
         if let Some(task) = self.backend_task.take() {
             task.abort();
         }
-        let _ = self.server.kill();
-        let _ = self.server.wait();
+        common::shutdown(&mut self.server);
         let _ = std::fs::remove_dir_all(&self.root);
     }
 }
