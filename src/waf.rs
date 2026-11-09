@@ -1,6 +1,6 @@
 use std::{
     collections::VecDeque, error::Error, future::Future, io, net::SocketAddr, path::PathBuf,
-    time::Duration,
+    str::FromStr, time::Duration,
 };
 
 use bytes::Bytes;
@@ -21,8 +21,64 @@ const CONNECTOR_INFO: &str = "project-charlotte/0.1.0";
 pub(crate) struct Waf {
     modsecurity: &'static ModSecurity,
     rules: &'static Rules,
+    rule_files: &'static [PathBuf],
     request_body_limit: usize,
     response_body_limit: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RuleIdSpec {
+    start: u64,
+    end: Option<u64>,
+}
+
+impl FromStr for RuleIdSpec {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let parse_id = |id: &str| {
+            if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(format!("invalid ModSecurity rule ID: {value}"));
+            }
+            let id = id
+                .parse::<u64>()
+                .map_err(|_| format!("invalid ModSecurity rule ID: {value}"))?;
+            if id == 0 {
+                return Err("ModSecurity rule ID must be greater than zero".to_owned());
+            }
+            Ok(id)
+        };
+
+        if let Some((start, end)) = value.split_once('-') {
+            if end.contains('-') {
+                return Err(format!("invalid ModSecurity rule ID range: {value}"));
+            }
+            let start = parse_id(start)?;
+            let end = parse_id(end)?;
+            if start > end {
+                return Err(format!("ModSecurity rule ID range is reversed: {value}"));
+            }
+            Ok(Self {
+                start,
+                end: Some(end),
+            })
+        } else {
+            Ok(Self {
+                start: parse_id(value)?,
+                end: None,
+            })
+        }
+    }
+}
+
+impl std::fmt::Display for RuleIdSpec {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(end) = self.end {
+            write!(formatter, "{}-{end}", self.start)
+        } else {
+            write!(formatter, "{}", self.start)
+        }
+    }
 }
 
 impl Waf {
@@ -37,16 +93,29 @@ impl Waf {
             eprintln!("ModSecurity: {}", String::from_utf8_lossy(message));
         });
 
-        let mut rules = Rules::new()?;
-        for path in rule_files {
-            rules.add_file(path)?;
-        }
+        let rule_files = Box::leak(rule_files.to_vec().into_boxed_slice());
+        let rules = build_rules(rule_files, &[])?;
 
         Ok(Self {
             modsecurity: Box::leak(Box::new(modsecurity)),
             rules: Box::leak(Box::new(rules)),
+            rule_files,
             request_body_limit,
             response_body_limit,
+        })
+    }
+
+    pub(crate) fn without_rules(
+        &self,
+        ids: &[RuleIdSpec],
+    ) -> Result<Self, Box<dyn Error + Send + Sync>> {
+        let rules = build_rules(self.rule_files, ids)?;
+        Ok(Self {
+            modsecurity: self.modsecurity,
+            rules: Box::leak(Box::new(rules)),
+            rule_files: self.rule_files,
+            request_body_limit: self.request_body_limit,
+            response_body_limit: self.response_body_limit,
         })
     }
 
@@ -246,6 +315,25 @@ impl Waf {
             }
         }
     }
+}
+
+fn build_rules(
+    rule_files: &[PathBuf],
+    disabled_rules: &[RuleIdSpec],
+) -> Result<Rules, Box<dyn Error + Send + Sync>> {
+    let mut rules = Rules::new()?;
+    for path in rule_files {
+        rules.add_file(path)?;
+    }
+    if !disabled_rules.is_empty() {
+        let ids = disabled_rules
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(" ");
+        rules.add_plain(&format!("SecRuleRemoveById {ids}"))?;
+    }
+    Ok(rules)
 }
 
 fn process_request_headers(

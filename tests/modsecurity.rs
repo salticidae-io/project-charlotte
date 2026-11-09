@@ -30,7 +30,12 @@ struct Fixture {
 }
 
 impl Fixture {
-    async fn start(body_limit: Option<usize>, with_fastcgi: bool, with_vhost: bool) -> Self {
+    async fn start(
+        body_limit: Option<usize>,
+        with_fastcgi: bool,
+        with_vhost: bool,
+        disable_vhost_rule: bool,
+    ) -> Self {
         let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
             "project-charlotte-modsecurity-{}-{sequence}",
@@ -66,10 +71,15 @@ impl Fixture {
             std::fs::write(vhost_root.join("clean.txt"), "vhost response").unwrap();
             let user = User::from_uid(geteuid()).unwrap().unwrap();
             let config_path = root.join("vhosts.toml");
+            let disable_rules = if disable_vhost_rule {
+                "modsecurity_disable_rules = [\"100001-100001\"]\n"
+            } else {
+                ""
+            };
             std::fs::write(
                 &config_path,
                 format!(
-                    "[[vhost]]\nserver_names = [\"waf.example.test\"]\nroot = {:?}\nuser = {:?}\n",
+                    "[[vhost]]\nserver_names = [\"waf.example.test\"]\nroot = {:?}\nuser = {:?}\n{disable_rules}",
                     vhost_root.to_string_lossy(),
                     user.name
                 ),
@@ -146,7 +156,7 @@ impl Drop for Fixture {
 
 #[tokio::test]
 async fn applies_request_response_and_redirect_rules() {
-    let fixture = Fixture::start(None, false, false).await;
+    let fixture = Fixture::start(None, false, false, false).await;
 
     let clean = send_request(&fixture, "GET", "/clean.txt", "", "").await;
     assert_eq!(clean.status, 200);
@@ -177,7 +187,7 @@ async fn applies_request_response_and_redirect_rules() {
 
 #[tokio::test]
 async fn blocks_request_body_before_fastcgi_backend() {
-    let fixture = Fixture::start(None, true, false).await;
+    let fixture = Fixture::start(None, true, false, false).await;
     let response = send_request(
         &fixture,
         "POST",
@@ -199,7 +209,7 @@ async fn blocks_request_body_before_fastcgi_backend() {
 
 #[tokio::test]
 async fn enforces_request_body_limit() {
-    let fixture = Fixture::start(Some(16), false, false).await;
+    let fixture = Fixture::start(Some(16), false, false, false).await;
     let response = send_request(
         &fixture,
         "POST",
@@ -213,7 +223,7 @@ async fn enforces_request_body_limit() {
 
 #[tokio::test]
 async fn inspects_requests_routed_to_vhost_workers() {
-    let fixture = Fixture::start(None, false, true).await;
+    let fixture = Fixture::start(None, false, true, false).await;
     let clean =
         send_request_with_host(&fixture, "GET", "/clean.txt", "waf.example.test", "", "").await;
     assert_eq!(clean.status, 200);
@@ -229,6 +239,37 @@ async fn inspects_requests_routed_to_vhost_workers() {
     )
     .await;
     assert_eq!(blocked.status, 403);
+}
+
+#[tokio::test]
+async fn vhost_can_disable_specific_rules_without_disabling_other_rules() {
+    let fixture = Fixture::start(None, false, true, true).await;
+
+    let fallback_blocked = send_request(&fixture, "GET", "/clean.txt?q=block", "", "").await;
+    assert_eq!(fallback_blocked.status, 403);
+
+    let excluded = send_request_with_host(
+        &fixture,
+        "GET",
+        "/clean.txt?q=block",
+        "waf.example.test",
+        "",
+        "",
+    )
+    .await;
+    assert_eq!(excluded.status, 200);
+    assert_eq!(excluded.body, b"vhost response");
+
+    let still_enforced = send_request_with_host(
+        &fixture,
+        "GET",
+        "/clean.txt",
+        "waf.example.test",
+        "X-Block: yes\r\n",
+        "",
+    )
+    .await;
+    assert_eq!(still_enforced.status, 406);
 }
 
 struct HttpResponse {

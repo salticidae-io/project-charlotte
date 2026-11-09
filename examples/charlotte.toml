@@ -48,6 +48,11 @@ index = "index.html"
 # Optional. Falls back to --no-listing / the default of true.
 listing = false
 
+# Optional. Requires global rules supplied with --modsecurity-rules. Rule IDs
+# and inclusive ID ranges can be disabled for this vhost only; the rule-file
+# ruleset remains active for every other host. For example:
+# modsecurity_disable_rules = [100001, "2000-2099"]
+
 # Optional. At most one virtual host in the file may set this. It receives
 # every request that matches no other host (and supplies the fallback
 # certificate for TLS clients that send no SNI).

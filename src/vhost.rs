@@ -24,7 +24,7 @@ use tokio::{io::AsyncReadExt, net::UnixStream, sync::Mutex, time::timeout};
 use crate::{
     config::{Config, FastCgiAddress, FastCgiBackend, TlsFiles},
     handler::{self, ResponseBody},
-    waf::Waf,
+    waf::{RuleIdSpec, Waf},
 };
 
 const META_PEER: HeaderName = HeaderName::from_static("x-charlotte-peer");
@@ -60,6 +60,24 @@ struct VhostFile {
     tls_key: Option<PathBuf>,
     #[serde(default)]
     default: bool,
+    #[serde(default)]
+    modsecurity_disable_rules: Vec<RuleIdFile>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RuleIdFile {
+    Integer(u64),
+    RangeOrId(String),
+}
+
+impl RuleIdFile {
+    fn parse(&self) -> Result<RuleIdSpec, String> {
+        match self {
+            Self::Integer(id) => id.to_string().parse(),
+            Self::RangeOrId(value) => value.parse(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -74,6 +92,7 @@ struct FastCgiAppFile {
 struct Vhost {
     names: Vec<String>,
     tls: Option<TlsFiles>,
+    waf: Option<Waf>,
     worker: Arc<Worker>,
 }
 
@@ -146,10 +165,25 @@ impl Router {
         waf: Option<Waf>,
     ) -> Result<Self, Box<dyn Error + Send + Sync>> {
         validate_vhost_declarations(&file.vhost)?;
+        validate_vhost_waf_declarations(&file.vhost, waf.is_some())?;
         let mut vhosts = Vec::with_capacity(file.vhost.len());
         let default = file.vhost.iter().position(|entry| entry.default);
 
         for entry in file.vhost {
+            let disabled_rules = entry
+                .modsecurity_disable_rules
+                .iter()
+                .map(RuleIdFile::parse)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(io::Error::other)?;
+            let vhost_waf = if disabled_rules.is_empty() {
+                waf
+            } else {
+                Some(
+                    waf.expect("non-empty rule exclusions require a global WAF")
+                        .without_rules(&disabled_rules)?,
+                )
+            };
             let mut normalized_names = Vec::with_capacity(entry.server_names.len());
             for name in entry.server_names {
                 let normalized = normalize_server_name(&name)
@@ -250,6 +284,7 @@ impl Router {
             vhosts.push(Vhost {
                 names: normalized_names,
                 tls,
+                waf: vhost_waf,
                 worker,
             });
         }
@@ -272,7 +307,14 @@ impl Router {
         B: Body<Data = Bytes> + Send + 'static,
         B::Error: Into<Box<dyn Error + Send + Sync>>,
     {
-        if let Some(waf) = self.waf {
+        let selected = request_host(&request)
+            .as_deref()
+            .and_then(|host| self.select_vhost(host))
+            .or(self.default);
+        let waf = selected
+            .and_then(|index| self.vhosts[index].waf)
+            .or(self.waf);
+        if let Some(waf) = waf {
             return waf
                 .inspect(request, peer, local, |request| {
                     self.route(request, peer, local)
@@ -588,6 +630,9 @@ fn validate_vhost_declarations(entries: &[VhostFile]) -> Result<(), Box<dyn Erro
         if entry.server_names.is_empty() {
             return Err(format!("vhost {} has no server_names", index + 1).into());
         }
+        for rule in &entry.modsecurity_disable_rules {
+            rule.parse().map_err(io::Error::other)?;
+        }
         if entry.default {
             if has_default {
                 return Err("only one vhost may be marked default".into());
@@ -601,6 +646,20 @@ fn validate_vhost_declarations(entries: &[VhostFile]) -> Result<(), Box<dyn Erro
                 return Err(format!("duplicate virtual host name: {normalized}").into());
             }
         }
+    }
+    Ok(())
+}
+
+fn validate_vhost_waf_declarations(
+    entries: &[VhostFile],
+    has_global_waf: bool,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    if !has_global_waf
+        && entries
+            .iter()
+            .any(|entry| !entry.modsecurity_disable_rules.is_empty())
+    {
+        return Err("modsecurity_disable_rules requires --modsecurity-rules".into());
     }
     Ok(())
 }
@@ -701,6 +760,7 @@ mod tests {
     use super::{
         FileConfig, Router, VhostFile, build_worker_args, match_score, normalize_host,
         normalize_server_name, request_host, resolve_identity, validate_vhost_declarations,
+        validate_vhost_waf_declarations,
     };
     use crate::{
         config::{FastCgiAddress, FastCgiApp, FastCgiBackend},
@@ -747,6 +807,7 @@ mod tests {
             tls_cert: None,
             tls_key: None,
             default: is_default,
+            modsecurity_disable_rules: Vec::new(),
         }
     }
 
@@ -777,6 +838,34 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn parses_and_validates_modsecurity_rule_exclusions() {
+        let parsed: FileConfig = toml::from_str(
+            r#"
+                [[vhost]]
+                server_names = ["example.test"]
+                root = "/tmp/site"
+                user = "example"
+                modsecurity_disable_rules = [100001, "2000-2099"]
+            "#,
+        )
+        .unwrap();
+        assert!(validate_vhost_declarations(&parsed.vhost).is_ok());
+        assert!(validate_vhost_waf_declarations(&parsed.vhost, true).is_ok());
+        assert!(validate_vhost_waf_declarations(&parsed.vhost, false).is_err());
+
+        for rule in ["0", "2099-2000", "1001;SecRuleEngine Off", "1-2-3"] {
+            let config = format!(
+                "[[vhost]]\nserver_names = [\"example.test\"]\nroot = \"/tmp/site\"\nuser = \"example\"\nmodsecurity_disable_rules = [\"{rule}\"]\n"
+            );
+            let parsed: FileConfig = toml::from_str(&config).unwrap();
+            assert!(
+                validate_vhost_declarations(&parsed.vhost).is_err(),
+                "{rule}"
+            );
+        }
     }
 
     #[test]
