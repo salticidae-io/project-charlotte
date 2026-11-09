@@ -193,6 +193,10 @@ where
                     Err("Unix FastCGI sockets are not supported on this platform".to_owned())
                 }
             }
+            FastCgiAddress::Spawn(app) => Err(format!(
+                "FastCGI app {} was not started",
+                app.program.display()
+            )),
         }
     };
 

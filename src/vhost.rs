@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     error::Error,
     ffi::OsString,
     io,
@@ -52,11 +53,22 @@ struct VhostFile {
     listing: Option<bool>,
     #[serde(default)]
     fastcgi: Vec<String>,
+    #[serde(default)]
+    fastcgi_app: Vec<FastCgiAppFile>,
     fastcgi_timeout: Option<u64>,
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
     #[serde(default)]
     default: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FastCgiAppFile {
+    extension: String,
+    command: Vec<String>,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
 }
 
 struct Vhost {
@@ -149,7 +161,7 @@ impl Router {
             let index_name = entry.index.unwrap_or_else(|| fallback.index.clone());
             validate_index(&index_name)?;
             let listing = entry.listing.unwrap_or(fallback.listing);
-            let fastcgi = entry
+            let mut fastcgi = entry
                 .fastcgi
                 .iter()
                 .map(|value| crate::config::parse_fastcgi_backend(value))
@@ -163,6 +175,35 @@ impl Router {
                     )
                     .into());
                 }
+            }
+            for app_file in entry.fastcgi_app {
+                let Some(program) = app_file.command.first() else {
+                    return Err(format!(
+                        "vhost FastCGI app .{} command must not be empty",
+                        app_file.extension
+                    )
+                    .into());
+                };
+                let extension = crate::config::normalize_extension(&app_file.extension)?;
+                if !extensions.insert(extension.clone()) {
+                    return Err(format!("duplicate FastCGI extension in vhost: {extension}").into());
+                }
+                if app_file.command.iter().any(|part| part.contains('\0')) {
+                    return Err("vhost FastCGI app command cannot contain NUL".into());
+                }
+                for (key, value) in &app_file.env {
+                    crate::config::validate_env_key(key)?;
+                    if value.contains('\0') {
+                        return Err("vhost FastCGI app environment value cannot contain NUL".into());
+                    }
+                }
+                let mut backend =
+                    crate::config::parse_fastcgi_app(&format!("{extension}={program}"))?;
+                if let FastCgiAddress::Spawn(app) = &mut backend.address {
+                    app.args = app_file.command.into_iter().skip(1).collect();
+                    app.env = app_file.env;
+                }
+                fastcgi.push(backend);
             }
             let fastcgi = fastcgi
                 .into_iter()
@@ -614,8 +655,24 @@ fn build_worker_args(
         args.push("--no-listing".into());
     }
     for backend in fastcgi {
-        args.push("--fastcgi".into());
-        args.push(format_backend(backend).into());
+        match &backend.address {
+            FastCgiAddress::Spawn(app) => {
+                args.push("--fastcgi-app".into());
+                args.push(format!("{}={}", backend.extension, app.program.display()).into());
+                for arg in &app.args {
+                    args.push("--fastcgi-app-arg".into());
+                    args.push(format!("{}={arg}", backend.extension).into());
+                }
+                for (key, value) in &app.env {
+                    args.push("--fastcgi-app-env".into());
+                    args.push(format!("{}={key}={value}", backend.extension).into());
+                }
+            }
+            _ => {
+                args.push("--fastcgi".into());
+                args.push(format_backend(backend).into());
+            }
+        }
     }
     args
 }
@@ -624,6 +681,7 @@ fn format_backend(backend: &FastCgiBackend) -> String {
     match &backend.address {
         FastCgiAddress::Tcp(address) => format!("{}={address}", backend.extension),
         FastCgiAddress::Unix(path) => format!("{}=unix:{}", backend.extension, path.display()),
+        FastCgiAddress::Spawn(app) => format!("{}={}", backend.extension, app.program.display()),
     }
 }
 
@@ -645,12 +703,12 @@ mod tests {
         normalize_server_name, request_host, resolve_identity, validate_vhost_declarations,
     };
     use crate::{
-        config::{FastCgiAddress, FastCgiBackend},
+        config::{FastCgiAddress, FastCgiApp, FastCgiBackend},
         fuzz_support::{self, FuzzRequest},
     };
     use http::{HeaderValue, Request};
     use http_body_util::BodyExt;
-    use std::{path::Path, sync::Arc, time::Duration};
+    use std::{collections::BTreeMap, path::Path, sync::Arc, time::Duration};
 
     #[test]
     fn normalizes_authority_hosts() {
@@ -684,6 +742,7 @@ mod tests {
             index: None,
             listing: None,
             fastcgi: Vec::new(),
+            fastcgi_app: Vec::new(),
             fastcgi_timeout: None,
             tls_cert: None,
             tls_key: None,
@@ -721,6 +780,45 @@ mod tests {
     }
 
     #[test]
+    fn parses_vhost_fastcgi_app_command_and_environment() {
+        let parsed: FileConfig = toml::from_str(
+            r#"
+                [[vhost]]
+                server_names = ["php.example"]
+                root = "/srv/php"
+                user = "php"
+
+                [[vhost.fastcgi_app]]
+                extension = "php"
+                command = ["php8.4-cgi", "--foreground"]
+                env = { APP_MODE = "test" }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(parsed.vhost[0].fastcgi_app[0].extension, "php");
+        assert_eq!(
+            parsed.vhost[0].fastcgi_app[0].command,
+            ["php8.4-cgi", "--foreground"]
+        );
+        assert_eq!(
+            parsed.vhost[0].fastcgi_app[0]
+                .env
+                .get("APP_MODE")
+                .map(String::as_str),
+            Some("test")
+        );
+    }
+
+    #[test]
+    fn example_config_parses_and_validates() {
+        let parsed: FileConfig = toml::from_str(include_str!("../examples/charlotte.toml"))
+            .expect("example configuration should parse");
+        validate_vhost_declarations(&parsed.vhost)
+            .expect("example virtual host declarations should be valid");
+        assert_eq!(parsed.vhost[2].fastcgi_app.len(), 2);
+    }
+
+    #[test]
     fn validates_vhost_tls_certificate_pair() {
         let mut entry = declaration(&["example.test"], false);
         entry.tls_cert = Some("cert.pem".into());
@@ -740,10 +838,20 @@ mod tests {
             Path::new("/srv/example"),
             "home.php",
             false,
-            &[FastCgiBackend {
-                extension: "php".to_owned(),
-                address: FastCgiAddress::Tcp("127.0.0.1:9000".to_owned()),
-            }],
+            &[
+                FastCgiBackend {
+                    extension: "php".to_owned(),
+                    address: FastCgiAddress::Tcp("127.0.0.1:9000".to_owned()),
+                },
+                FastCgiBackend {
+                    extension: "cgi".to_owned(),
+                    address: FastCgiAddress::Spawn(FastCgiApp {
+                        program: "/usr/bin/php8.4-cgi".into(),
+                        args: vec!["--foreground".to_owned()],
+                        env: BTreeMap::from([("APP_MODE".to_owned(), "worker".to_owned())]),
+                    }),
+                },
+            ],
             Duration::from_secs(12),
         );
         let args = args
@@ -755,6 +863,18 @@ mod tests {
         assert!(
             args.windows(2)
                 .any(|pair| pair == ["--fastcgi", "php=127.0.0.1:9000"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| { pair == ["--fastcgi-app", "cgi=/usr/bin/php8.4-cgi"] })
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| { pair == ["--fastcgi-app-arg", "cgi=--foreground"] })
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| { pair == ["--fastcgi-app-env", "cgi=APP_MODE=worker"] })
         );
     }
 

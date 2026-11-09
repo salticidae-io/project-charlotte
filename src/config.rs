@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, path::PathBuf, time::Duration};
+use std::{collections::BTreeMap, net::SocketAddr, path::PathBuf, time::Duration};
 
 #[derive(Clone, Debug)]
 pub struct FastCgiBackend {
@@ -10,6 +10,14 @@ pub struct FastCgiBackend {
 pub enum FastCgiAddress {
     Tcp(String),
     Unix(PathBuf),
+    Spawn(FastCgiApp),
+}
+
+#[derive(Clone, Debug)]
+pub struct FastCgiApp {
+    pub program: PathBuf,
+    pub args: Vec<String>,
+    pub env: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug)]
@@ -54,6 +62,8 @@ impl Config {
         let mut index = String::from("index.html");
         let mut listing = true;
         let mut fastcgi = Vec::new();
+        let mut fastcgi_app_args = Vec::new();
+        let mut fastcgi_app_env = Vec::new();
         let mut fastcgi_timeout = Duration::from_secs(60);
         let mut modsecurity_rules = Vec::new();
         let mut modsecurity_body_limit = 16 * 1024 * 1024;
@@ -84,6 +94,48 @@ impl Config {
                         ));
                     }
                     fastcgi.push(backend);
+                }
+                "--fastcgi-app" => {
+                    let value = next_value(&mut args, "--fastcgi-app")?;
+                    let backend = parse_fastcgi_app(&value)?;
+                    if fastcgi
+                        .iter()
+                        .any(|existing: &FastCgiBackend| existing.extension == backend.extension)
+                    {
+                        return Err(format!(
+                            "duplicate FastCGI extension: {}",
+                            backend.extension
+                        ));
+                    }
+                    fastcgi.push(backend);
+                }
+                "--fastcgi-app-arg" => {
+                    let value = next_value(&mut args, "--fastcgi-app-arg")?;
+                    let (extension, arg) = value.split_once('=').ok_or_else(|| {
+                        format!("invalid FastCGI app argument: {value}; expected EXT=ARG")
+                    })?;
+                    if arg.contains('\0') {
+                        return Err("FastCGI app argument cannot contain NUL".to_owned());
+                    }
+                    fastcgi_app_args.push((normalize_extension(extension)?, arg.to_owned()));
+                }
+                "--fastcgi-app-env" => {
+                    let value = next_value(&mut args, "--fastcgi-app-env")?;
+                    let (extension, assignment) = value.split_once('=').ok_or_else(|| {
+                        format!("invalid FastCGI app environment: {value}; expected EXT=KEY=VALUE")
+                    })?;
+                    let (key, env_value) = assignment.split_once('=').ok_or_else(|| {
+                        format!("invalid FastCGI app environment: {value}; expected EXT=KEY=VALUE")
+                    })?;
+                    validate_env_key(key)?;
+                    if env_value.contains('\0') {
+                        return Err("FastCGI app environment value cannot contain NUL".to_owned());
+                    }
+                    fastcgi_app_env.push((
+                        normalize_extension(extension)?,
+                        key.to_owned(),
+                        env_value.to_owned(),
+                    ));
                 }
                 "--fastcgi-timeout" => {
                     let value = next_value(&mut args, "--fastcgi-timeout")?;
@@ -166,6 +218,37 @@ impl Config {
             return Err("--index must be a non-empty file name".to_owned());
         }
 
+        for (extension, arg) in fastcgi_app_args {
+            let Some(FastCgiBackend {
+                address: FastCgiAddress::Spawn(app),
+                ..
+            }) = fastcgi
+                .iter_mut()
+                .find(|backend| backend.extension == extension)
+            else {
+                return Err(format!(
+                    "FastCGI app argument references undeclared app extension: {extension}"
+                ));
+            };
+            app.args.push(arg);
+        }
+        for (extension, key, value) in fastcgi_app_env {
+            let Some(FastCgiBackend {
+                address: FastCgiAddress::Spawn(app),
+                ..
+            }) = fastcgi
+                .iter_mut()
+                .find(|backend| backend.extension == extension)
+            else {
+                return Err(format!(
+                    "FastCGI app environment references undeclared app extension: {extension}"
+                ));
+            };
+            if app.env.insert(key.clone(), value).is_some() {
+                return Err(format!("duplicate FastCGI app environment key: {key}"));
+            }
+        }
+
         let tls = match (tls_cert, tls_key) {
             (Some(cert), Some(key)) => Some(TlsFiles { cert, key }),
             (None, None) => None,
@@ -203,7 +286,7 @@ impl Config {
     }
 
     pub fn usage() -> &'static str {
-        "Usage: project-charlotte [--bind ADDRESS] [--tls-bind ADDRESS] [--root DIRECTORY] [--index NAME] [--no-listing] [--fastcgi EXT=ADDR]... [--fastcgi-timeout SECS] [--modsecurity-rules FILE]... [--modsecurity-body-limit BYTES] [--config FILE] [--tls-cert PATH --tls-key PATH] [--http3-bind ADDRESS] [--help]"
+        "Usage: project-charlotte [--bind ADDRESS] [--tls-bind ADDRESS] [--root DIRECTORY] [--index NAME] [--no-listing] [--fastcgi EXT=ADDR]... [--fastcgi-app EXT=PROGRAM]... [--fastcgi-app-arg EXT=ARG]... [--fastcgi-app-env EXT=KEY=VALUE]... [--fastcgi-timeout SECS] [--modsecurity-rules FILE]... [--modsecurity-body-limit BYTES] [--config FILE] [--tls-cert PATH --tls-key PATH] [--http3-bind ADDRESS] [--help]"
     }
 }
 
@@ -211,10 +294,7 @@ pub(crate) fn parse_fastcgi_backend(value: &str) -> Result<FastCgiBackend, Strin
     let (extension, address) = value
         .split_once('=')
         .ok_or_else(|| format!("invalid FastCGI backend: {value}; expected EXT=ADDR"))?;
-    let extension = extension.trim_start_matches('.').to_ascii_lowercase();
-    if extension.is_empty() || !extension.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
-        return Err(format!("invalid FastCGI extension: {extension}"));
-    }
+    let extension = normalize_extension(extension)?;
     let address = if let Some(path) = address.strip_prefix("unix:") {
         if path.is_empty() {
             return Err("FastCGI Unix socket path cannot be empty".to_owned());
@@ -238,6 +318,43 @@ pub(crate) fn parse_fastcgi_backend(value: &str) -> Result<FastCgiBackend, Strin
         FastCgiAddress::Tcp(address.to_owned())
     };
     Ok(FastCgiBackend { extension, address })
+}
+
+pub(crate) fn parse_fastcgi_app(value: &str) -> Result<FastCgiBackend, String> {
+    let (extension, program) = value
+        .split_once('=')
+        .ok_or_else(|| format!("invalid FastCGI app: {value}; expected EXT=PROGRAM"))?;
+    let extension = normalize_extension(extension)?;
+    if program.is_empty() || program.contains('\0') {
+        return Err("FastCGI app program cannot be empty or contain NUL".to_owned());
+    }
+    Ok(FastCgiBackend {
+        extension,
+        address: FastCgiAddress::Spawn(FastCgiApp {
+            program: PathBuf::from(program),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+        }),
+    })
+}
+
+pub(crate) fn normalize_extension(extension: &str) -> Result<String, String> {
+    let extension = extension.trim_start_matches('.').to_ascii_lowercase();
+    if extension.is_empty() || !extension.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+        return Err(format!("invalid FastCGI extension: {extension}"));
+    }
+    Ok(extension)
+}
+
+pub(crate) fn validate_env_key(key: &str) -> Result<(), String> {
+    let mut bytes = key.bytes();
+    let valid_first = bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_');
+    if !valid_first || !bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_') {
+        return Err(format!("invalid FastCGI app environment key: {key}"));
+    }
+    Ok(())
 }
 
 fn next_value(args: &mut impl Iterator<Item = String>, option: &str) -> Result<String, String> {
@@ -308,6 +425,60 @@ mod tests {
                 "php=127.0.0.1:9000".to_owned(),
                 "--fastcgi".to_owned(),
                 ".PHP=127.0.0.1:9001".to_owned(),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn parses_fastcgi_app_and_preserves_args_and_environment() {
+        let parsed = Config::parse([
+            "--fastcgi-app-arg".to_owned(),
+            "PHP=--foreground".to_owned(),
+            "--fastcgi-app-env".to_owned(),
+            "php=APP_MODE=production".to_owned(),
+            "--fastcgi-app".to_owned(),
+            "php=/usr/bin/php8.4-cgi".to_owned(),
+            "--fastcgi-app-arg".to_owned(),
+            "php=--bind".to_owned(),
+        ])
+        .unwrap();
+        let ParseResult::Config(config) = parsed else {
+            panic!("expected config")
+        };
+        assert_eq!(config.fastcgi.len(), 1);
+        assert_eq!(config.fastcgi[0].extension, "php");
+        let FastCgiAddress::Spawn(app) = &config.fastcgi[0].address else {
+            panic!("expected spawned FastCGI app")
+        };
+        assert_eq!(app.program, PathBuf::from("/usr/bin/php8.4-cgi"));
+        assert_eq!(app.args, ["--foreground", "--bind"]);
+        assert_eq!(
+            app.env.get("APP_MODE").map(String::as_str),
+            Some("production")
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_fastcgi_app_declarations_and_options() {
+        assert!(Config::parse(["--fastcgi-app".to_owned(), "php=".to_owned()]).is_err());
+        assert!(
+            Config::parse([
+                "--fastcgi-app".to_owned(),
+                "php=php-cgi".to_owned(),
+                "--fastcgi".to_owned(),
+                "PHP=127.0.0.1:9000".to_owned()
+            ])
+            .is_err()
+        );
+        assert!(Config::parse(["--fastcgi-app-arg".to_owned(), "php=--arg".to_owned()]).is_err());
+        assert!(Config::parse(["--fastcgi-app-env".to_owned(), "php=KEY".to_owned()]).is_err());
+        assert!(
+            Config::parse([
+                "--fastcgi-app-env".to_owned(),
+                "php=1BAD=value".to_owned(),
+                "--fastcgi-app".to_owned(),
+                "php=php-cgi".to_owned()
             ])
             .is_err()
         );

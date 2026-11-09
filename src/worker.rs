@@ -11,7 +11,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use nix::unistd::{Gid, Uid, getegid, geteuid, getgroups, setgid, setgroups, setuid};
 use tokio::{io::AsyncWriteExt, net::UnixStream};
 
-use crate::{config::Config, handler};
+use crate::{config::Config, fastcgi_app, handler};
 
 pub(crate) fn drop_privileges(config: &Config) -> Result<(), Box<dyn Error + Send + Sync>> {
     let uid = Uid::from_raw(config.worker_uid.ok_or("worker uid is missing")?);
@@ -40,6 +40,7 @@ pub(crate) async fn run(mut config: Config) -> Result<(), Box<dyn Error + Send +
         .into());
     }
     config.root = root;
+    let _fastcgi_apps = fastcgi_app::start_apps(&mut config).await?;
     let socket_fd = std::io::stdin().as_fd().try_clone_to_owned()?;
     let socket = StdUnixStream::from(socket_fd);
     socket.set_nonblocking(true)?;

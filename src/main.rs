@@ -2,6 +2,7 @@
 
 mod config;
 mod fastcgi;
+mod fastcgi_app;
 mod handler;
 mod http3;
 mod httpdate;
@@ -65,7 +66,8 @@ async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> 
     if !tokio::fs::metadata(&root).await?.is_dir() {
         return Err(format!("document root is not a directory: {}", root.display()).into());
     }
-    let config = Config { root, ..config };
+    let mut config = Config { root, ..config };
+    let _fastcgi_apps = fastcgi_app::start_apps(&mut config).await?;
     let listener = TcpListener::bind(config.bind).await?;
     let waf = if config.modsecurity_rules.is_empty() {
         None
@@ -110,6 +112,7 @@ async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> 
         let address = match &backend.address {
             FastCgiAddress::Tcp(address) => address.clone(),
             FastCgiAddress::Unix(path) => format!("unix:{}", path.display()),
+            FastCgiAddress::Spawn(app) => format!("spawn:{}", app.program.display()),
         };
         eprintln!("FastCGI .{} -> {address}", backend.extension);
     }
