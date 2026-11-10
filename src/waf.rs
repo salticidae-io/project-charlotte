@@ -574,15 +574,21 @@ impl Drop for StreamingBody {
 mod tests {
     use std::sync::{Arc, OnceLock};
 
-    use http_body_util::BodyExt;
-
     use crate::{
         config::Config,
         fuzz_support::{self, FuzzRequest},
         vhost::Router,
     };
 
-    use super::Waf;
+    use super::{RuleIdSpec, Waf};
+
+    /// Request bodies above this size are refused by the fuzz WAF. It is kept
+    /// small so that the limit is within reach of fuzzer-sized inputs.
+    const REQUEST_BODY_LIMIT: usize = 4096;
+    /// `large.txt` exceeds this, which moves its response onto the streaming
+    /// inspection path.
+    const RESPONSE_BODY_LIMIT: usize = 1024 * 1024;
+    const _: () = assert!(fuzz_support::LARGE_FILE_LEN > RESPONSE_BODY_LIMIT);
 
     fn fuzz_waf() -> Waf {
         static WAF: OnceLock<Waf> = OnceLock::new();
@@ -590,8 +596,8 @@ mod tests {
             let fixture = fuzz_support::fixture();
             Waf::load(
                 std::slice::from_ref(&fixture.rules),
-                16 * 1024 * 1024,
-                1024 * 1024,
+                REQUEST_BODY_LIMIT,
+                RESPONSE_BODY_LIMIT,
             )
             .expect("fuzz ModSecurity rules load")
         })
@@ -606,33 +612,89 @@ mod tests {
         let mut config: Config = fuzz_support::fuzz_config(fixture.root.clone());
         config.fastcgi.clear();
         let (peer, local) = fuzz_support::addresses();
-        let response = fuzz_support::run(async {
+        let method = request.method().clone();
+        let must_block = request
+            .uri()
+            .query()
+            .is_some_and(|query| query.split('&').any(|pair| pair == "block=yes"));
+        let collected = fuzz_support::collect(async {
             let router = Router::load(Arc::new(config), None, Some(fuzz_waf()))
                 .await
                 .expect("WAF router loads");
             router.dispatch(request, peer, local).await
         });
-        assert!((100..=599).contains(&response.status().as_u16()));
-        let body = fuzz_support::run(async { response.into_body().collect().await })
-            .expect("WAF response body should be readable")
-            .to_bytes();
+        // A streamed response may be cut short by a late intervention, so a
+        // body error is acceptable here; what was delivered is still checked.
+        fuzz_support::assert_response_invariants(&method, &collected);
+        // The only fixture content holding the marker is smaller than the
+        // inspection limit, so the response rule must always catch it.
         assert!(
-            !body
-                .windows(fixture.outside_secret.len())
-                .any(|window| window == fixture.outside_secret)
+            !fuzz_support::contains(&collected.body, fuzz_support::RESPONSE_SECRET),
+            "response rule was bypassed"
         );
+        if must_block {
+            assert_eq!(
+                collected.parts.status,
+                http::StatusCode::FORBIDDEN,
+                "request rule was bypassed"
+            );
+        }
     }
 
     #[test]
     fn fuzz_seed_waf_request() {
         waf_request(FuzzRequest::default());
+        for uri in [
+            "/response-secret.txt",
+            "/safe.txt?block=yes",
+            "/large.txt",
+            "/listing/",
+        ] {
+            waf_request(FuzzRequest {
+                uri: uri.to_owned(),
+                ..FuzzRequest::default()
+            });
+        }
         waf_request(FuzzRequest {
             uri: "/response-secret.txt".to_owned(),
+            headers: vec![("range".to_owned(), b"bytes=18-".to_vec())],
             ..FuzzRequest::default()
         });
         waf_request(FuzzRequest {
-            uri: "/safe.txt?block=yes".to_owned(),
+            method: "POST".to_owned(),
+            headers: vec![(
+                "content-type".to_owned(),
+                b"application/x-www-form-urlencoded".to_vec(),
+            )],
+            body: b"block=yes".to_vec(),
             ..FuzzRequest::default()
         });
+        waf_request(FuzzRequest {
+            method: "POST".to_owned(),
+            body: vec![b'a'; REQUEST_BODY_LIMIT + 1],
+            ..FuzzRequest::default()
+        });
+    }
+
+    /// Rule exclusions from vhost files are interpolated into a ModSecurity
+    /// directive, so an accepted value must render as plain IDs and ranges.
+    #[test_fuzz::test_fuzz]
+    fn rule_id_spec(value: &str) {
+        if let Ok(spec) = value.parse::<RuleIdSpec>() {
+            let rendered = spec.to_string();
+            assert!(
+                rendered
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || byte == b'-')
+            );
+            assert_eq!(rendered.parse::<RuleIdSpec>(), Ok(spec));
+        }
+    }
+
+    #[test]
+    fn fuzz_seed_rule_id_spec() {
+        rule_id_spec("942100");
+        rule_id_spec("0042-100000");
+        rule_id_spec("1 2");
     }
 }

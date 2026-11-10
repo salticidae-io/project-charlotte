@@ -258,15 +258,7 @@ impl AcmeManager {
 
     pub(crate) async fn challenge_response(&self, host: &str, path: &str) -> Option<String> {
         let host = normalize_host(host)?;
-        let token = path.strip_prefix(CHALLENGE_PREFIX)?;
-        if token.is_empty()
-            || token.contains('/')
-            || !token
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
-        {
-            return None;
-        }
+        let token = challenge_token(path)?;
         self.inner
             .challenges
             .lock()
@@ -274,6 +266,17 @@ impl AcmeManager {
             .get(&(host, token.to_owned()))
             .cloned()
     }
+}
+
+/// Extracts the token from an HTTP-01 challenge path. Only the base64url
+/// alphabet that ACME tokens use is accepted.
+fn challenge_token(path: &str) -> Option<&str> {
+    let token = path.strip_prefix(CHALLENGE_PREFIX)?;
+    (!token.is_empty()
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-'))
+    .then_some(token)
 }
 
 async fn provision(inner: &AcmeInner, host: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -489,8 +492,8 @@ use std::os::unix::fs::PermissionsExt;
 #[cfg(test)]
 mod tests {
     use super::{
-        AcmeCertificateStore, AcmeManager, AcmeSettings, acme_dns_name, cache_files,
-        certificate_not_after,
+        AcmeCertificateStore, AcmeManager, AcmeSettings, CHALLENGE_PREFIX, acme_dns_name,
+        cache_files, certificate_not_after, challenge_token,
     };
     use std::{
         path::PathBuf,
@@ -637,5 +640,54 @@ mod tests {
             .not_after = 0;
         assert!(store.needs_renewal("alpha.example.test"));
         std::fs::remove_dir_all(cache).unwrap();
+    }
+
+    /// Eligible names become cache file names, so nothing that passes the
+    /// check may address a file outside the cache directory.
+    #[test_fuzz::test_fuzz]
+    fn dns_name(name: String) {
+        if !acme_dns_name(&name) {
+            return;
+        }
+        assert!(
+            name.bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'.')
+        );
+        let cache = std::path::Path::new("/cache");
+        let files = cache_files(cache, &name);
+        for file in [files.cert, files.key] {
+            assert_eq!(file.parent(), Some(cache));
+            assert!(
+                file.file_name()
+                    .is_some_and(|file_name| file_name.to_string_lossy().starts_with(&name))
+            );
+        }
+    }
+
+    #[test]
+    fn fuzz_seed_dns_name() {
+        dns_name("alpha.example.test".to_owned());
+        dns_name("../escape".to_owned());
+        dns_name("*.example.test".to_owned());
+    }
+
+    #[test_fuzz::test_fuzz]
+    fn challenge_path(path: String) {
+        if let Some(token) = challenge_token(&path) {
+            assert!(!token.is_empty());
+            assert!(
+                token
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+            );
+            assert_eq!(format!("{CHALLENGE_PREFIX}{token}"), path);
+        }
+    }
+
+    #[test]
+    fn fuzz_seed_challenge_path() {
+        challenge_path("/.well-known/acme-challenge/token_123".to_owned());
+        challenge_path("/.well-known/acme-challenge/../secret".to_owned());
+        challenge_path("/.well-known/acme-challenge/".to_owned());
     }
 }

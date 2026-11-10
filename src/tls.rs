@@ -200,7 +200,11 @@ mod tests {
     };
 
     use super::{SniResolver, StaticCertificates, load_certified_key, select_index, select_key};
-    use crate::{acme::AcmeCertificateStore, config::TlsFiles};
+    use crate::{
+        acme::AcmeCertificateStore,
+        config::TlsFiles,
+        vhost::{match_score, normalize_host},
+    };
 
     static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
 
@@ -288,5 +292,46 @@ mod tests {
         std::fs::remove_dir_all(dynamic_dir).unwrap();
         std::fs::remove_dir_all(static_dir).unwrap();
         std::fs::remove_dir_all(fallback_dir).unwrap();
+    }
+
+    /// Certificate selection must return the best-matching entry, and use
+    /// the fallback only when no entry matches the server name.
+    #[test_fuzz::test_fuzz]
+    fn sni_selection(names: Vec<String>, server_name: Option<String>, fallback: bool) {
+        const FALLBACK: usize = usize::MAX;
+        let entries = names.into_iter().zip(0usize..).collect::<Vec<_>>();
+        let selected = select_key(
+            &entries,
+            fallback.then_some(&FALLBACK),
+            server_name.as_deref(),
+        );
+        let host = server_name.as_deref().and_then(normalize_host);
+        let score = |pattern: &str| host.as_deref().and_then(|host| match_score(pattern, host));
+        match selected {
+            Some(&index) if index != FALLBACK => {
+                let best = score(&entries[index].0).expect("selected entry matches the name");
+                assert!(
+                    entries
+                        .iter()
+                        .all(|(pattern, _)| score(pattern).is_none_or(|other| other <= best))
+                );
+            }
+            other => {
+                assert_eq!(other.is_some(), fallback);
+                assert!(entries.iter().all(|(pattern, _)| score(pattern).is_none()));
+            }
+        }
+    }
+
+    #[test]
+    fn fuzz_seed_sni_selection() {
+        let names = vec![
+            "*.example.test".to_owned(),
+            "api.example.test".to_owned(),
+            "*.dev.example.test".to_owned(),
+        ];
+        sni_selection(names.clone(), Some("API.Example.Test.".to_owned()), true);
+        sni_selection(names.clone(), Some("a.dev.example.test".to_owned()), false);
+        sni_selection(names, None, false);
     }
 }

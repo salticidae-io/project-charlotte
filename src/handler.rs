@@ -907,13 +907,24 @@ mod tests {
     #[test_fuzz::test_fuzz]
     fn if_range(value: &str, etag: &str) {
         let modified = DateTime::<Utc>::from_timestamp(784_111_777, 0).unwrap();
-        let _ = super::if_range_matches(value, etag, modified);
+        let matches = super::if_range_matches(value, etag, modified);
+        if matches && value != etag {
+            // Anything other than the exact entity tag may only match as a
+            // date that is no older than the file.
+            let date = crate::httpdate::parse_http_date(value)
+                .expect("a non-tag If-Range only matches as an HTTP date");
+            assert!(date >= modified);
+        }
+        if etag.starts_with('"') {
+            assert!(super::if_range_matches(etag, etag, modified));
+        }
     }
 
     #[test]
     fn fuzz_seed_if_range() {
         if_range("\"tag\"", "\"tag\"");
         if_range("invalid", "\"tag\"");
+        if_range("Sun, 06 Nov 1994 08:49:37 GMT", "\"tag\"");
     }
 
     #[test_fuzz::test_fuzz]
@@ -939,29 +950,104 @@ mod tests {
         let mut config = fuzz_support::fuzz_config(fixture.root.clone());
         config.fastcgi.clear();
         let (peer, local) = fuzz_support::addresses();
-        let response = fuzz_support::run(super::handle_request(
+        let method = request.method().clone();
+        let collected = fuzz_support::collect(super::handle_request(
             request,
             Arc::new(config),
             peer,
             local,
         ));
-        assert!((100..=599).contains(&response.status().as_u16()));
-        let body = fuzz_support::run(async { response.into_body().collect().await })
-            .expect("static response body should be readable")
-            .to_bytes();
         assert!(
-            !body
-                .windows(fixture.outside_secret.len())
-                .any(|window| window == fixture.outside_secret)
+            collected.error.is_none(),
+            "static response body should be readable"
         );
+        fuzz_support::assert_response_invariants(&method, &collected);
     }
 
     #[test]
     fn fuzz_seed_static_request() {
         static_request(FuzzRequest::default());
+        for uri in [
+            "/escape.txt",
+            "/escape-dir/secret.txt",
+            "/escape-dir/",
+            "/listing/",
+            "/listing/nested/",
+            "/subdir",
+        ] {
+            static_request(FuzzRequest {
+                uri: uri.to_owned(),
+                ..FuzzRequest::default()
+            });
+        }
         static_request(FuzzRequest {
-            uri: "/escape.txt".to_owned(),
+            uri: "/large.txt".to_owned(),
+            headers: vec![("range".to_owned(), b"bytes=1048570-".to_vec())],
             ..FuzzRequest::default()
         });
+        static_request(FuzzRequest {
+            method: "HEAD".to_owned(),
+            headers: vec![("if-none-match".to_owned(), b"*".to_vec())],
+            ..FuzzRequest::default()
+        });
+    }
+
+    #[test_fuzz::test_fuzz]
+    fn try_files_request(request: FuzzRequest, entries: Vec<String>) {
+        if entries.is_empty() || crate::config::validate_try_files(&entries).is_err() {
+            return;
+        }
+        let Some(request) = request.build() else {
+            return;
+        };
+        // Every entry that configuration validation accepts must expand for
+        // any request; a failure here is a 500 an operator cannot foresee.
+        for entry in &entries {
+            assert!(
+                super::substitute_try_file(entry, request.uri().path(), request.uri().query())
+                    .is_some(),
+                "validated try_files entry failed to expand: {entry}"
+            );
+        }
+        let fixture = fuzz_support::fixture();
+        let mut config = fuzz_support::fuzz_config(fixture.root.clone());
+        config.fastcgi.clear();
+        config.try_files = entries;
+        let (peer, local) = fuzz_support::addresses();
+        let method = request.method().clone();
+        let collected = fuzz_support::collect(super::handle_request(
+            request,
+            Arc::new(config),
+            peer,
+            local,
+        ));
+        assert!(
+            collected.error.is_none(),
+            "try_files response body should be readable"
+        );
+        fuzz_support::assert_response_invariants(&method, &collected);
+    }
+
+    #[test]
+    fn fuzz_seed_try_files_request() {
+        let entries = |entries: &[&str]| entries.iter().map(|entry| (*entry).to_owned()).collect();
+        try_files_request(
+            FuzzRequest {
+                uri: "/missing?x=1".to_owned(),
+                ..FuzzRequest::default()
+            },
+            entries(&["$uri", "$uri/", "/index.html?$args"]),
+        );
+        try_files_request(
+            FuzzRequest {
+                uri: "/escape.txt".to_owned(),
+                ..FuzzRequest::default()
+            },
+            entries(&["$uri", "/escape-dir/secret.txt", "=404"]),
+        );
+        try_files_request(
+            FuzzRequest::default(),
+            entries(&["/subdir$uri", "/safe.txt$is_args$query_string"]),
+        );
     }
 }

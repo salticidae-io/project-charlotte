@@ -611,7 +611,7 @@ impl Router {
 
     async fn route<B>(
         &self,
-        mut request: Request<B>,
+        request: Request<B>,
         peer: SocketAddr,
         local: SocketAddr,
         table: Arc<VhostTable>,
@@ -621,62 +621,18 @@ impl Router {
         B::Error: Into<Box<dyn Error + Send + Sync>>,
     {
         let host = request_host(&request);
-        if let (Some(TlsSni(Some(sni))), Some(host)) =
-            (request.extensions().get::<TlsSni>(), host.as_deref())
-        {
-            let sni_selected = normalize_host(sni)
-                .as_deref()
-                .and_then(|sni| Self::select_vhost(&table, sni))
-                .or(table.default);
-            let host_selected = Self::select_vhost(&table, host).or(table.default);
-            if sni_selected != host_selected {
-                return handler::error_response(
-                    StatusCode::MISDIRECTED_REQUEST,
-                    "Request authority does not match TLS server name\n",
-                );
+        let index = match select_route(&table, &request, host.as_deref()) {
+            Ok(Some(index)) => index,
+            Ok(None) => {
+                return handler::handle_request(request, Arc::clone(&self.fallback), peer, local)
+                    .await;
             }
-        }
-        let selected = host
-            .as_deref()
-            .and_then(|host| Self::select_vhost(&table, host))
-            .or(table.default);
-        let Some(index) = selected else {
-            return handler::handle_request(request, Arc::clone(&self.fallback), peer, local).await;
+            Err((status, message)) => return handler::error_response(status, message),
         };
-
-        let authority = request_authority(&request)
-            .or_else(|| host.map(|host| host.to_owned()))
-            .unwrap_or_else(|| "localhost".to_owned());
-        if let Ok(value) = HeaderValue::from_str(&authority) {
-            request.headers_mut().insert(HOST, value);
-        }
-        let original_version = version_name(request.version());
-        request.headers_mut().insert(
-            META_PEER,
-            HeaderValue::from_str(&peer.to_string()).expect("socket address is a valid header"),
-        );
-        request.headers_mut().insert(
-            META_LOCAL,
-            HeaderValue::from_str(&local.to_string()).expect("socket address is a valid header"),
-        );
-        request
-            .headers_mut()
-            .insert(META_VERSION, HeaderValue::from_static(original_version));
-        let path_and_query = request
-            .uri()
-            .path_and_query()
-            .map_or("/", |value| value.as_str());
-        let path_and_query = if path_and_query == "*" {
-            "/"
-        } else {
-            path_and_query
+        let request = match worker_request(request, host.as_deref(), peer, local) {
+            Ok(request) => request,
+            Err((status, message)) => return handler::error_response(status, message),
         };
-        let uri = match format!("http://{authority}{path_and_query}").parse::<Uri>() {
-            Ok(uri) => uri,
-            Err(_) => return handler::error_response(StatusCode::BAD_REQUEST, "Invalid URI\n"),
-        };
-        *request.uri_mut() = uri;
-        *request.version_mut() = Version::HTTP_2;
 
         let request = request.map(|body| {
             body.map_err(|error| io::Error::other(error.into()))
@@ -800,6 +756,90 @@ impl Worker {
             }
         }
     }
+}
+
+/// A request that routing refuses, as the status and body of its response.
+type Rejection = (StatusCode, &'static str);
+
+/// Chooses the virtual host for a request, or `None` for the fallback site.
+///
+/// A request that arrived over TLS is refused when its authority selects a
+/// different virtual host than the server name the connection was
+/// established for.
+fn select_route<B>(
+    table: &VhostTable,
+    request: &Request<B>,
+    host: Option<&str>,
+) -> Result<Option<usize>, Rejection> {
+    if let (Some(TlsSni(Some(sni))), Some(host)) = (request.extensions().get::<TlsSni>(), host) {
+        let sni_selected = normalize_host(sni)
+            .as_deref()
+            .and_then(|sni| Router::select_vhost(table, sni))
+            .or(table.default);
+        let host_selected = Router::select_vhost(table, host).or(table.default);
+        if sni_selected != host_selected {
+            return Err((
+                StatusCode::MISDIRECTED_REQUEST,
+                "Request authority does not match TLS server name\n",
+            ));
+        }
+    }
+    Ok(host
+        .and_then(|host| Router::select_vhost(table, host))
+        .or(table.default))
+}
+
+/// Rewrites a request into the form a virtual host worker expects: an
+/// absolute HTTP/2 request carrying the client's addresses and original
+/// protocol version as private metadata headers.
+///
+/// `worker::prepare_request` reverses this, and must recover exactly the
+/// path and query that were inspected before routing.
+fn worker_request<B>(
+    mut request: Request<B>,
+    host: Option<&str>,
+    peer: SocketAddr,
+    local: SocketAddr,
+) -> Result<Request<B>, Rejection> {
+    let authority = request_authority(&request)
+        .or_else(|| host.map(str::to_owned))
+        .unwrap_or_else(|| "localhost".to_owned());
+    // The authority is spliced into the worker's request URI below. A `Host`
+    // header is free-form text, so one such as `x/admin.php?` would otherwise
+    // replace the path that was inspected before routing.
+    if authority.parse::<http::uri::Authority>().is_err() {
+        return Err((StatusCode::BAD_REQUEST, "Invalid Host\n"));
+    }
+    if let Ok(value) = HeaderValue::from_str(&authority) {
+        request.headers_mut().insert(HOST, value);
+    }
+    let original_version = version_name(request.version());
+    request.headers_mut().insert(
+        META_PEER,
+        HeaderValue::from_str(&peer.to_string()).expect("socket address is a valid header"),
+    );
+    request.headers_mut().insert(
+        META_LOCAL,
+        HeaderValue::from_str(&local.to_string()).expect("socket address is a valid header"),
+    );
+    request
+        .headers_mut()
+        .insert(META_VERSION, HeaderValue::from_static(original_version));
+    let path_and_query = request
+        .uri()
+        .path_and_query()
+        .map_or("/", |value| value.as_str());
+    let path_and_query = if path_and_query == "*" {
+        "/"
+    } else {
+        path_and_query
+    };
+    let uri = format!("http://{authority}{path_and_query}")
+        .parse::<Uri>()
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid URI\n"))?;
+    *request.uri_mut() = uri;
+    *request.version_mut() = Version::HTTP_2;
+    Ok(request)
 }
 
 fn request_authority<B>(request: &Request<B>) -> Option<String> {
@@ -1058,19 +1098,22 @@ fn version_name(version: Version) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        FileConfig, Router, VhostFile, build_worker_args, match_score, normalize_host,
-        normalize_server_name, request_host, resolve_identity, scan_vhost_files,
-        validate_vhost_declarations, validate_vhost_waf_declarations,
+        FileConfig, Router, TlsSni, Vhost, VhostFile, VhostTable, Worker, build_worker_args,
+        match_score, normalize_host, normalize_server_name, request_host, resolve_identity,
+        scan_vhost_files, select_route, validate_index, validate_vhost_declarations,
+        validate_vhost_waf_declarations, worker_request,
     };
     use crate::{
-        config::{FastCgiAddress, FastCgiApp, FastCgiBackend},
+        config::{
+            Config, FastCgiAddress, FastCgiApp, FastCgiBackend, ParseResult, normalize_extension,
+            parse_fastcgi_app, parse_fastcgi_backend, validate_env_key, validate_try_files,
+        },
         fuzz_support::{self, FuzzRequest},
     };
-    use http::{HeaderValue, Request};
-    use http_body_util::BodyExt;
+    use http::{HeaderValue, Request, StatusCode, Version, header::HOST};
     use std::{
-        collections::BTreeMap,
-        path::Path,
+        collections::{BTreeMap, HashSet},
+        path::{Path, PathBuf},
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
@@ -1359,13 +1402,26 @@ mod tests {
             let Some(pattern) = normalize_server_name(&name) else {
                 continue;
             };
-            if match_score(&pattern, &host).is_some() {
-                let wildcard_match = pattern.strip_prefix("*.").is_some_and(|suffix| {
-                    host.len() > suffix.len()
-                        && host.ends_with(suffix)
-                        && host.as_bytes().get(host.len() - suffix.len() - 1) == Some(&b'.')
-                });
-                assert!(pattern == host || wildcard_match);
+            match pattern.strip_prefix("*.") {
+                Some(suffix) => {
+                    // A wildcard covers subdomains only: never the apex, and
+                    // never a different domain that merely ends the same way.
+                    assert_eq!(match_score(&pattern, suffix), None);
+                    assert_eq!(match_score(&pattern, &format!("a{suffix}")), None);
+                    assert!(
+                        match_score(&pattern, &format!("a.{suffix}"))
+                            .is_some_and(|score| score < usize::MAX)
+                    );
+                    if match_score(&pattern, &host).is_some() {
+                        assert!(host.ends_with(&format!(".{suffix}")));
+                    }
+                }
+                None => {
+                    assert_eq!(match_score(&pattern, &pattern), Some(usize::MAX));
+                    if match_score(&pattern, &host).is_some() {
+                        assert_eq!(pattern, host);
+                    }
+                }
             }
         }
     }
@@ -1409,21 +1465,18 @@ mod tests {
         let mut config = fuzz_support::fuzz_config(fixture.root.clone());
         config.fastcgi.clear();
         let (peer, local) = fuzz_support::addresses();
-        let response = fuzz_support::run(async {
+        let method = request.method().clone();
+        let collected = fuzz_support::collect(async {
             let router = Router::load(Arc::new(config), None, None)
                 .await
                 .expect("fallback router loads");
             router.dispatch(request, peer, local).await
         });
-        assert!((100..=599).contains(&response.status().as_u16()));
-        let body = fuzz_support::run(async { response.into_body().collect().await })
-            .expect("router response body should be readable")
-            .to_bytes();
         assert!(
-            !body
-                .windows(fixture.outside_secret.len())
-                .any(|window| window == fixture.outside_secret)
+            collected.error.is_none(),
+            "router response body should be readable"
         );
+        fuzz_support::assert_response_invariants(&method, &collected);
     }
 
     #[test]
@@ -1433,5 +1486,293 @@ mod tests {
             uri: "/escape.txt".to_owned(),
             ..FuzzRequest::default()
         });
+    }
+
+    /// A routing table whose workers are never started; it exercises vhost
+    /// selection and request rewriting without spawning processes.
+    fn fuzz_table(default: bool) -> VhostTable {
+        let vhost = |names: &[&str], default: bool| {
+            Arc::new(Vhost {
+                names: names.iter().map(|name| (*name).to_owned()).collect(),
+                tls: None,
+                acme: false,
+                default,
+                waf: None,
+                worker: Arc::new(Worker {
+                    uid: 0,
+                    gid: 0,
+                    root: PathBuf::from("/"),
+                    index: "index.html".to_owned(),
+                    listing: false,
+                    try_files: Vec::new(),
+                    fastcgi: Vec::new(),
+                    fastcgi_timeout: Duration::from_secs(1),
+                    threads: 1,
+                    process: tokio::sync::Mutex::new(None),
+                }),
+            })
+        };
+        VhostTable {
+            vhosts: vec![
+                vhost(&["example.test", "*.example.test"], false),
+                vhost(&["other.test", "*.dev.example.test"], default),
+            ],
+            default: default.then_some(1),
+        }
+    }
+
+    /// Routes a request to a vhost in the master and unpacks it again the way
+    /// the worker does. The worker must see exactly the request target that
+    /// the master (and therefore the WAF) saw.
+    #[test_fuzz::test_fuzz]
+    fn worker_roundtrip(input: FuzzRequest, sni: Option<String>, default: bool) {
+        let Some(mut request) = input.build() else {
+            return;
+        };
+        let has_sni = sni.is_some();
+        if let Some(sni) = sni {
+            request.extensions_mut().insert(TlsSni(Some(sni)));
+        }
+        let table = fuzz_table(default);
+        let host = request_host(&request);
+        let index = match select_route(&table, &request, host.as_deref()) {
+            Ok(Some(index)) => index,
+            Ok(None) => {
+                assert!(!default, "a default vhost handles every request");
+                return;
+            }
+            Err((status, _)) => {
+                assert_eq!(status, StatusCode::MISDIRECTED_REQUEST);
+                assert!(has_sni && host.is_some());
+                return;
+            }
+        };
+        if !default {
+            let host = host
+                .as_deref()
+                .expect("only a default matches without a host");
+            assert!(
+                table.vhosts[index]
+                    .names
+                    .iter()
+                    .any(|name| match_score(name, host).is_some())
+            );
+        }
+
+        let version = request.version();
+        let target = match request.uri().path_and_query().map(|value| value.as_str()) {
+            None | Some("*") => "/".to_owned(),
+            Some(value) => value.to_owned(),
+        };
+        let (peer, local) = fuzz_support::addresses();
+        let Ok(mut forwarded) = worker_request(request, host.as_deref(), peer, local) else {
+            return;
+        };
+        assert_eq!(forwarded.version(), Version::HTTP_2);
+        assert_eq!(
+            forwarded.headers().get(HOST).map(HeaderValue::as_bytes),
+            forwarded
+                .uri()
+                .authority()
+                .map(|authority| authority.as_str().as_bytes())
+        );
+
+        let addresses = crate::worker::prepare_request(&mut forwarded)
+            .expect("worker accepts the request the master forwarded");
+        assert_eq!(addresses, (peer, local));
+        assert_eq!(forwarded.version(), version);
+        assert_eq!(
+            forwarded
+                .uri()
+                .path_and_query()
+                .map_or("/", |value| value.as_str()),
+            target
+        );
+    }
+
+    #[test]
+    fn fuzz_seed_worker_roundtrip() {
+        worker_roundtrip(
+            FuzzRequest {
+                uri: "/a.php?x=1".to_owned(),
+                headers: vec![
+                    ("host".to_owned(), b"www.example.test:8443".to_vec()),
+                    ("x-charlotte-peer".to_owned(), b"203.0.113.9:1".to_vec()),
+                ],
+                ..FuzzRequest::default()
+            },
+            Some("www.example.test".to_owned()),
+            false,
+        );
+        worker_roundtrip(
+            FuzzRequest {
+                uri: "https://other.test/".to_owned(),
+                version: "HTTP/2.0".to_owned(),
+                ..FuzzRequest::default()
+            },
+            Some("example.test".to_owned()),
+            false,
+        );
+        worker_roundtrip(
+            FuzzRequest {
+                method: "OPTIONS".to_owned(),
+                uri: "*".to_owned(),
+                ..FuzzRequest::default()
+            },
+            None,
+            true,
+        );
+        worker_roundtrip(
+            FuzzRequest {
+                uri: "/ignored".to_owned(),
+                headers: vec![("host".to_owned(), b"x/admin.php?".to_vec())],
+                ..FuzzRequest::default()
+            },
+            None,
+            true,
+        );
+    }
+
+    #[test]
+    fn host_header_cannot_replace_the_worker_request_path() {
+        let (peer, local) = fuzz_support::addresses();
+        for host in ["x/admin.php?", "x/admin.php#", "x?y", "a b", ""] {
+            let request = Request::builder()
+                .uri("/inspected")
+                .header(HOST, host)
+                .body(())
+                .unwrap();
+            let rejection = worker_request(request, None, peer, local).unwrap_err();
+            assert_eq!(rejection.0, StatusCode::BAD_REQUEST, "Host: {host:?}");
+        }
+        let request = Request::builder()
+            .uri("/inspected")
+            .header(HOST, "example.test:8443")
+            .body(())
+            .unwrap();
+        let forwarded = worker_request(request, None, peer, local).unwrap();
+        assert_eq!(forwarded.uri(), "http://example.test:8443/inspected");
+    }
+
+    /// A spawned FastCGI app as `(extension, command, environment)`.
+    type FuzzApp = (String, Vec<String>, Vec<(String, String)>);
+
+    /// The master hands each worker its configuration as command-line
+    /// arguments. Whatever vhost validation accepts must reach the worker
+    /// unchanged.
+    #[test_fuzz::test_fuzz]
+    fn worker_args(
+        index: String,
+        listing: bool,
+        try_files: Vec<String>,
+        fastcgi: Vec<String>,
+        apps: Vec<FuzzApp>,
+        timeout: u64,
+        root: String,
+    ) {
+        if validate_index(&index).is_err()
+            || validate_try_files(&try_files).is_err()
+            || timeout == 0
+        {
+            return;
+        }
+        let mut backends = Vec::new();
+        for value in &fastcgi {
+            let Ok(backend) = parse_fastcgi_backend(value) else {
+                return;
+            };
+            backends.push(backend);
+        }
+        for (extension, command, env) in apps {
+            let (Ok(extension), Some(program)) = (normalize_extension(&extension), command.first())
+            else {
+                return;
+            };
+            if command.iter().any(|part| part.contains('\0'))
+                || env
+                    .iter()
+                    .any(|(key, value)| validate_env_key(key).is_err() || value.contains('\0'))
+            {
+                return;
+            }
+            let Ok(mut backend) = parse_fastcgi_app(&format!("{extension}={program}")) else {
+                return;
+            };
+            if let FastCgiAddress::Spawn(app) = &mut backend.address {
+                app.args = command.into_iter().skip(1).collect();
+                app.env = env.into_iter().collect();
+            }
+            backends.push(backend);
+        }
+        let mut extensions = HashSet::new();
+        if !backends
+            .iter()
+            .all(|backend| extensions.insert(backend.extension.clone()))
+        {
+            return;
+        }
+
+        let args = build_worker_args(
+            1000,
+            1001,
+            Path::new(&root),
+            &index,
+            listing,
+            &try_files,
+            &backends,
+            Duration::from_secs(timeout),
+        )
+        .into_iter()
+        .map(|arg| arg.into_string().expect("worker arguments are UTF-8"))
+        .collect::<Vec<_>>();
+        let config = match Config::parse(args) {
+            Ok(ParseResult::Config(config)) => config,
+            Ok(ParseResult::Help) => panic!("worker arguments were parsed as a help request"),
+            Err(error) => panic!("worker rejected the master's arguments: {error}"),
+        };
+        assert!(config.worker);
+        assert_eq!(
+            (config.worker_uid, config.worker_gid),
+            (Some(1000), Some(1001))
+        );
+        assert_eq!(config.root, Path::new(&root));
+        assert_eq!(config.index, index);
+        assert_eq!(config.listing, listing);
+        assert_eq!(config.try_files, try_files);
+        assert_eq!(config.fastcgi_timeout, Duration::from_secs(timeout));
+        assert_eq!(format!("{:?}", config.fastcgi), format!("{backends:?}"));
+    }
+
+    #[test]
+    fn fuzz_seed_worker_args() {
+        worker_args(
+            "index.php".to_owned(),
+            false,
+            vec!["$uri".to_owned(), "/index.php?$args".to_owned()],
+            vec![
+                "php=127.0.0.1:9000".to_owned(),
+                "py=unix:/run/py.sock".to_owned(),
+            ],
+            vec![(
+                "cgi".to_owned(),
+                vec![
+                    "/usr/bin/app".to_owned(),
+                    "--mode=fast".to_owned(),
+                    "--help".to_owned(),
+                ],
+                vec![("APP_MODE".to_owned(), "a=b".to_owned())],
+            )],
+            30,
+            "/srv/site".to_owned(),
+        );
+        worker_args(
+            "--no-listing".to_owned(),
+            true,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            1,
+            "--help".to_owned(),
+        );
     }
 }

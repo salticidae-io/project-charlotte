@@ -106,13 +106,15 @@ async fn dispatch(
     handler::handle_request(request, config, peer, local).await
 }
 
-#[derive(Clone, Copy)]
-enum PrepareError {
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum PrepareError {
     Metadata,
     Uri,
 }
 
-fn prepare_request<B>(request: &mut Request<B>) -> Result<(SocketAddr, SocketAddr), PrepareError> {
+pub(crate) fn prepare_request<B>(
+    request: &mut Request<B>,
+) -> Result<(SocketAddr, SocketAddr), PrepareError> {
     let Some(peer) = take_socket_addr(request, "x-charlotte-peer") else {
         return Err(PrepareError::Metadata);
     };

@@ -714,15 +714,45 @@ mod tests {
         assert_eq!(params["REQUEST_URI"], "/front.php?original=1");
     }
 
+    /// Headers that describe the backend connection, or that the server sets
+    /// itself, must never be copied from a CGI response.
+    fn assert_backend_headers_filtered(headers: &http::HeaderMap) {
+        for name in [
+            "connection",
+            "keep-alive",
+            "proxy-authenticate",
+            "proxy-authorization",
+            "te",
+            "trailer",
+            "transfer-encoding",
+            "upgrade",
+            "status",
+        ] {
+            assert!(
+                !headers.contains_key(name),
+                "CGI response header was forwarded: {name}"
+            );
+        }
+    }
+
     #[test_fuzz::test_fuzz]
     fn cgi_headers(stdout: Vec<u8>) {
-        let _ = parse_cgi_headers(&stdout);
+        if let Ok(parsed) = parse_cgi_headers(&stdout) {
+            assert!((100..=599).contains(&parsed.status.as_u16()));
+            assert_backend_headers_filtered(&parsed.headers);
+            assert!(!parsed.headers.contains_key("server"));
+            assert!(!parsed.headers.contains_key("date"));
+        }
     }
 
     #[test]
     fn fuzz_seed_cgi_headers() {
         cgi_headers(b"Status: 201 Created\r\nContent-Type: text/plain\r\n\r\n".to_vec());
         cgi_headers(b"malformed header\r\n".to_vec());
+        cgi_headers(
+            b"Connection: close, X-Private\r\nX-Private: 1\r\nServer: backend\r\nLocation: /next\r\n"
+                .to_vec(),
+        );
     }
 
     #[test_fuzz::test_fuzz]
@@ -734,7 +764,9 @@ mod tests {
         let Ok(root) = std::fs::canonicalize(&fixture.root) else {
             return;
         };
-        let config = fuzz_support::fuzz_config(root.clone());
+        let mut config = fuzz_support::fuzz_config(root.clone());
+        // Makes `scripts/index.php` reachable as a directory index.
+        config.index = "index.php".to_owned();
         let uri = request.uri().clone();
         let Some(relative) = decode_request_path(uri.path()) else {
             return;
@@ -799,6 +831,9 @@ mod tests {
                 .unwrap_or_default();
             let result = execute(client, params, body, Duration::from_secs(1)).await;
             if let Ok(response) = result {
+                assert_backend_headers_filtered(response.headers());
+                assert_eq!(response.headers().get_all("server").iter().count(), 1);
+                assert_eq!(response.headers().get_all("date").iter().count(), 1);
                 let _ = response.into_body().collect().await;
             }
             let _ = responder.await;
@@ -820,6 +855,81 @@ mod tests {
             Vec::new(),
         );
         fastcgi_request(FuzzRequest::default(), Vec::new(), Vec::new());
+        fastcgi_request(
+            FuzzRequest {
+                method: "POST".to_owned(),
+                uri: "/scripts/".to_owned(),
+                body: b"a=1".to_vec(),
+                ..FuzzRequest::default()
+            },
+            vec![
+                b"Status: 404 Not Found\r\nConnection: close\r\n".to_vec(),
+                b"\r\nmissing".to_vec(),
+            ],
+            b"warning".to_vec(),
+        );
+    }
+
+    /// Feeds the FastCGI client an arbitrary byte stream in place of a
+    /// backend, covering record framing that `fastcgi_request` always gets
+    /// right: bad versions, lengths, padding, record types, and truncation.
+    #[test_fuzz::test_fuzz]
+    fn fastcgi_backend_stream(request_body: Vec<u8>, backend: Vec<u8>) {
+        fuzz_support::run(async move {
+            let (client, server) = tokio::io::duplex(64 * 1024);
+            let (mut reader, mut writer) = tokio::io::split(server);
+            let drain = tokio::spawn(async move {
+                let _ = tokio::io::copy(&mut reader, &mut tokio::io::sink()).await;
+            });
+            let respond = tokio::spawn(async move {
+                let _ = writer.write_all(&backend).await;
+                let _ = writer.shutdown().await;
+            });
+            let params = fastcgi_client::Params::default()
+                .custom("REQUEST_METHOD", "POST")
+                .custom("SCRIPT_FILENAME", "/app.php");
+            let exchange = async {
+                let result = execute(
+                    client,
+                    params,
+                    bytes::Bytes::from(request_body),
+                    Duration::from_secs(1),
+                )
+                .await;
+                if let Ok(response) = result {
+                    assert_backend_headers_filtered(response.headers());
+                    let _ = response.into_body().collect().await;
+                }
+            };
+            // The backend closes its end after replying, so the client must
+            // finish on its own rather than wait for the request timeout.
+            assert!(
+                tokio::time::timeout(Duration::from_secs(10), exchange)
+                    .await
+                    .is_ok(),
+                "FastCGI client hung on a backend that closed the connection"
+            );
+            let _ = respond.await;
+            let _ = drain.await;
+        });
+    }
+
+    #[test]
+    fn fuzz_seed_fastcgi_backend_stream() {
+        let well_formed = fuzz_support::run(async {
+            let mut stream = Vec::new();
+            write_record(&mut stream, 7, b"notice").await;
+            write_records(&mut stream, 6, b"Content-Type: text/plain\r\n\r\nbody").await;
+            write_record(&mut stream, 6, &[]).await;
+            write_record(&mut stream, 3, &[0; 8]).await;
+            stream
+        });
+        let mut truncated = well_formed.clone();
+        truncated.truncate(well_formed.len() - 11);
+        fastcgi_backend_stream(b"a=1".to_vec(), well_formed);
+        fastcgi_backend_stream(Vec::new(), truncated);
+        fastcgi_backend_stream(Vec::new(), vec![1, 6, 0, 1, 0xff, 0xff, 0xff, 0]);
+        fastcgi_backend_stream(Vec::new(), Vec::new());
     }
 
     async fn write_records<W>(writer: &mut W, record_type: u8, content: &[u8])
