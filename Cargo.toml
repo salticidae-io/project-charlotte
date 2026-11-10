@@ -2,6 +2,7 @@
 name = "project-charlotte"
 version = "0.1.0"
 edition = "2024"
+description = "Asynchronous web server for static sites and virtual-hosted applications"
 
 [dependencies]
 bytes = "1"
@@ -33,3 +34,13 @@ x509-parser = "0.16"
 [dev-dependencies]
 rcgen = "0.13"
 test-fuzz = "8.1.1"
+
+[package.metadata.deb]
+maintainer = "Fzy Logic <fzylogic@users.noreply.github.com>"
+copyright = "Copyright 2026, project-charlotte contributors"
+section = "web"
+depends = "$auto"
+assets = [
+    ["target/release/project-charlotte", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/project-charlotte/README.md", "644"],
+]

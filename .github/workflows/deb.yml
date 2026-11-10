@@ -1,0 +1,87 @@
+name: Debian packages
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    name: Build .deb (${{ matrix.codename }})
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:${{ matrix.codename }}
+    strategy:
+      fail-fast: false
+      matrix:
+        codename:
+          - noble
+          - resolute
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential \
+            pkg-config \
+            git \
+            curl \
+            ca-certificates \
+            dpkg-dev \
+            libmodsecurity-dev
+
+      - name: Check out project-charlotte
+        uses: actions/checkout@v4
+        with:
+          path: project-charlotte
+
+      - name: Check out modsecurity-rs
+        uses: actions/checkout@v4
+        with:
+          repository: fzylogic/modsecurity-rs
+          token: ${{ secrets.MODSECURITY_RS_TOKEN || github.token }}
+          path: modsecurity-rs
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb --locked
+
+      - name: Build Debian package
+        working-directory: project-charlotte
+        run: cargo deb --deb-revision "1~${{ matrix.codename }}" -- --locked
+
+      - name: Upload Debian package
+        uses: actions/upload-artifact@v4
+        with:
+          name: project-charlotte-${{ matrix.codename }}-deb
+          path: project-charlotte/target/debian/*.deb
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download Debian packages
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Attach packages to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.deb
