@@ -8,9 +8,10 @@ use std::{
         Arc, RwLock,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
+use chrono::Utc;
 use instant_acme::{
     Account, AccountCredentials, AuthorizationStatus, ChallengeType, Identifier, NewAccount,
     NewOrder, OrderStatus, RetryPolicy,
@@ -66,10 +67,7 @@ impl AcmeCertificateStore {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         match entries.get(host) {
             Some(entry) => {
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs() as i64;
+                let now = Utc::now().timestamp();
                 entry.not_after <= now.saturating_add(RENEW_BEFORE.as_secs() as i64)
             }
             None => true,

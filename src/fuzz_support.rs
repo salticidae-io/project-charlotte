@@ -1,12 +1,7 @@
-use std::{
-    future::Future,
-    net::SocketAddr,
-    path::PathBuf,
-    sync::OnceLock,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{future::Future, net::SocketAddr, path::PathBuf, sync::OnceLock};
 
 use bytes::Bytes;
+use chrono::Utc;
 use http::{HeaderName, HeaderValue, Method, Request, Uri, Version};
 use http_body_util::Full;
 use serde::{Deserialize, Serialize};
@@ -68,10 +63,7 @@ static FIXTURE: OnceLock<FuzzFixture> = OnceLock::new();
 
 pub(crate) fn fixture() -> &'static FuzzFixture {
     FIXTURE.get_or_init(|| {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
+        let unique = Utc::now().timestamp_nanos_opt().unwrap_or_default();
         let base = std::env::temp_dir().join(format!(
             "project-charlotte-fuzz-{}-{unique}",
             std::process::id()

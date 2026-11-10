@@ -4,10 +4,10 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
 use futures_util::stream;
 use http::{
     Method, Request, Response, StatusCode,
@@ -297,11 +297,11 @@ where
     B: Body<Data = Bytes>,
 {
     let length = metadata.len();
-    let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
-    let modified_secs = modified
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let modified = metadata
+        .modified()
+        .map(DateTime::<Utc>::from)
+        .unwrap_or(DateTime::<Utc>::UNIX_EPOCH);
+    let modified_secs = modified.timestamp().max(0);
     let etag = format!("\"{:x}-{:x}\"", length, modified_secs);
     let last_modified = format_http_date(modified);
 
@@ -384,7 +384,7 @@ where
     response
 }
 
-fn not_modified<B>(request: &Request<B>, etag: &str, modified: SystemTime) -> bool
+fn not_modified<B>(request: &Request<B>, etag: &str, modified: DateTime<Utc>) -> bool
 where
     B: Body<Data = Bytes>,
 {
@@ -404,32 +404,14 @@ where
         .get(header::IF_MODIFIED_SINCE)
         .and_then(|value| value.to_str().ok())
         .and_then(parse_http_date)
-        .is_some_and(|date| {
-            modified
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs()
-                <= date
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs()
-        })
+        .is_some_and(|date| modified.timestamp() <= date.timestamp())
 }
 
-fn if_range_matches(value: &str, etag: &str, modified: SystemTime) -> bool {
+fn if_range_matches(value: &str, etag: &str, modified: DateTime<Utc>) -> bool {
     if value.starts_with('"') {
         value == etag
     } else {
-        parse_http_date(value).is_some_and(|date| {
-            modified
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs()
-                <= date
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs()
-        })
+        parse_http_date(value).is_some_and(|date| modified.timestamp() <= date.timestamp())
     }
 }
 
@@ -648,10 +630,9 @@ pub(crate) fn response(status: StatusCode, body: ResponseBody) -> Response<Respo
         header::SERVER,
         HeaderValue::from_static("project-charlotte"),
     );
-    response.headers_mut().insert(
-        header::DATE,
-        header_value(&format_http_date(SystemTime::now())),
-    );
+    response
+        .headers_mut()
+        .insert(header::DATE, header_value(&format_http_date(Utc::now())));
     response
 }
 
@@ -705,13 +686,13 @@ fn full_body(bytes: Bytes) -> ResponseBody {
 #[cfg(test)]
 mod tests {
     use super::{OriginalUri, apply_try_files, decode_request_path, escape_html, parse_byte_range};
+    use chrono::{DateTime, Utc};
     use std::{
         path::{Component, Path, PathBuf},
         sync::{
             Arc,
             atomic::{AtomicU64, Ordering},
         },
-        time::{Duration, UNIX_EPOCH},
     };
 
     use bytes::Bytes;
@@ -925,7 +906,8 @@ mod tests {
 
     #[test_fuzz::test_fuzz]
     fn if_range(value: &str, etag: &str) {
-        let _ = super::if_range_matches(value, etag, UNIX_EPOCH + Duration::from_secs(784_111_777));
+        let modified = DateTime::<Utc>::from_timestamp(784_111_777, 0).unwrap();
+        let _ = super::if_range_matches(value, etag, modified);
     }
 
     #[test]
