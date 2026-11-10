@@ -3,7 +3,7 @@
 mod common;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io,
     net::SocketAddr,
     os::fd::AsFd,
@@ -31,6 +31,16 @@ struct Fixture {
 
 impl Fixture {
     async fn start(root: PathBuf, vhost_config: Option<String>, exit_after: Option<usize>) -> Self {
+        Self::start_with(root, vhost_config, exit_after, &[], &[]).await
+    }
+
+    async fn start_with(
+        root: PathBuf,
+        vhost_config: Option<String>,
+        exit_after: Option<usize>,
+        extra_env: &[&str],
+        extra_args: &[&str],
+    ) -> Self {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("echo.php"), "not served statically").unwrap();
         let reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -69,7 +79,11 @@ impl Fixture {
                     .arg("--fastcgi-app-env")
                     .arg(format!("php=CHARLOTTE_FCGI_EXIT_AFTER={count}"));
             }
+            for entry in extra_env {
+                command.arg("--fastcgi-app-env").arg(format!("php={entry}"));
+            }
         }
+        command.args(extra_args);
         let mut server = command.spawn().unwrap();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
         loop {
@@ -271,6 +285,83 @@ async fn restarts_application_after_it_exits() {
 }
 
 #[tokio::test]
+async fn spreads_concurrent_requests_across_cli_workers() {
+    let fixture = Fixture::start_with(
+        new_root(),
+        None,
+        None,
+        &["CHARLOTTE_FCGI_DELAY_MS=300"],
+        &["--fastcgi-app-workers", "php=3"],
+    )
+    .await;
+    let (first, second, third) = tokio::join!(
+        request(
+            fixture.address,
+            "localhost",
+            "GET",
+            "/echo.php?worker=1",
+            &[],
+            b""
+        ),
+        request(
+            fixture.address,
+            "localhost",
+            "GET",
+            "/echo.php?worker=2",
+            &[],
+            b""
+        ),
+        request(
+            fixture.address,
+            "localhost",
+            "GET",
+            "/echo.php?worker=3",
+            &[],
+            b""
+        ),
+    );
+    let mut pids = HashSet::new();
+    for response in [first, second, third] {
+        assert_eq!(response.status, 200);
+        let body = String::from_utf8(response.body).unwrap();
+        pids.insert(field(&body, "pid").to_owned());
+    }
+    assert_eq!(
+        pids.len(),
+        3,
+        "requests should reach all configured workers"
+    );
+}
+
+#[tokio::test]
+async fn restarts_each_cli_worker_independently() {
+    let fixture = Fixture::start_with(
+        new_root(),
+        None,
+        Some(1),
+        &[],
+        &["--fastcgi-app-workers", "php=2"],
+    )
+    .await;
+    let mut pids = HashSet::new();
+    for index in 1..=4 {
+        let response = request(
+            fixture.address,
+            "localhost",
+            "GET",
+            &format!("/echo.php?request={index}"),
+            &[],
+            b"",
+        )
+        .await;
+        assert_eq!(response.status, 200);
+        let body = String::from_utf8(response.body).unwrap();
+        pids.insert(field(&body, "pid").to_owned());
+    }
+    assert_eq!(pids.len(), 4, "each completed worker should be replaced");
+}
+
+#[tokio::test]
 async fn rejects_missing_application_at_startup() {
     let root = new_root();
     std::fs::create_dir_all(&root).unwrap();
@@ -312,25 +403,50 @@ async fn starts_vhost_application_inside_privileged_worker_identity() {
     let command = std::env::current_exe().unwrap();
     let user = User::from_uid(geteuid()).unwrap().unwrap().name;
     let config = format!(
-        "[[vhost]]\nserver_names = [\"app.test\"]\nroot = {:?}\nuser = {:?}\n\n[[vhost.fastcgi_app]]\nextension = \"php\"\ncommand = [{:?}, \"--exact\", \"fcgi_app_helper\", \"--nocapture\"]\nenv = {{ CHARLOTTE_FCGI_HELPER = \"1\", APP_MODE = \"vhost\" }}\n",
+        "[[vhost]]\nserver_names = [\"app.test\"]\nroot = {:?}\nuser = {:?}\n\n[[vhost.fastcgi_app]]\nextension = \"php\"\ncommand = [{:?}, \"--exact\", \"fcgi_app_helper\", \"--nocapture\"]\nenv = {{ CHARLOTTE_FCGI_HELPER = \"1\", APP_MODE = \"vhost\", CHARLOTTE_FCGI_DELAY_MS = \"200\" }}\nworkers = 3\n",
         site.to_string_lossy(),
         user,
         command.to_string_lossy()
     );
     let fixture = Fixture::start(root, Some(config), None).await;
-    let response = request(
-        fixture.address,
-        "app.test",
-        "POST",
-        "/echo.php",
-        &[("Content-Type", "application/octet-stream")],
-        b"worker payload",
-    )
-    .await;
-    let body = String::from_utf8(response.body).unwrap();
-    assert_eq!(response.status, 200);
-    assert!(body.contains("app_mode=vhost"));
-    assert!(body.contains("stdin=worker payload"));
+    let (first, second, third) = tokio::join!(
+        request(
+            fixture.address,
+            "app.test",
+            "GET",
+            "/echo.php?worker=1",
+            &[],
+            b""
+        ),
+        request(
+            fixture.address,
+            "app.test",
+            "GET",
+            "/echo.php?worker=2",
+            &[],
+            b""
+        ),
+        request(
+            fixture.address,
+            "app.test",
+            "GET",
+            "/echo.php?worker=3",
+            &[],
+            b""
+        ),
+    );
+    let mut pids = HashSet::new();
+    for response in [first, second, third] {
+        assert_eq!(response.status, 200);
+        let body = String::from_utf8(response.body).unwrap();
+        assert!(body.contains("app_mode=vhost"));
+        pids.insert(field(&body, "pid").to_owned());
+    }
+    assert_eq!(
+        pids.len(),
+        3,
+        "requests should reach all configured workers"
+    );
 }
 
 #[test]
@@ -370,6 +486,12 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let (params, stdin) = read_fastcgi_request(stream).await?;
+    if let Some(milliseconds) = std::env::var("CHARLOTTE_FCGI_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        sleep(Duration::from_millis(milliseconds)).await;
+    }
     let body = format!(
         "method={}\nquery={}\nlength={}\ncontent_type={}\napp_mode={}\ninherited={}\nlisten_fd={}\nstdin={}\npid={}",
         cgi_parameter(&params, "REQUEST_METHOD"),

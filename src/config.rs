@@ -18,6 +18,7 @@ pub struct FastCgiApp {
     pub program: PathBuf,
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
+    pub workers: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -79,6 +80,7 @@ impl Config {
         let mut try_files = Vec::new();
         let mut fastcgi = Vec::new();
         let mut fastcgi_app_args = Vec::new();
+        let mut fastcgi_app_workers = Vec::new();
         let mut fastcgi_app_env = Vec::new();
         let mut fastcgi_timeout = Duration::from_secs(60);
         let mut threads = None;
@@ -158,6 +160,23 @@ impl Config {
                         return Err("FastCGI app argument cannot contain NUL".to_owned());
                     }
                     fastcgi_app_args.push((normalize_extension(extension)?, arg.to_owned()));
+                }
+                "--fastcgi-app-workers" => {
+                    let value = next_value(&mut args, "--fastcgi-app-workers")?;
+                    let (extension, workers) = value.split_once('=').ok_or_else(|| {
+                        format!("invalid FastCGI app worker count: {value}; expected EXT=N")
+                    })?;
+                    let extension = normalize_extension(extension)?;
+                    let workers = parse_fastcgi_app_workers(workers)?;
+                    if fastcgi_app_workers
+                        .iter()
+                        .any(|(existing, _): &(String, usize)| existing == &extension)
+                    {
+                        return Err(format!(
+                            "duplicate FastCGI app worker count for extension: {extension}"
+                        ));
+                    }
+                    fastcgi_app_workers.push((extension, workers));
                 }
                 "--fastcgi-app-env" => {
                     let value = next_value(&mut args, "--fastcgi-app-env")?;
@@ -312,6 +331,20 @@ impl Config {
             };
             app.args.push(arg);
         }
+        for (extension, workers) in fastcgi_app_workers {
+            let Some(FastCgiBackend {
+                address: FastCgiAddress::Spawn(app),
+                ..
+            }) = fastcgi
+                .iter_mut()
+                .find(|backend| backend.extension == extension)
+            else {
+                return Err(format!(
+                    "FastCGI app worker count references undeclared app extension: {extension}"
+                ));
+            };
+            app.workers = workers;
+        }
         for (extension, key, value) in fastcgi_app_env {
             add_fastcgi_app_env(&mut fastcgi, &extension, key, value)?;
         }
@@ -397,7 +430,7 @@ impl Config {
     }
 
     pub fn usage() -> &'static str {
-        "Usage: project-charlotte [--user USER [--group GROUP]] [--bind ADDRESS] [--tls-bind ADDRESS] [--root DIRECTORY] [--index NAME] [--no-listing] [--try-files ENTRY]... [--fastcgi EXT=ADDR]... [--fastcgi-app EXT=PROGRAM]... [--fastcgi-app-arg EXT=ARG]... [--fastcgi-app-env EXT=KEY=VALUE]... [--fastcgi-timeout SECS] [--threads N] [--worker-threads N] [--modsecurity-rules FILE]... [--modsecurity-body-limit BYTES] [--config FILE] [--vhost-dir DIRECTORY] [--tls-cert PATH --tls-key PATH] [--acme-directory URL|letsencrypt|letsencrypt-staging --acme-cache DIR] [--acme-contact URI]... [--acme-ca-root PEM] [--http3-bind ADDRESS] [--help]"
+        "Usage: project-charlotte [--user USER [--group GROUP]] [--bind ADDRESS] [--tls-bind ADDRESS] [--root DIRECTORY] [--index NAME] [--no-listing] [--try-files ENTRY]... [--fastcgi EXT=ADDR]... [--fastcgi-app EXT=PROGRAM]... [--fastcgi-app-arg EXT=ARG]... [--fastcgi-app-workers EXT=N]... [--fastcgi-app-env EXT=KEY=VALUE]... [--fastcgi-timeout SECS] [--threads N] [--worker-threads N] [--modsecurity-rules FILE]... [--modsecurity-body-limit BYTES] [--config FILE] [--vhost-dir DIRECTORY] [--tls-cert PATH --tls-key PATH] [--acme-directory URL|letsencrypt|letsencrypt-staging --acme-cache DIR] [--acme-contact URI]... [--acme-ca-root PEM] [--http3-bind ADDRESS] [--help]"
     }
 }
 
@@ -530,6 +563,7 @@ pub(crate) fn parse_fastcgi_app(value: &str) -> Result<FastCgiBackend, String> {
             program: PathBuf::from(program),
             args: Vec::new(),
             env: BTreeMap::new(),
+            workers: 1,
         }),
     })
 }
@@ -555,6 +589,19 @@ pub(crate) fn validate_env_key(key: &str) -> Result<(), String> {
 
 pub const DEFAULT_WORKER_THREADS: usize = 2;
 pub const MAX_THREADS: usize = 1024;
+pub const MAX_FASTCGI_APP_WORKERS: usize = 256;
+
+pub fn parse_fastcgi_app_workers(value: &str) -> Result<usize, String> {
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|workers| (1..=MAX_FASTCGI_APP_WORKERS).contains(workers))
+        .ok_or_else(|| {
+            format!(
+                "invalid FastCGI app worker count: {value}; expected 1-{MAX_FASTCGI_APP_WORKERS}"
+            )
+        })
+}
 
 pub fn parse_thread_count(value: &str) -> Result<usize, String> {
     value
@@ -675,12 +722,14 @@ mod tests {
     }
 
     #[test]
-    fn parses_fastcgi_app_and_preserves_args_and_environment() {
+    fn parses_fastcgi_app_and_preserves_args_workers_and_environment() {
         let parsed = Config::parse([
             "--fastcgi-app-arg".to_owned(),
             "PHP=--foreground".to_owned(),
             "--fastcgi-app-env".to_owned(),
             "php=APP_MODE=production".to_owned(),
+            "--fastcgi-app-workers".to_owned(),
+            "php=4".to_owned(),
             "--fastcgi-app".to_owned(),
             "php=/usr/bin/php8.4-cgi".to_owned(),
             "--fastcgi-app-arg".to_owned(),
@@ -697,10 +746,23 @@ mod tests {
         };
         assert_eq!(app.program, PathBuf::from("/usr/bin/php8.4-cgi"));
         assert_eq!(app.args, ["--foreground", "--bind"]);
+        assert_eq!(app.workers, 4);
         assert_eq!(
             app.env.get("APP_MODE").map(String::as_str),
             Some("production")
         );
+    }
+
+    #[test]
+    fn fastcgi_app_defaults_to_one_worker() {
+        let parsed = Config::parse(["--fastcgi-app".to_owned(), "php=php-cgi".to_owned()]).unwrap();
+        let ParseResult::Config(config) = parsed else {
+            panic!("expected config")
+        };
+        let FastCgiAddress::Spawn(app) = &config.fastcgi[0].address else {
+            panic!("expected spawned FastCGI app")
+        };
+        assert_eq!(app.workers, 1);
     }
 
     #[test]
@@ -717,6 +779,30 @@ mod tests {
         );
         assert!(Config::parse(["--fastcgi-app-arg".to_owned(), "php=--arg".to_owned()]).is_err());
         assert!(Config::parse(["--fastcgi-app-env".to_owned(), "php=KEY".to_owned()]).is_err());
+        for value in ["php=0", "php=nope", "php=257", "php"] {
+            assert!(
+                Config::parse([
+                    "--fastcgi-app-workers".to_owned(),
+                    value.to_owned(),
+                    "--fastcgi-app".to_owned(),
+                    "php=php-cgi".to_owned(),
+                ])
+                .is_err(),
+                "{value}"
+            );
+        }
+        assert!(Config::parse(["--fastcgi-app-workers".to_owned(), "php=2".to_owned(),]).is_err());
+        assert!(
+            Config::parse([
+                "--fastcgi-app".to_owned(),
+                "php=php-cgi".to_owned(),
+                "--fastcgi-app-workers".to_owned(),
+                "php=2".to_owned(),
+                "--fastcgi-app-workers".to_owned(),
+                ".PHP=3".to_owned(),
+            ])
+            .is_err()
+        );
         assert!(
             Config::parse([
                 "--fastcgi-app-env".to_owned(),

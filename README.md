@@ -75,6 +75,7 @@ see all command-line options. Common options include:
 | `--http3-bind ADDRESS` | Enable the HTTP/3 listener; TLS configuration is required. |
 | `--fastcgi EXT=ADDR` | Route a file extension to a FastCGI TCP or Unix-socket backend. |
 | `--fastcgi-app EXT=PROGRAM` | Start and supervise a FastCGI application for an extension. |
+| `--fastcgi-app-workers EXT=N` | Run 1–256 supervised processes for a spawned FastCGI app; defaults to one. |
 | `--modsecurity-rules FILE` | Load ModSecurity rules; can be repeated to load multiple files. |
 | `--acme-directory URL --acme-cache DIR` | Configure ACME certificate provisioning and its cache. |
 

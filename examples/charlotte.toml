@@ -134,12 +134,12 @@ fastcgi_timeout = 120
 # pool on the loopback interface:
 fastcgi = ["cgi=127.0.0.1:9001"]
 
-# Processes charlotte starts and keeps running for this virtual host. Each app
-# receives a private FastCGI listening socket on file descriptor 0, using the
-# FCGI_LISTENSOCK_FILENO convention; do not pass php-cgi's `-b` option. Apps run
-# as this vhost's user with the document root as their working directory. Their
-# environment is cleared except for PATH and variables configured below. If an
-# app exits (including after PHP_FCGI_MAX_REQUESTS), charlotte restarts it.
+# Processes charlotte starts and keeps running for this virtual host. Each app's
+# workers share a private FastCGI listening socket on file descriptor 0, using
+# the FCGI_LISTENSOCK_FILENO convention; do not pass php-cgi's `-b` option. Apps
+# run as this vhost's user with the document root as their working directory.
+# Their environment is cleared except for PATH and variables configured below.
+# If an app exits (including after PHP_FCGI_MAX_REQUESTS), charlotte restarts it.
 # Extensions must not collide with one declared in `fastcgi` above or another
 # `fastcgi_app` entry.
 [[vhost.fastcgi_app]]
@@ -148,6 +148,10 @@ extension = "php"
 # argv for the child process: the program first, then its arguments. Must not
 # be empty.
 command = ["/usr/bin/php8.4-cgi"]
+
+# Optional. Number of independently supervised processes sharing this app's
+# listening socket (1-256); defaults to 1.
+workers = 4
 
 # Optional environment for the child. Keys must look like shell identifiers:
 # a letter or underscore, then letters, digits or underscores.

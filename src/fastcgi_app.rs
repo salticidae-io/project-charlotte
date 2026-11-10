@@ -32,26 +32,28 @@ const QUICK_EXIT: Duration = Duration::from_secs(5);
 const RESTART_DELAY: Duration = Duration::from_secs(1);
 
 pub(crate) struct AppHandle {
-    supervisor: JoinHandle<()>,
+    supervisors: Vec<(JoinHandle<()>, Arc<AtomicU32>)>,
     socket_dir: PathBuf,
-    pid: Arc<AtomicU32>,
 }
 
 impl Drop for AppHandle {
     fn drop(&mut self) {
         // Stop the supervisor first so that it cannot restart the app in
         // response to the kill below.
-        self.supervisor.abort();
-        // Aborting drops the supervisor's `Child`, and `kill_on_drop` would then
-        // reap the app, but only once the runtime polls the task again. Signal
-        // the process directly so that the descriptors it inherited - notably
-        // stderr, which keeps a piped parent's output pipe open - are released
+        for (supervisor, _) in &self.supervisors {
+            supervisor.abort();
+        }
+        // Aborting drops each supervisor's `Child`, and `kill_on_drop` would
+        // then reap the app, but only once the runtime polls the task again.
+        // Signal the processes directly so inherited descriptors are released
         // even when the runtime never gets another chance to run.
-        let pid = self.pid.swap(0, Ordering::SeqCst);
-        if let Ok(pid) = i32::try_from(pid)
-            && pid > 0
-        {
-            let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
+        for (_, pid) in &self.supervisors {
+            let pid = pid.swap(0, Ordering::SeqCst);
+            if let Ok(pid) = i32::try_from(pid)
+                && pid > 0
+            {
+                let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
+            }
         }
         if let Err(error) = fs::remove_dir_all(&self.socket_dir)
             && error.kind() != io::ErrorKind::NotFound
@@ -76,32 +78,30 @@ pub(crate) async fn start_apps(
         let extension = backend.extension.clone();
         let app = app.clone();
         let (socket_dir, socket_path, listener) = create_listener()?;
-        let pid = Arc::new(AtomicU32::new(0));
-        let child = match spawn_app(&app, &root, &listener, &pid) {
-            Ok(child) => child,
-            Err(error) => {
-                drop(listener);
-                let _ = fs::remove_dir_all(&socket_dir);
-                return Err(error.into());
-            }
+        let mut handle = AppHandle {
+            supervisors: Vec::with_capacity(app.workers),
+            socket_dir,
         };
+        for _ in 0..app.workers {
+            let worker_listener = listener.try_clone()?;
+            let pid = Arc::new(AtomicU32::new(0));
+            let child = spawn_app(&app, &root, &worker_listener, &pid)?;
+            let supervisor = tokio::spawn(supervise(
+                worker_listener,
+                app.clone(),
+                root.clone(),
+                child,
+                Arc::clone(&pid),
+            ));
+            handle.supervisors.push((supervisor, pid));
+        }
         eprintln!(
-            "Started FastCGI app .{extension}: {}",
+            "Started {} FastCGI app worker(s) .{extension}: {}",
+            app.workers,
             app.program.display()
         );
-        let supervisor = tokio::spawn(supervise(
-            listener,
-            app,
-            root.clone(),
-            child,
-            Arc::clone(&pid),
-        ));
         backend.address = FastCgiAddress::Unix(socket_path);
-        handles.push(AppHandle {
-            supervisor,
-            socket_dir,
-            pid,
-        });
+        handles.push(handle);
     }
     Ok(handles)
 }

@@ -104,6 +104,8 @@ struct FastCgiAppFile {
     command: Vec<String>,
     #[serde(default)]
     env: BTreeMap<String, String>,
+    #[serde(default)]
+    workers: Option<usize>,
 }
 
 struct Vhost {
@@ -442,6 +444,9 @@ impl Router {
                 if app_file.command.iter().any(|part| part.contains('\0')) {
                     return Err("vhost FastCGI app command cannot contain NUL".into());
                 }
+                let workers = app_file.workers.unwrap_or(1);
+                crate::config::parse_fastcgi_app_workers(&workers.to_string())
+                    .map_err(|error| format!("vhost FastCGI app .{extension}: {error}"))?;
                 for (key, value) in &app_file.env {
                     crate::config::validate_env_key(key)?;
                     if value.contains('\0') {
@@ -453,6 +458,7 @@ impl Router {
                 if let FastCgiAddress::Spawn(app) = &mut backend.address {
                     app.args = app_file.command.into_iter().skip(1).collect();
                     app.env = app_file.env;
+                    app.workers = workers;
                 }
                 fastcgi.push(backend);
             }
@@ -998,6 +1004,19 @@ fn validate_vhost_declarations(entries: &[VhostFile]) -> Result<(), Box<dyn Erro
             crate::config::parse_thread_count(&threads.to_string())
                 .map_err(|error| format!("vhost {} worker_threads: {error}", index + 1))?;
         }
+        for app in &entry.fastcgi_app {
+            if let Some(workers) = app.workers {
+                crate::config::parse_fastcgi_app_workers(&workers.to_string()).map_err(
+                    |error| {
+                        format!(
+                            "vhost {} FastCGI app .{}: {error}",
+                            index + 1,
+                            app.extension
+                        )
+                    },
+                )?;
+            }
+        }
         if let Some(try_files) = &entry.try_files {
             crate::config::validate_try_files(try_files)
                 .map_err(|error| format!("vhost {} try_files: {error}", index + 1))?;
@@ -1181,6 +1200,10 @@ fn build_worker_args(worker: WorkerArgs<'_>) -> Vec<OsString> {
                 for arg in &app.args {
                     args.push("--fastcgi-app-arg".into());
                     args.push(format!("{}={arg}", backend.extension).into());
+                }
+                if app.workers != 1 {
+                    args.push("--fastcgi-app-workers".into());
+                    args.push(format!("{}={}", backend.extension, app.workers).into());
                 }
             }
             _ => {
@@ -1415,10 +1438,13 @@ mod tests {
                 extension = "php"
                 command = ["php8.4-cgi", "--foreground"]
                 env = { APP_MODE = "test" }
+                workers = 4
             "#,
         )
         .unwrap();
         assert_eq!(parsed.vhost[0].fastcgi_app[0].extension, "php");
+        assert_eq!(parsed.vhost[0].fastcgi_app[0].workers, Some(4));
+        assert!(validate_vhost_declarations(&parsed.vhost).is_ok());
         assert_eq!(
             parsed.vhost[0].fastcgi_app[0].command,
             ["php8.4-cgi", "--foreground"]
@@ -1430,6 +1456,10 @@ mod tests {
                 .map(String::as_str),
             Some("test")
         );
+
+        let mut invalid = parsed.vhost[0].clone();
+        invalid.fastcgi_app[0].workers = Some(0);
+        assert!(validate_vhost_declarations(&[invalid]).is_err());
     }
 
     #[test]
@@ -1493,6 +1523,7 @@ mod tests {
                     program: "/usr/bin/php8.4-cgi".into(),
                     args: vec!["--foreground".to_owned()],
                     env: BTreeMap::from([("APP_MODE".to_owned(), "worker".to_owned())]),
+                    workers: 4,
                 }),
             },
         ];
@@ -1525,6 +1556,10 @@ mod tests {
         assert!(
             args.windows(2)
                 .any(|pair| { pair == ["--fastcgi-app-arg", "cgi=--foreground"] })
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| { pair == ["--fastcgi-app-workers", "cgi=4"] })
         );
         // App environment may hold credentials, so it must stay off the
         // command line, which every local user can read.
