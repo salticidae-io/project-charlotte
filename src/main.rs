@@ -80,6 +80,7 @@ async fn accepted_stream(
     accepted: std::io::Result<(TcpStream, SocketAddr)>,
 ) -> Option<(TcpStream, SocketAddr, SocketAddr)> {
     let result = accepted.and_then(|(stream, peer)| {
+        let _ = stream.set_nodelay(true);
         let local = stream.local_addr()?;
         Ok((stream, peer, local))
     });

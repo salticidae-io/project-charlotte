@@ -1,20 +1,22 @@
 use std::{
     convert::Infallible,
-    io,
+    fs as std_fs,
+    io::{self, Read, Seek, SeekFrom as StdSeekFrom, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
+    pin::Pin,
     sync::Arc,
 };
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, Utc};
-use futures_util::stream;
+use futures_util::{FutureExt, StreamExt, stream};
 use http::{
     Method, Request, Response, StatusCode,
     header::{self, HeaderValue},
 };
 use http_body::{Body, Frame};
-use http_body_util::{BodyExt, Full, StreamBody, combinators::UnsyncBoxBody};
+use http_body_util::{BodyExt, BodyStream, Full, StreamBody, combinators::UnsyncBoxBody};
 use tokio::{
     fs::{self, File},
     io::{AsyncReadExt, AsyncSeekExt, SeekFrom},
@@ -28,6 +30,21 @@ use crate::{
 };
 
 pub(crate) type ResponseBody = UnsyncBoxBody<Bytes, io::Error>;
+
+const SMALL_FILE_LIMIT: u64 = 64 * 1024;
+const COALESCE_BODY_LIMIT: usize = 64 * 1024;
+
+enum StaticResolution {
+    NotFound,
+    Redirect,
+    Listing(PathBuf),
+    File {
+        file: std_fs::File,
+        metadata: std_fs::Metadata,
+        path: PathBuf,
+        contents: Option<Bytes>,
+    },
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct OriginalUri(pub(crate) String);
@@ -89,7 +106,8 @@ where
         .get(header::CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
         .unwrap_or("-");
-    eprintln!("{} {} {} {}", method, uri, response.status(), size);
+    let log_line = format!("{} {} {} {}\n", method, uri, response.status(), size);
+    let _ = io::stderr().lock().write_all(log_line.as_bytes());
     response
 }
 
@@ -117,21 +135,27 @@ async fn apply_try_files<B>(
         let Some(relative_path) = decode_request_path(candidate_path) else {
             continue;
         };
-        let Ok(canonical) = fs::canonicalize(config.root.join(relative_path)).await else {
-            continue;
-        };
-        if !canonical.starts_with(&config.root) {
-            continue;
-        }
-        let Ok(metadata) = fs::metadata(&canonical).await else {
-            continue;
-        };
-        let matched = if candidate_path.ends_with('/') {
-            metadata.is_dir()
-        } else {
-            metadata.is_file()
-        };
-        if !matched {
+        let root = config.root.clone();
+        let directory_candidate = candidate_path.ends_with('/');
+        let matches = tokio::task::spawn_blocking(move || {
+            let Ok(canonical) = std_fs::canonicalize(root.join(relative_path)) else {
+                return false;
+            };
+            if !canonical.starts_with(&root) {
+                return false;
+            }
+            let Ok(metadata) = std_fs::metadata(canonical) else {
+                return false;
+            };
+            if directory_candidate {
+                metadata.is_dir()
+            } else {
+                metadata.is_file()
+            }
+        })
+        .await
+        .unwrap_or(false);
+        if !matches {
             continue;
         }
 
@@ -244,18 +268,16 @@ where
         Some(path) => path,
         None => return error_response(StatusCode::NOT_FOUND, "Not found\n"),
     };
-    let candidate = config.root.join(relative_path);
-    let canonical = match fs::canonicalize(&candidate).await {
-        Ok(path) if path.starts_with(&config.root) => path,
-        _ => return error_response(StatusCode::NOT_FOUND, "Not found\n"),
-    };
-    let metadata = match fs::metadata(&canonical).await {
-        Ok(metadata) => metadata,
-        Err(_) => return error_response(StatusCode::NOT_FOUND, "Not found\n"),
-    };
-
-    if metadata.is_dir() {
-        if !raw_path.ends_with('/') {
+    let root = config.root.clone();
+    let index = config.index.clone();
+    let raw_path_is_dir = raw_path.ends_with('/');
+    let read_small = request.method() == Method::GET;
+    let resolution = tokio::task::spawn_blocking(move || {
+        resolve_static(&root, &index, &relative_path, raw_path_is_dir, read_small)
+    })
+    .await;
+    match resolution {
+        Ok(StaticResolution::Redirect) => {
             let mut location = format!("{raw_path}/");
             if let Some(query) = request.uri().query() {
                 location.push('?');
@@ -265,28 +287,79 @@ where
             if let Ok(value) = HeaderValue::from_str(&location) {
                 response.headers_mut().insert(header::LOCATION, value);
             }
-            return response;
+            response
         }
+        Ok(StaticResolution::Listing(path)) => {
+            if config.listing {
+                directory_listing(request.uri().path(), &path).await
+            } else {
+                error_response(StatusCode::NOT_FOUND, "Not found\n")
+            }
+        }
+        Ok(StaticResolution::File {
+            file,
+            metadata,
+            path,
+            contents,
+        }) => serve_file(request, &path, file, metadata, contents).await,
+        Ok(StaticResolution::NotFound) | Err(_) => {
+            error_response(StatusCode::NOT_FOUND, "Not found\n")
+        }
+    }
+}
 
-        let index = canonical.join(&config.index);
-        if let Ok(index_path) = fs::canonicalize(index).await
-            && index_path.starts_with(&config.root)
-            && fs::metadata(&index_path)
-                .await
-                .is_ok_and(|metadata| metadata.is_file())
-        {
-            return serve_file(request, &index_path, &config.root).await;
-        }
-        if config.listing {
-            return directory_listing(request.uri().path(), &canonical).await;
-        }
-        return error_response(StatusCode::NOT_FOUND, "Not found\n");
+fn resolve_static(
+    root: &Path,
+    index: &str,
+    relative_path: &Path,
+    raw_path_is_dir: bool,
+    read_small: bool,
+) -> StaticResolution {
+    let Ok(canonical) = std_fs::canonicalize(root.join(relative_path)) else {
+        return StaticResolution::NotFound;
+    };
+    if !canonical.starts_with(root) {
+        return StaticResolution::NotFound;
     }
 
+    let Ok(metadata) = std_fs::metadata(&canonical) else {
+        return StaticResolution::NotFound;
+    };
+    if metadata.is_dir() {
+        if !raw_path_is_dir {
+            return StaticResolution::Redirect;
+        }
+        let Ok(index_path) = std_fs::canonicalize(canonical.join(index)) else {
+            return StaticResolution::Listing(canonical);
+        };
+        if !index_path.starts_with(root) {
+            return StaticResolution::Listing(canonical);
+        }
+        if !std_fs::metadata(&index_path).is_ok_and(|metadata| metadata.is_file()) {
+            return StaticResolution::Listing(canonical);
+        }
+        return match open_static_file(&index_path, root, read_small) {
+            Some((file, metadata, contents)) => StaticResolution::File {
+                file,
+                metadata,
+                path: index_path,
+                contents,
+            },
+            None => StaticResolution::NotFound,
+        };
+    }
     if !metadata.is_file() {
-        return error_response(StatusCode::NOT_FOUND, "Not found\n");
+        return StaticResolution::NotFound;
     }
-    serve_file(request, &canonical, &config.root).await
+    match open_static_file(&canonical, root, read_small) {
+        Some((file, metadata, contents)) => StaticResolution::File {
+            file,
+            metadata,
+            path: canonical,
+            contents,
+        },
+        None => StaticResolution::NotFound,
+    }
 }
 
 /// Reports whether an open file really lives under the document root.
@@ -296,36 +369,54 @@ where
 /// component with a symbolic link in between. Asking the kernel where the
 /// open descriptor points closes that window.
 #[cfg(target_os = "linux")]
-async fn opened_within_root(file: &File, root: &Path) -> bool {
+fn opened_within_root(file: &std_fs::File, root: &Path) -> bool {
     use std::os::fd::AsRawFd;
 
-    fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
-        .await
+    std_fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
         .is_ok_and(|path| path.starts_with(root))
 }
 
 #[cfg(not(target_os = "linux"))]
-async fn opened_within_root(_file: &File, _root: &Path) -> bool {
+fn opened_within_root(_file: &std_fs::File, _root: &Path) -> bool {
     true
 }
 
-async fn serve_file<B>(request: &Request<B>, path: &Path, root: &Path) -> Response<ResponseBody>
+fn open_static_file(
+    path: &Path,
+    root: &Path,
+    read_small: bool,
+) -> Option<(std_fs::File, std_fs::Metadata, Option<Bytes>)> {
+    let mut file = std_fs::File::open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || !opened_within_root(&file, root) {
+        return None;
+    }
+
+    let contents = if read_small && metadata.len() <= SMALL_FILE_LIMIT {
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        match file.read_to_end(&mut bytes) {
+            Ok(_) if bytes.len() as u64 == metadata.len() => Some(Bytes::from(bytes)),
+            _ => {
+                file.seek(StdSeekFrom::Start(0)).ok()?;
+                None
+            }
+        }
+    } else {
+        None
+    };
+    Some((file, metadata, contents))
+}
+
+async fn serve_file<B>(
+    request: &Request<B>,
+    path: &Path,
+    file: std_fs::File,
+    metadata: std_fs::Metadata,
+    contents: Option<Bytes>,
+) -> Response<ResponseBody>
 where
     B: Body<Data = Bytes>,
 {
-    // Everything below describes and reads this one open file, never the
-    // path again.
-    let not_found = || error_response(StatusCode::NOT_FOUND, "Not found\n");
-    let Ok(mut file) = File::open(path).await else {
-        return not_found();
-    };
-    let metadata = match file.metadata().await {
-        Ok(metadata) if metadata.is_file() => metadata,
-        _ => return not_found(),
-    };
-    if !opened_within_root(&file, root).await {
-        return not_found();
-    }
     let length = metadata.len();
     let modified = metadata
         .modified()
@@ -378,8 +469,11 @@ where
     let body_length = if length == 0 { 0 } else { end - start + 1 };
     let body = if request.method() == Method::HEAD || body_length == 0 {
         empty_body()
+    } else if let Some(contents) = contents {
+        full_body(contents.slice(start as usize..(end + 1) as usize))
     } else {
-        if file.seek(SeekFrom::Start(start)).await.is_err() {
+        let mut file = File::from_std(file);
+        if start > 0 && file.seek(SeekFrom::Start(start)).await.is_err() {
             return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Unable to read file\n");
         }
         file_body(file, body_length)
@@ -632,7 +726,7 @@ fn file_body(file: File, length: u64) -> ResponseBody {
         if remaining == 0 {
             return None;
         }
-        let mut buffer = vec![0; remaining.min(16 * 1024) as usize];
+        let mut buffer = vec![0; remaining.min(64 * 1024) as usize];
         match file.read(&mut buffer).await {
             Ok(0) => Some((
                 Err(io::Error::new(
@@ -663,8 +757,28 @@ pub(crate) fn response(status: StatusCode, body: ResponseBody) -> Response<Respo
     );
     response
         .headers_mut()
-        .insert(header::DATE, header_value(&format_http_date(Utc::now())));
+        .insert(header::DATE, cached_date_header());
     response
+}
+
+fn cached_date_header() -> HeaderValue {
+    thread_local! {
+        static DATE_HEADER: std::cell::RefCell<Option<(i64, HeaderValue)>> = const { std::cell::RefCell::new(None) };
+    }
+
+    let now = Utc::now();
+    let timestamp = now.timestamp();
+    DATE_HEADER.with(|cached| {
+        let mut cached = cached.borrow_mut();
+        if let Some((cached_timestamp, value)) = cached.as_ref()
+            && *cached_timestamp == timestamp
+        {
+            return value.clone();
+        }
+        let value = header_value(&format_http_date(now));
+        *cached = Some((timestamp, value.clone()));
+        value
+    })
 }
 
 pub(crate) fn error_response(status: StatusCode, message: &'static str) -> Response<ResponseBody> {
@@ -708,6 +822,59 @@ pub(crate) fn empty_body() -> ResponseBody {
     full_body(Bytes::new())
 }
 
+pub(crate) fn coalesce_ready_body(mut body: ResponseBody) -> ResponseBody {
+    let mut buffered = BytesMut::new();
+    let mut pending = None;
+    let mut complete = false;
+
+    loop {
+        match std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).now_or_never() {
+            None => break,
+            Some(None) => {
+                complete = true;
+                break;
+            }
+            Some(Some(Ok(frame))) => match frame.into_data() {
+                Ok(bytes) if bytes.is_empty() => {
+                    pending = Some(Ok(Frame::data(bytes)));
+                    break;
+                }
+                Ok(bytes) if buffered.len() + bytes.len() <= COALESCE_BODY_LIMIT => {
+                    buffered.extend_from_slice(&bytes);
+                    if buffered.len() == COALESCE_BODY_LIMIT {
+                        break;
+                    }
+                }
+                Ok(bytes) => {
+                    pending = Some(Ok(Frame::data(bytes)));
+                    break;
+                }
+                Err(frame) => {
+                    pending = Some(Ok(frame));
+                    break;
+                }
+            },
+            Some(Some(Err(error))) => {
+                pending = Some(Err(error));
+                break;
+            }
+        }
+    }
+
+    if complete && pending.is_none() {
+        return full_body(buffered.freeze());
+    }
+
+    let mut frames = Vec::with_capacity(2);
+    if !buffered.is_empty() {
+        frames.push(Ok(Frame::data(buffered.freeze())));
+    }
+    if let Some(frame) = pending {
+        frames.push(frame);
+    }
+    StreamBody::new(stream::iter(frames).chain(BodyStream::new(body))).boxed_unsync()
+}
+
 fn full_body(bytes: Bytes) -> ResponseBody {
     Full::new(bytes)
         .map_err(|never: Infallible| match never {})
@@ -716,22 +883,90 @@ fn full_body(bytes: Bytes) -> ResponseBody {
 
 #[cfg(test)]
 mod tests {
-    use super::{OriginalUri, apply_try_files, decode_request_path, escape_html, parse_byte_range};
+    use super::{
+        OriginalUri, ResponseBody, apply_try_files, coalesce_ready_body, decode_request_path,
+        escape_html, parse_byte_range,
+    };
     use chrono::{DateTime, Utc};
     use std::{
+        io,
         path::{Component, Path, PathBuf},
+        pin::Pin,
         sync::{
             Arc,
             atomic::{AtomicU64, Ordering},
         },
+        task::{Context, Poll},
     };
 
     use bytes::Bytes;
+    use http_body::{Body, Frame};
     use http_body_util::{BodyExt, Full};
 
     use crate::fuzz_support::{self, FuzzRequest};
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+    struct PendingAfterPrefix(u8);
+
+    impl Body for PendingAfterPrefix {
+        type Data = Bytes;
+        type Error = io::Error;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            match self.0 {
+                0 => {
+                    self.0 = 1;
+                    Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(b"prefix")))))
+                }
+                1 => {
+                    self.0 = 2;
+                    Poll::Pending
+                }
+                2 => {
+                    self.0 = 3;
+                    Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(b"suffix")))))
+                }
+                _ => Poll::Ready(None),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn coalesces_ready_body_frames_into_one_exact_length_frame() {
+        let body = http_body_util::StreamBody::new(futures_util::stream::iter([
+            Ok::<_, io::Error>(Frame::data(Bytes::from_static(b"hello "))),
+            Ok(Frame::data(Bytes::from_static(b"world"))),
+        ]))
+        .boxed_unsync();
+        let mut body = coalesce_ready_body(body);
+
+        assert_eq!(body.size_hint().exact(), Some(11));
+        assert_eq!(
+            body.frame().await.unwrap().unwrap().into_data().unwrap(),
+            Bytes::from_static(b"hello world")
+        );
+        assert!(body.frame().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn coalescing_pending_body_preserves_prefix_and_remaining_frames() {
+        let body: ResponseBody = PendingAfterPrefix(0).boxed_unsync();
+        let mut body = coalesce_ready_body(body);
+
+        assert_eq!(
+            body.frame().await.unwrap().unwrap().into_data().unwrap(),
+            Bytes::from_static(b"prefix")
+        );
+        assert_eq!(
+            body.frame().await.unwrap().unwrap().into_data().unwrap(),
+            Bytes::from_static(b"suffix")
+        );
+        assert!(body.frame().await.is_none());
+    }
 
     async fn temp_root() -> PathBuf {
         let root = std::env::temp_dir().join(format!(

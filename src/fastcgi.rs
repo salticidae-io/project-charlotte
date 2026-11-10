@@ -48,12 +48,12 @@ pub async fn resolve_script(
         .collect::<Option<Vec<_>>>()?;
 
     if raw_path.ends_with('/')
+        && let Some(backend) = backend_for_name(&config.index, config)
         && let Ok(directory) = fs::canonicalize(config.root.join(relative_path)).await
         && directory.starts_with(&config.root)
         && fs::metadata(&directory)
             .await
             .is_ok_and(|metadata| metadata.is_dir())
-        && let Some(backend) = backend_for_name(&config.index, config)
         && let Ok(index_path) = fs::canonicalize(directory.join(&config.index)).await
         && index_path.starts_with(&config.root)
         && fs::metadata(&index_path)
@@ -394,7 +394,8 @@ where
                     let parsed = parse_cgi_headers(&stdout[..header_end])?;
                     let body_start = header_end + delimiter_length;
                     let initial_body = Bytes::copy_from_slice(&stdout[body_start..]);
-                    let body = response_body(output, initial_body, timeout);
+                    let body =
+                        handler::coalesce_ready_body(response_body(output, initial_body, timeout));
                     let mut response = handler::response(parsed.status, body);
                     for (name, value) in &parsed.headers {
                         response.headers_mut().append(name.clone(), value.clone());

@@ -672,7 +672,8 @@ impl Router {
         match table.vhosts[index].worker.dispatch(request).await {
             Ok(response) => {
                 let (parts, body) = response.into_parts();
-                let body = body.map_err(io::Error::other).boxed_unsync();
+                let body =
+                    handler::coalesce_ready_body(body.map_err(io::Error::other).boxed_unsync());
                 Response::from_parts(parts, body)
             }
             Err(error) => {
