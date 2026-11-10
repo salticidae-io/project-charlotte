@@ -438,7 +438,7 @@ fn write_certificate(
     let cert_path = root.join(format!("{name}.pem"));
     let key_path = root.join(format!("{name}-key.pem"));
     std::fs::write(&cert_path, generated.cert.pem()).unwrap();
-    std::fs::write(&key_path, generated.key_pair.serialize_pem()).unwrap();
+    std::fs::write(&key_path, generated.signing_key.serialize_pem()).unwrap();
     (generated.cert.der().clone(), cert_path, key_path)
 }
 

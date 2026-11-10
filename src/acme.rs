@@ -584,7 +584,7 @@ mod tests {
         tokio::fs::write(&files.cert, generated.cert.pem())
             .await
             .unwrap();
-        tokio::fs::write(&files.key, generated.key_pair.serialize_pem())
+        tokio::fs::write(&files.key, generated.signing_key.serialize_pem())
             .await
             .unwrap();
         let manager = AcmeManager::load(
@@ -631,7 +631,7 @@ mod tests {
         std::fs::create_dir_all(&cache).unwrap();
         let files = cache_files(&cache, "alpha.example.test");
         std::fs::write(&files.cert, generated.cert.pem()).unwrap();
-        std::fs::write(&files.key, generated.key_pair.serialize_pem()).unwrap();
+        std::fs::write(&files.key, generated.signing_key.serialize_pem()).unwrap();
         let key = tls::load_certified_key(&files).unwrap();
         store.insert("alpha.example.test".to_owned(), key).unwrap();
         assert!(!store.needs_renewal("alpha.example.test"));

@@ -1,7 +1,10 @@
-use std::{error::Error, fs::File, io::BufReader, sync::Arc};
+use std::{error::Error, sync::Arc};
 
 use rustls::{
-    pki_types::{CertificateDer, PrivateKeyDer},
+    pki_types::{
+        CertificateDer, PrivateKeyDer,
+        pem::{self, PemObject},
+    },
     server::{ClientHello, ResolvesServerCert},
     sign::CertifiedKey,
 };
@@ -155,8 +158,7 @@ fn select_key<'a, T>(
 pub(crate) fn load_certified_key(
     files: &TlsFiles,
 ) -> Result<Arc<CertifiedKey>, Box<dyn Error + Send + Sync>> {
-    let cert_file = File::open(&files.cert)?;
-    let certs = rustls_pemfile::certs(&mut BufReader::new(cert_file))
+    let certs = CertificateDer::pem_file_iter(&files.cert)?
         .collect::<Result<Vec<CertificateDer<'static>>, _>>()?;
     if certs.is_empty() {
         return Err(format!(
@@ -166,14 +168,18 @@ pub(crate) fn load_certified_key(
         .into());
     }
 
-    let key_file = File::open(&files.key)?;
-    let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut BufReader::new(key_file))?
-        .ok_or_else(|| {
-        format!(
-            "TLS private-key file contains no private key: {}",
-            files.key.display()
-        )
-    })?;
+    let key: PrivateKeyDer<'static> = PrivateKeyDer::from_pem_file(&files.key).map_err(
+        |error| -> Box<dyn Error + Send + Sync> {
+            match error {
+                pem::Error::NoItemsFound => format!(
+                    "TLS private-key file contains no private key: {}",
+                    files.key.display()
+                )
+                .into(),
+                other => Box::new(other),
+            }
+        },
+    )?;
     let signing_key = rustls::crypto::ring::sign::any_supported_type(&key)?;
     Ok(Arc::new(CertifiedKey::new(certs, signing_key)))
 }
@@ -222,8 +228,38 @@ mod tests {
             key: directory.join("key.pem"),
         };
         std::fs::write(&files.cert, generated.cert.pem()).unwrap();
-        std::fs::write(&files.key, generated.key_pair.serialize_pem()).unwrap();
+        std::fs::write(&files.key, generated.signing_key.serialize_pem()).unwrap();
         (directory, files, certificate)
+    }
+
+    #[test]
+    fn empty_certificate_file_returns_existing_error() {
+        let (_directory, files, _) = certificate_files("empty-cert.test");
+        std::fs::write(&files.cert, []).unwrap();
+
+        let error = load_certified_key(&files).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "TLS certificate file contains no certificates: {}",
+                files.cert.display()
+            )
+        );
+    }
+
+    #[test]
+    fn empty_private_key_file_returns_existing_error() {
+        let (_directory, files, _) = certificate_files("empty-key.test");
+        std::fs::write(&files.key, []).unwrap();
+
+        let error = load_certified_key(&files).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "TLS private-key file contains no private key: {}",
+                files.key.display()
+            )
+        );
     }
 
     #[test]

@@ -47,7 +47,7 @@ impl Fixture {
         let cert_path = root.join("server.pem");
         let key_path = root.join("server-key.pem");
         std::fs::write(&cert_path, generated.cert.pem()).unwrap();
-        std::fs::write(&key_path, generated.key_pair.serialize_pem()).unwrap();
+        std::fs::write(&key_path, generated.signing_key.serialize_pem()).unwrap();
         let certificate = generated.cert.der().clone();
 
         let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
