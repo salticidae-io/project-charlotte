@@ -15,7 +15,7 @@ use tokio::{
     signal::unix::{SignalKind, signal},
 };
 
-use crate::{config::Config, fastcgi_app, handler};
+use crate::{config::Config, fastcgi_app, handler, vhost::TlsSni};
 
 pub(crate) fn drop_privileges(config: &Config) -> Result<(), Box<dyn Error + Send + Sync>> {
     let uid = Uid::from_raw(config.worker_uid.ok_or("worker uid is missing")?);
@@ -129,6 +129,15 @@ pub(crate) fn prepare_request<B>(
         return Err(PrepareError::Metadata);
     };
 
+    let tls = request
+        .headers_mut()
+        .remove("x-charlotte-tls")
+        .is_some_and(|value| value == "1");
+    if tls {
+        // Tells the request handler that the client connection was encrypted.
+        request.extensions_mut().insert(TlsSni(None));
+    }
+
     let path_and_query = request
         .uri()
         .path_and_query()
@@ -175,6 +184,7 @@ mod tests {
                 "x-charlotte-peer",
                 "x-charlotte-local",
                 "x-charlotte-version",
+                "x-charlotte-tls",
             ] {
                 assert!(!request.headers().contains_key(name));
             }

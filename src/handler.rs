@@ -271,10 +271,11 @@ where
         let index = canonical.join(&config.index);
         if let Ok(index_path) = fs::canonicalize(index).await
             && index_path.starts_with(&config.root)
-            && let Ok(index_metadata) = fs::metadata(&index_path).await
-            && index_metadata.is_file()
+            && fs::metadata(&index_path)
+                .await
+                .is_ok_and(|metadata| metadata.is_file())
         {
-            return serve_file(request, &index_path, index_metadata).await;
+            return serve_file(request, &index_path, &config.root).await;
         }
         if config.listing {
             return directory_listing(request.uri().path(), &canonical).await;
@@ -285,17 +286,46 @@ where
     if !metadata.is_file() {
         return error_response(StatusCode::NOT_FOUND, "Not found\n");
     }
-    serve_file(request, &canonical, metadata).await
+    serve_file(request, &canonical, &config.root).await
 }
 
-async fn serve_file<B>(
-    request: &Request<B>,
-    path: &Path,
-    metadata: std::fs::Metadata,
-) -> Response<ResponseBody>
+/// Reports whether an open file really lives under the document root.
+///
+/// The path was checked before it was opened, but a path names a file only
+/// for an instant: whoever can write to the document root can replace a
+/// component with a symbolic link in between. Asking the kernel where the
+/// open descriptor points closes that window.
+#[cfg(target_os = "linux")]
+async fn opened_within_root(file: &File, root: &Path) -> bool {
+    use std::os::fd::AsRawFd;
+
+    fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
+        .await
+        .is_ok_and(|path| path.starts_with(root))
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn opened_within_root(_file: &File, _root: &Path) -> bool {
+    true
+}
+
+async fn serve_file<B>(request: &Request<B>, path: &Path, root: &Path) -> Response<ResponseBody>
 where
     B: Body<Data = Bytes>,
 {
+    // Everything below describes and reads this one open file, never the
+    // path again.
+    let not_found = || error_response(StatusCode::NOT_FOUND, "Not found\n");
+    let Ok(mut file) = File::open(path).await else {
+        return not_found();
+    };
+    let metadata = match file.metadata().await {
+        Ok(metadata) if metadata.is_file() => metadata,
+        _ => return not_found(),
+    };
+    if !opened_within_root(&file, root).await {
+        return not_found();
+    }
     let length = metadata.len();
     let modified = metadata
         .modified()
@@ -349,18 +379,10 @@ where
     let body = if request.method() == Method::HEAD || body_length == 0 {
         empty_body()
     } else {
-        match File::open(path).await {
-            Ok(mut file) => {
-                if file.seek(SeekFrom::Start(start)).await.is_err() {
-                    return error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "Unable to read file\n",
-                    );
-                }
-                file_body(file, body_length)
-            }
-            Err(_) => return error_response(StatusCode::NOT_FOUND, "Not found\n"),
+        if file.seek(SeekFrom::Start(start)).await.is_err() {
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Unable to read file\n");
         }
+        file_body(file, body_length)
     };
 
     let mut response = response(status, body);
@@ -458,7 +480,7 @@ async fn directory_listing(path: &str, directory: &Path) -> Response<ResponseBod
         match read_dir.next_entry().await {
             Ok(Some(entry)) => {
                 let name = entry.file_name().to_string_lossy().into_owned();
-                if name == "." || name == ".." {
+                if is_hidden(&name) {
                     continue;
                 }
                 let is_dir = fs::metadata(entry.path())
@@ -554,10 +576,19 @@ pub(crate) fn decode_request_path(path: &str) -> Option<PathBuf> {
         match segment {
             "" | "." => {}
             ".." => return None,
+            // Dotfiles hold what a site never means to publish: version
+            // control metadata, credentials, editor backups.
+            segment if is_hidden(segment) => return None,
             segment => relative.push(segment),
         }
     }
     Some(relative)
+}
+
+/// Reports whether a file name is hidden from clients. `.well-known` is the
+/// one dot-directory that exists to be served.
+fn is_hidden(name: &str) -> bool {
+    name.starts_with('.') && name != ".well-known"
 }
 
 fn hex_value(value: u8) -> Option<u8> {
@@ -748,6 +779,19 @@ mod tests {
         assert!(decode_request_path("/a/../secret").is_none());
         assert!(decode_request_path("/%00").is_none());
         assert!(decode_request_path("/%GG").is_none());
+    }
+
+    #[test]
+    fn hides_dotfiles_but_serves_well_known() {
+        assert!(decode_request_path("/.git/config").is_none());
+        assert!(decode_request_path("/app/.env").is_none());
+        assert!(decode_request_path("/%2eenv").is_none());
+        assert_eq!(
+            decode_request_path("/.well-known/security.txt")
+                .unwrap()
+                .as_path(),
+            Path::new(".well-known/security.txt")
+        );
     }
 
     #[tokio::test]

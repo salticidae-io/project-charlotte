@@ -16,6 +16,8 @@ use modsecurity::{Intervention, ModSecurity, Rules, Transaction};
 use crate::handler::{self, ResponseBody};
 
 const CONNECTOR_INFO: &str = "project-charlotte/0.1.0";
+/// How long a client may take to deliver a request body for inspection.
+const REQUEST_BODY_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy)]
 pub(crate) struct Waf {
@@ -157,9 +159,19 @@ impl Waf {
             return finish_intervention(&mut transaction, intervention).await;
         }
 
-        let collected = match Limited::new(body, self.request_body_limit).collect().await {
-            Ok(body) => body,
-            Err(error) if error.is::<http_body_util::LengthLimitError>() => {
+        let collecting = Limited::new(body, self.request_body_limit).collect();
+        let collected = match tokio::time::timeout(REQUEST_BODY_TIMEOUT, collecting).await {
+            Err(_) => {
+                if let Err(error) = finish_logging(&mut transaction) {
+                    eprintln!("ModSecurity logging failed: {error}");
+                }
+                return handler::error_response(
+                    StatusCode::REQUEST_TIMEOUT,
+                    "Request body timed out\n",
+                );
+            }
+            Ok(Ok(body)) => body,
+            Ok(Err(error)) if error.is::<http_body_util::LengthLimitError>() => {
                 if let Err(error) = finish_logging(&mut transaction) {
                     eprintln!("ModSecurity logging failed: {error}");
                     return handler::error_response(
@@ -172,7 +184,7 @@ impl Waf {
                     "Request body too large\n",
                 );
             }
-            Err(error) => {
+            Ok(Err(error)) => {
                 eprintln!("Request body read failed during ModSecurity inspection: {error}");
                 if let Err(error) = finish_logging(&mut transaction) {
                     eprintln!("ModSecurity logging failed: {error}");
@@ -204,6 +216,12 @@ impl Waf {
             }
         }
 
+        // Response rules see one response at a time. Were ranges honoured, a
+        // client could fetch blocked content in pieces that each pass, so
+        // inspected requests are always answered in full.
+        let mut parts = parts;
+        parts.headers.remove(header::RANGE);
+        parts.headers.remove(header::IF_RANGE);
         let request = Request::from_parts(parts, Full::new(request_body));
         let response = next(request).await;
         self.inspect_response(response, transaction, request_version)
@@ -674,6 +692,36 @@ mod tests {
             body: vec![b'a'; REQUEST_BODY_LIMIT + 1],
             ..FuzzRequest::default()
         });
+    }
+
+    #[test]
+    fn range_requests_cannot_split_blocked_content() {
+        let fixture = fuzz_support::fixture();
+        let mut config: Config = fuzz_support::fuzz_config(fixture.root.clone());
+        config.fastcgi.clear();
+        let config = Arc::new(config);
+        let (peer, local) = fuzz_support::addresses();
+        // "SECRET" spans bytes 18-23; neither half contains the whole marker.
+        for range in ["bytes=0-20", "bytes=21-"] {
+            let request = FuzzRequest {
+                uri: "/response-secret.txt".to_owned(),
+                headers: vec![("range".to_owned(), range.as_bytes().to_vec())],
+                ..FuzzRequest::default()
+            }
+            .build()
+            .unwrap();
+            let config = Arc::clone(&config);
+            let collected = fuzz_support::collect(async {
+                let router = Router::load(config, None, Some(fuzz_waf())).await.unwrap();
+                router.dispatch(request, peer, local).await
+            });
+            assert_eq!(
+                collected.parts.status,
+                http::StatusCode::INTERNAL_SERVER_ERROR,
+                "Range: {range}"
+            );
+            assert!(collected.body.len() < 40);
+        }
     }
 
     /// Rule exclusions from vhost files are interpolated into a ModSecurity

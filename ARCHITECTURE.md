@@ -127,6 +127,30 @@ substitute for deployment-level sandboxing. WAF request and response body
 limits are configurable. The ACME cache is kept outside served roots so
 private key material is not exposed as static content.
 
+The master refuses a configuration file, virtual-host directory, or
+virtual-host file that is world-writable or owned by anyone other than root
+or the server's own user, and refuses a virtual host whose user is root: those
+files choose the account a worker runs as and the programs it starts. A
+worker receives only a short allowlist of the master's environment, and the
+environment of its FastCGI apps reaches it through its own environment rather
+than its command line.
+
+Files whose name begins with a dot are neither served nor listed, except
+under `.well-known`. A served file is opened first and then confirmed, by
+descriptor, to lie under the document root, so swapping a path component for
+a symbolic link cannot redirect the read. When the WAF is active, `Range`
+and `If-Range` are removed from requests after inspection so that response
+rules always see a whole response; the cost is that inspected responses
+cannot be resumed or seeked. Responses larger than the response-body limit
+are inspected only up to that limit.
+
+The master accepts at most 4096 concurrent TCP connections, closes a
+connection that has not produced a complete request head within 30 seconds,
+and bounds the time a client may take to deliver a request body. A failed
+`accept` is logged rather than fatal. The master itself keeps the privileges
+it was started with; it terminates TLS, parses requests, serves the fallback
+site, and runs ModSecurity in that one process.
+
 Unit and integration tests cover routing, handlers, TLS, ACME, FastCGI, and
 ModSecurity. Fuzz targets exercise parsed inputs and request-handling paths;
 see [FUZZING.md](FUZZING.md) for target names, setup, and commands. HTTP wire

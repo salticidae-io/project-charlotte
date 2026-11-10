@@ -21,13 +21,13 @@ use std::{error::Error, net::SocketAddr, sync::Arc, time::Duration};
 
 use hyper::{Request, service::service_fn};
 use hyper_util::{
-    rt::{TokioExecutor, TokioIo},
+    rt::{TokioExecutor, TokioIo, TokioTimer},
     server::conn::auto,
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    net::TcpListener,
-    sync::watch,
+    net::{TcpListener, TcpStream},
+    sync::{OwnedSemaphorePermit, Semaphore, watch},
     task::JoinSet,
     time::timeout,
 };
@@ -41,6 +41,57 @@ use crate::{
     waf::Waf,
 };
 
+/// Connections served at once across the TCP listeners. Further connections
+/// wait in the listen backlog rather than consume descriptors and memory.
+const MAX_CONNECTIONS: usize = 4096;
+/// How long a client may take to send a complete request head.
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// How often an idle HTTP/2 connection is probed, and how long it has to
+/// answer before it is closed.
+const HTTP2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
+const HTTP2_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(20);
+/// Pause after a failed `accept`, so that a persistent failure such as
+/// descriptor exhaustion does not spin the accept loop.
+const ACCEPT_ERROR_DELAY: Duration = Duration::from_millis(100);
+
+/// Waits for a free connection slot, then for a connection.
+async fn accept(
+    listener: Option<&TcpListener>,
+    limiter: &Arc<Semaphore>,
+) -> (
+    std::io::Result<(TcpStream, SocketAddr)>,
+    OwnedSemaphorePermit,
+) {
+    let Some(listener) = listener else {
+        return std::future::pending().await;
+    };
+    let permit = Arc::clone(limiter)
+        .acquire_owned()
+        .await
+        .expect("connection limiter is never closed");
+    (listener.accept().await, permit)
+}
+
+/// Unpacks an accepted connection. A failure to accept must not stop the
+/// server: it is usually transient (the peer already hung up) or a resource
+/// limit that clears when other connections close.
+async fn accepted_stream(
+    accepted: std::io::Result<(TcpStream, SocketAddr)>,
+) -> Option<(TcpStream, SocketAddr, SocketAddr)> {
+    let result = accepted.and_then(|(stream, peer)| {
+        let local = stream.local_addr()?;
+        Ok((stream, peer, local))
+    });
+    match result {
+        Ok(connection) => Some(connection),
+        Err(error) => {
+            eprintln!("Could not accept connection: {error}");
+            tokio::time::sleep(ACCEPT_ERROR_DELAY).await;
+            None
+        }
+    }
+}
+
 fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let config = match Config::parse(std::env::args().skip(1))? {
         ParseResult::Help => {
@@ -49,8 +100,12 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         }
         ParseResult::Config(config) => *config,
     };
+    let mut config = config;
 
     if config.worker {
+        if let Ok(app_env) = std::env::var(config::WORKER_APP_ENV) {
+            config.apply_fastcgi_app_env(&app_env)?;
+        }
         worker::drop_privileges(&config)?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(config.worker_threads)
@@ -169,6 +224,7 @@ async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> 
         })
         .transpose()?;
     let mut connections = JoinSet::new();
+    let limiter = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     let signal_tx = shutdown_tx.clone();
     tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
@@ -179,12 +235,21 @@ async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> 
     loop {
         tokio::select! {
             _ = shutdown_rx.changed() => break,
-            accepted = listener.accept() => {
-                let (stream, peer) = accepted?;
+            // Reap finished connections as they end; left in the set, each
+            // would hold its task allocation until shutdown.
+            Some(result) = connections.join_next(), if !connections.is_empty() => {
+                if let Err(error) = result {
+                    eprintln!("Connection task failed: {error}");
+                }
+            }
+            (accepted, permit) = accept(Some(&listener), &limiter) => {
+                let Some((stream, peer, local)) = accepted_stream(accepted).await else {
+                    continue;
+                };
                 let router = Arc::clone(&router);
                 let connection_shutdown = shutdown_rx.clone();
-                let local = stream.local_addr()?;
                 connections.spawn(async move {
+                    let _permit = permit;
                     if let Err(error) = serve_connection(
                         stream,
                         peer,
@@ -198,14 +263,10 @@ async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> 
                     }
                 });
             }
-            accepted = async {
-                match &tls_listener {
-                    Some(listener) => listener.accept().await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                let (stream, peer) = accepted?;
-                let local = stream.local_addr()?;
+            (accepted, permit) = accept(tls_listener.as_ref(), &limiter) => {
+                let Some((stream, peer, local)) = accepted_stream(accepted).await else {
+                    continue;
+                };
                 let router = Arc::clone(&router);
                 let connection_shutdown = shutdown_rx.clone();
                 let acceptor = tls_acceptor
@@ -213,6 +274,7 @@ async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> 
                     .expect("TLS listener requires a TLS acceptor")
                     .clone();
                 connections.spawn(async move {
+                    let _permit = permit;
                     match timeout(Duration::from_secs(10), acceptor.accept(stream)).await {
                         Ok(Ok(stream)) => {
                             let sni = stream.get_ref().1.server_name().map(str::to_owned);
@@ -274,9 +336,11 @@ where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let io = TokioIo::new(stream);
+    let (request_seen, mut first_request) = watch::channel(false);
     let service = service_fn(move |mut request: Request<hyper::body::Incoming>| {
         let router = Arc::clone(&router);
         let sni = sni.clone();
+        request_seen.send_replace(true);
         async move {
             if let Some(sni) = sni {
                 request.extensions_mut().insert(TlsSni(sni));
@@ -290,7 +354,18 @@ where
             Ok::<_, std::convert::Infallible>(response)
         }
     });
-    let builder = auto::Builder::new(TokioExecutor::new());
+    let mut builder = auto::Builder::new(TokioExecutor::new());
+    // Without these a client can hold a connection open indefinitely without
+    // ever completing a request.
+    builder
+        .http1()
+        .timer(TokioTimer::new())
+        .header_read_timeout(HEADER_READ_TIMEOUT);
+    builder
+        .http2()
+        .timer(TokioTimer::new())
+        .keep_alive_interval(HTTP2_KEEP_ALIVE_INTERVAL)
+        .keep_alive_timeout(HTTP2_KEEP_ALIVE_TIMEOUT);
     let mut connection = Box::pin(builder.serve_connection(io, service));
 
     if *shutdown.borrow() {
@@ -299,12 +374,30 @@ where
         return Ok(());
     }
 
-    tokio::select! {
-        result = &mut connection => result?,
-        _ = shutdown.changed() => {
-            connection.as_mut().graceful_shutdown();
-            connection.await?;
+    // Hyper's header timeout starts with the first byte of a request, and
+    // protocol detection before it has no timeout at all. This deadline covers
+    // a client that connects and then sends nothing, or too little to tell.
+    let no_request = async {
+        timeout(HEADER_READ_TIMEOUT, first_request.wait_for(|seen| *seen))
+            .await
+            .is_err()
+    };
+    tokio::pin!(no_request);
+    let mut awaiting_first_request = true;
+    loop {
+        tokio::select! {
+            result = &mut connection => return result,
+            _ = shutdown.changed() => {
+                connection.as_mut().graceful_shutdown();
+                connection.await?;
+                return Ok(());
+            }
+            expired = &mut no_request, if awaiting_first_request => {
+                if expired {
+                    return Ok(());
+                }
+                awaiting_first_request = false;
+            }
         }
     }
-    Ok(())
 }

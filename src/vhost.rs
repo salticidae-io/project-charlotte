@@ -35,6 +35,7 @@ use crate::{
 const META_PEER: HeaderName = HeaderName::from_static("x-charlotte-peer");
 const META_LOCAL: HeaderName = HeaderName::from_static("x-charlotte-local");
 const META_VERSION: HeaderName = HeaderName::from_static("x-charlotte-version");
+const META_TLS: HeaderName = HeaderName::from_static("x-charlotte-tls");
 const WORKER_READY_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a worker is given to shut down on its own before it is killed.
 const WORKER_SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
@@ -208,6 +209,7 @@ impl Router {
             current_dir.clone()
         };
         let file = if let Some(path) = path {
+            ensure_trusted_config(path)?;
             let content = std::fs::read_to_string(path)?;
             toml::from_str(&content)?
         } else {
@@ -238,9 +240,11 @@ impl Router {
             return Ok(false);
         };
         let mut sources = self.sources.lock().await;
+        ensure_trusted_config(dir)?;
         let paths = scan_vhost_files(dir)?;
         let mut candidates = Vec::with_capacity(paths.len());
         for path in paths {
+            ensure_trusted_config(&path)?;
             let content = std::fs::read_to_string(&path)?;
             let old = sources.files.get(&path);
             let entries = if old.is_some_and(|source| source.content == content) {
@@ -329,6 +333,9 @@ impl Router {
         for source in loaded.values() {
             vhosts.extend(source.vhosts.iter().cloned());
         }
+        if let Some(acme) = &self.acme {
+            ensure_acme_cache_is_private(acme.cache_dir(), &vhosts)?;
+        }
         let default = vhosts.iter().position(|vhost| vhost.default);
         let new_table = Arc::new(VhostTable { vhosts, default });
         if !changed {
@@ -389,6 +396,11 @@ impl Router {
             }
 
             let (uid, gid) = resolve_identity(&entry.user, entry.group.as_deref())?;
+            if uid == 0 {
+                // A worker exists to confine a site to an unprivileged
+                // account; one running as root confines nothing.
+                return Err(format!("virtual host user must not be root: {}", entry.user).into());
+            }
             let index_name = entry.index.unwrap_or_else(|| fallback.index.clone());
             validate_index(&index_name)?;
             let listing = entry.listing.unwrap_or(fallback.listing);
@@ -554,6 +566,16 @@ impl Router {
         B: Body<Data = Bytes> + Send + 'static,
         B::Error: Into<Box<dyn Error + Send + Sync>>,
     {
+        let mut request = request;
+        // Routing follows the authority of an absolute request target (or of
+        // HTTP/2's `:authority`) in preference to `Host`. Make the header agree
+        // before anything inspects it, so that the WAF and the backend see the
+        // host the request is actually routed to.
+        if let Some(authority) = request.uri().authority()
+            && let Ok(value) = HeaderValue::from_str(authority.as_str())
+        {
+            request.headers_mut().insert(HOST, value);
+        }
         let table = self.snapshot();
         if let Some(acme) = &self.acme {
             let host = request_host(&request);
@@ -687,8 +709,17 @@ impl Worker {
             ))
             .arg("--worker-threads")
             .arg(self.threads.to_string())
+            .env_clear()
+            .envs(
+                WORKER_INHERITED_ENV
+                    .iter()
+                    .filter_map(|name| std::env::var_os(name).map(|value| (name, value))),
+            )
             .stdin(Stdio::from(OwnedFd::from(child_socket)))
             .current_dir("/");
+        if let Some(app_env) = worker_app_env(&self.fastcgi) {
+            command.env(crate::config::WORKER_APP_ENV, app_env);
+        }
 
         let mut child = command.spawn()?;
         drop(command);
@@ -739,19 +770,36 @@ impl Worker {
         &self,
         request: Request<WorkerRequestBody>,
     ) -> Result<Response<Incoming>, Box<dyn Error + Send + Sync>> {
-        let mut process_guard = self.process.lock().await;
-        if process_guard
-            .as_ref()
-            .is_none_or(|process| process.sender.is_closed())
-        {
-            *process_guard = None;
-            *process_guard = Some(self.spawn_process().await?);
-        }
-        let process = process_guard.as_mut().expect("worker was started");
-        match process.sender.send_request(request).await {
+        // The lock covers only starting the worker and taking a handle to its
+        // connection. Holding it while a request is in flight would let one
+        // slow request stall every other request for the virtual host.
+        let mut sender = {
+            let mut process_guard = self.process.lock().await;
+            if process_guard
+                .as_ref()
+                .is_none_or(|process| process.sender.is_closed())
+            {
+                *process_guard = None;
+                *process_guard = Some(self.spawn_process().await?);
+            }
+            process_guard
+                .as_ref()
+                .expect("worker was started")
+                .sender
+                .clone()
+        };
+        match sender.send_request(request).await {
             Ok(response) => Ok(response),
             Err(error) => {
-                *process_guard = None;
+                // Only a broken connection condemns the worker; a failure of
+                // this one request leaves it serving the others.
+                let mut process_guard = self.process.lock().await;
+                if process_guard
+                    .as_ref()
+                    .is_some_and(|process| process.sender.is_closed())
+                {
+                    *process_guard = None;
+                }
                 Err(error.into())
             }
         }
@@ -825,6 +873,11 @@ fn worker_request<B>(
     request
         .headers_mut()
         .insert(META_VERSION, HeaderValue::from_static(original_version));
+    let tls = request.extensions().get::<TlsSni>().is_some();
+    request.headers_mut().insert(
+        META_TLS,
+        HeaderValue::from_static(if tls { "1" } else { "0" }),
+    );
     let path_and_query = request
         .uri()
         .path_and_query()
@@ -980,6 +1033,55 @@ fn validate_vhost_waf_declarations(
     Ok(())
 }
 
+/// Refuses configuration that an unprivileged account could have written.
+///
+/// Virtual host declarations choose the account a worker runs as and the
+/// programs it starts, so whoever can write them controls the server.
+fn ensure_trusted_config(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = std::fs::metadata(path)?;
+    let owner = metadata.uid();
+    if owner != 0 && owner != nix::unistd::geteuid().as_raw() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{} must be owned by root or by the user running the server",
+                path.display()
+            ),
+        ));
+    }
+    if metadata.mode() & 0o002 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} must not be world-writable", path.display()),
+        ));
+    }
+    Ok(())
+}
+
+/// Refuses a set of virtual hosts in which a document root would expose the
+/// ACME cache, which holds private keys.
+fn ensure_acme_cache_is_private(cache: &Path, vhosts: &[Arc<Vhost>]) -> io::Result<()> {
+    let Ok(cache) = std::fs::canonicalize(cache) else {
+        return Ok(());
+    };
+    for vhost in vhosts {
+        if let Ok(root) = std::fs::canonicalize(&vhost.worker.root)
+            && cache.starts_with(&root)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "ACME cache must be outside every served document root: {}",
+                    root.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn resolve_config_path(path: PathBuf, config_dir: &Path) -> PathBuf {
     if path.is_absolute() {
         path
@@ -1062,10 +1164,6 @@ fn build_worker_args(
                     args.push("--fastcgi-app-arg".into());
                     args.push(format!("{}={arg}", backend.extension).into());
                 }
-                for (key, value) in &app.env {
-                    args.push("--fastcgi-app-env".into());
-                    args.push(format!("{}={key}={value}", backend.extension).into());
-                }
             }
             _ => {
                 args.push("--fastcgi".into());
@@ -1075,6 +1173,33 @@ fn build_worker_args(
     }
     args
 }
+
+/// Encodes the environment of a worker's spawned FastCGI apps for
+/// `WORKER_APP_ENV`. It travels in the worker's environment rather than its
+/// arguments because a command line is readable by every local user, and
+/// these values are where applications keep their credentials.
+fn worker_app_env(fastcgi: &[FastCgiBackend]) -> Option<String> {
+    let entries = fastcgi
+        .iter()
+        .filter_map(|backend| match &backend.address {
+            FastCgiAddress::Spawn(app) => Some((&backend.extension, app)),
+            _ => None,
+        })
+        .flat_map(|(extension, app)| {
+            app.env
+                .iter()
+                .map(move |(key, value)| (extension, key, value))
+        })
+        .collect::<Vec<_>>();
+    if entries.is_empty() {
+        return None;
+    }
+    Some(serde_json::to_string(&entries).expect("strings serialize to JSON"))
+}
+
+/// Variables a worker keeps from the server's environment. Everything else,
+/// including whatever credentials the server was started with, is withheld.
+const WORKER_INHERITED_ENV: [&str; 5] = ["PATH", "TMPDIR", "LD_LIBRARY_PATH", "LANG", "TZ"];
 
 fn format_backend(backend: &FastCgiBackend) -> String {
     match &backend.address {
@@ -1099,9 +1224,10 @@ fn version_name(version: Version) -> &'static str {
 mod tests {
     use super::{
         FileConfig, Router, TlsSni, Vhost, VhostFile, VhostTable, Worker, build_worker_args,
-        match_score, normalize_host, normalize_server_name, request_host, resolve_identity,
-        scan_vhost_files, select_route, validate_index, validate_vhost_declarations,
-        validate_vhost_waf_declarations, worker_request,
+        ensure_trusted_config, match_score, normalize_host, normalize_server_name, request_host,
+        resolve_identity, scan_vhost_files, select_route, validate_index,
+        validate_vhost_declarations, validate_vhost_waf_declarations, worker_app_env,
+        worker_request,
     };
     use crate::{
         config::{
@@ -1338,6 +1464,20 @@ mod tests {
     #[test]
     fn rejects_unknown_vhost_user_and_builds_worker_arguments() {
         assert!(resolve_identity("charlotte-no-such-user", None).is_err());
+        let backends = [
+            FastCgiBackend {
+                extension: "php".to_owned(),
+                address: FastCgiAddress::Tcp("127.0.0.1:9000".to_owned()),
+            },
+            FastCgiBackend {
+                extension: "cgi".to_owned(),
+                address: FastCgiAddress::Spawn(FastCgiApp {
+                    program: "/usr/bin/php8.4-cgi".into(),
+                    args: vec!["--foreground".to_owned()],
+                    env: BTreeMap::from([("APP_MODE".to_owned(), "worker".to_owned())]),
+                }),
+            },
+        ];
         let args = build_worker_args(
             1001,
             1002,
@@ -1345,20 +1485,7 @@ mod tests {
             "home.php",
             false,
             &["$uri".to_owned(), "=404".to_owned()],
-            &[
-                FastCgiBackend {
-                    extension: "php".to_owned(),
-                    address: FastCgiAddress::Tcp("127.0.0.1:9000".to_owned()),
-                },
-                FastCgiBackend {
-                    extension: "cgi".to_owned(),
-                    address: FastCgiAddress::Spawn(FastCgiApp {
-                        program: "/usr/bin/php8.4-cgi".into(),
-                        args: vec!["--foreground".to_owned()],
-                        env: BTreeMap::from([("APP_MODE".to_owned(), "worker".to_owned())]),
-                    }),
-                },
-            ],
+            &backends,
             Duration::from_secs(12),
         );
         let args = args
@@ -1381,10 +1508,14 @@ mod tests {
             args.windows(2)
                 .any(|pair| { pair == ["--fastcgi-app-arg", "cgi=--foreground"] })
         );
-        assert!(
-            args.windows(2)
-                .any(|pair| { pair == ["--fastcgi-app-env", "cgi=APP_MODE=worker"] })
+        // App environment may hold credentials, so it must stay off the
+        // command line, which every local user can read.
+        assert!(!args.iter().any(|arg| arg.contains("APP_MODE")));
+        assert_eq!(
+            worker_app_env(&backends).as_deref(),
+            Some(r#"[["cgi","APP_MODE","worker"]]"#)
         );
+        assert_eq!(worker_app_env(&backends[..1]), None);
     }
 
     #[test_fuzz::test_fuzz]
@@ -1568,6 +1699,8 @@ mod tests {
         let Ok(mut forwarded) = worker_request(request, host.as_deref(), peer, local) else {
             return;
         };
+        // The master's connection state is not the client's to assert.
+        forwarded.extensions_mut().remove::<TlsSni>();
         assert_eq!(forwarded.version(), Version::HTTP_2);
         assert_eq!(
             forwarded.headers().get(HOST).map(HeaderValue::as_bytes),
@@ -1580,6 +1713,7 @@ mod tests {
         let addresses = crate::worker::prepare_request(&mut forwarded)
             .expect("worker accepts the request the master forwarded");
         assert_eq!(addresses, (peer, local));
+        assert_eq!(forwarded.extensions().get::<TlsSni>().is_some(), has_sni);
         assert_eq!(forwarded.version(), version);
         assert_eq!(
             forwarded
@@ -1631,6 +1765,23 @@ mod tests {
             None,
             true,
         );
+    }
+
+    #[test]
+    fn refuses_world_writable_configuration() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = std::env::temp_dir().join(format!(
+            "project-charlotte-trust-{}-{}.toml",
+            std::process::id(),
+            NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, "").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(ensure_trusted_config(&path).is_ok());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(ensure_trusted_config(&path).is_err());
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -1725,11 +1876,16 @@ mod tests {
         .into_iter()
         .map(|arg| arg.into_string().expect("worker arguments are UTF-8"))
         .collect::<Vec<_>>();
-        let config = match Config::parse(args) {
+        let mut config = match Config::parse(args) {
             Ok(ParseResult::Config(config)) => config,
             Ok(ParseResult::Help) => panic!("worker arguments were parsed as a help request"),
             Err(error) => panic!("worker rejected the master's arguments: {error}"),
         };
+        if let Some(app_env) = worker_app_env(&backends) {
+            config
+                .apply_fastcgi_app_env(&app_env)
+                .expect("worker accepts the app environment the master encoded");
+        }
         assert!(config.worker);
         assert_eq!(
             (config.worker_uid, config.worker_gid),

@@ -158,6 +158,10 @@ impl AcmeManager {
         })
     }
 
+    pub(crate) fn cache_dir(&self) -> &Path {
+        &self.inner.settings.cache
+    }
+
     pub(crate) fn certificate_store(&self) -> AcmeCertificateStore {
         self.inner.store.clone()
     }

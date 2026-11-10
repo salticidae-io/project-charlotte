@@ -156,15 +156,23 @@ where
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     let (parts, request_body) = request.into_parts();
-    let collected = match Limited::new(request_body, MAX_REQUEST_BODY).collect().await {
-        Ok(body) => body,
-        Err(error) if error.is::<http_body_util::LengthLimitError>() => {
+    // A client that never finishes its body must not hold the request open.
+    let collecting = Limited::new(request_body, MAX_REQUEST_BODY).collect();
+    let collected = match tokio::time::timeout(config.fastcgi_timeout, collecting).await {
+        Err(_) => {
+            return handler::error_response(
+                StatusCode::REQUEST_TIMEOUT,
+                "Request body timed out\n",
+            );
+        }
+        Ok(Ok(body)) => body,
+        Ok(Err(error)) if error.is::<http_body_util::LengthLimitError>() => {
             return handler::error_response(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "Request body too large\n",
             );
         }
-        Err(_) => {
+        Ok(Err(_)) => {
             return handler::error_response(StatusCode::BAD_REQUEST, "Invalid request body\n");
         }
     };
@@ -296,6 +304,13 @@ fn build_params(
         .custom("CONTENT_TYPE", content_type)
         .custom("CONTENT_LENGTH", content_length.to_string())
         .custom("REDIRECT_STATUS", "200");
+    // Applications use these to decide whether to mark cookies secure and
+    // which scheme to put in the links and redirects they generate.
+    let secure = parts.extensions.get::<crate::vhost::TlsSni>().is_some();
+    params = params.custom("REQUEST_SCHEME", if secure { "https" } else { "http" });
+    if secure {
+        params = params.custom("HTTPS", "on");
+    }
 
     let connection_headers = parts
         .headers
@@ -306,7 +321,9 @@ fn build_params(
         .map(|name| name.trim().to_ascii_lowercase())
         .collect::<HashSet<_>>();
     for name in parts.headers.keys() {
-        if is_cgi_excluded_header(name, &connection_headers) {
+        // `X_Real-IP` and `X-Real-IP` would both become `HTTP_X_REAL_IP`,
+        // letting a client shadow a header the application trusts.
+        if is_cgi_excluded_header(name, &connection_headers) || name.as_str().contains('_') {
             continue;
         }
         let key = format!(
@@ -733,6 +750,44 @@ mod tests {
                 "CGI response header was forwarded: {name}"
             );
         }
+    }
+
+    #[test]
+    fn drops_underscore_headers_and_reports_the_client_scheme() {
+        let config = test_config(PathBuf::from("/var/www"));
+        let script = super::ResolvedScript {
+            path: PathBuf::from("/var/www/app.php"),
+            script_name: "/app.php".to_owned(),
+            path_info: String::new(),
+            backend: config.fastcgi[0].clone(),
+        };
+        let build = |secure: bool| {
+            let mut request = http::Request::builder()
+                .uri("/app.php")
+                .header("X-Real-IP", "198.51.100.7")
+                .header("X_Real-IP", "spoofed")
+                .body(())
+                .unwrap();
+            if secure {
+                request.extensions_mut().insert(crate::vhost::TlsSni(None));
+            }
+            let (parts, ()) = request.into_parts();
+            build_params(
+                &parts,
+                &script,
+                &config,
+                "192.0.2.1:12345".parse().unwrap(),
+                "192.0.2.10:8080".parse().unwrap(),
+                0,
+            )
+        };
+        let plain = build(false);
+        assert_eq!(plain["HTTP_X_REAL_IP"], "198.51.100.7");
+        assert_eq!(plain["REQUEST_SCHEME"], "http");
+        assert!(!plain.contains_key("HTTPS"));
+        let secure = build(true);
+        assert_eq!(secure["REQUEST_SCHEME"], "https");
+        assert_eq!(secure["HTTPS"], "on");
     }
 
     #[test_fuzz::test_fuzz]

@@ -1,0 +1,2 @@
+[[vhost]]
+server_names = ["*.."]

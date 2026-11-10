@@ -295,20 +295,7 @@ impl Config {
             app.args.push(arg);
         }
         for (extension, key, value) in fastcgi_app_env {
-            let Some(FastCgiBackend {
-                address: FastCgiAddress::Spawn(app),
-                ..
-            }) = fastcgi
-                .iter_mut()
-                .find(|backend| backend.extension == extension)
-            else {
-                return Err(format!(
-                    "FastCGI app environment references undeclared app extension: {extension}"
-                ));
-            };
-            if app.env.insert(key.clone(), value).is_some() {
-                return Err(format!("duplicate FastCGI app environment key: {key}"));
-            }
+            add_fastcgi_app_env(&mut fastcgi, &extension, key, value)?;
         }
 
         let tls = match (tls_cert, tls_key) {
@@ -367,9 +354,52 @@ impl Config {
         })))
     }
 
+    /// Applies spawned-app environment that the master passed to this worker
+    /// through `WORKER_APP_ENV`, encoded as `[[extension, key, value], ...]`.
+    pub(crate) fn apply_fastcgi_app_env(&mut self, encoded: &str) -> Result<(), String> {
+        let entries: Vec<(String, String, String)> = serde_json::from_str(encoded)
+            .map_err(|error| format!("invalid {WORKER_APP_ENV}: {error}"))?;
+        for (extension, key, value) in entries {
+            validate_env_key(&key)?;
+            if value.contains('\0') {
+                return Err("FastCGI app environment value cannot contain NUL".to_owned());
+            }
+            let extension = normalize_extension(&extension)?;
+            add_fastcgi_app_env(&mut self.fastcgi, &extension, key, value)?;
+        }
+        Ok(())
+    }
+
     pub fn usage() -> &'static str {
         "Usage: project-charlotte [--bind ADDRESS] [--tls-bind ADDRESS] [--root DIRECTORY] [--index NAME] [--no-listing] [--try-files ENTRY]... [--fastcgi EXT=ADDR]... [--fastcgi-app EXT=PROGRAM]... [--fastcgi-app-arg EXT=ARG]... [--fastcgi-app-env EXT=KEY=VALUE]... [--fastcgi-timeout SECS] [--threads N] [--worker-threads N] [--modsecurity-rules FILE]... [--modsecurity-body-limit BYTES] [--config FILE] [--vhost-dir DIRECTORY] [--tls-cert PATH --tls-key PATH] [--acme-directory URL|letsencrypt|letsencrypt-staging --acme-cache DIR] [--acme-contact URI]... [--acme-ca-root PEM] [--http3-bind ADDRESS] [--help]"
     }
+}
+
+/// Environment variable through which the master hands a worker the
+/// environment of its spawned FastCGI apps.
+pub(crate) const WORKER_APP_ENV: &str = "CHARLOTTE_FASTCGI_APP_ENV";
+
+fn add_fastcgi_app_env(
+    fastcgi: &mut [FastCgiBackend],
+    extension: &str,
+    key: String,
+    value: String,
+) -> Result<(), String> {
+    let Some(FastCgiBackend {
+        address: FastCgiAddress::Spawn(app),
+        ..
+    }) = fastcgi
+        .iter_mut()
+        .find(|backend| backend.extension == extension)
+    else {
+        return Err(format!(
+            "FastCGI app environment references undeclared app extension: {extension}"
+        ));
+    };
+    if app.env.insert(key.clone(), value).is_some() {
+        return Err(format!("duplicate FastCGI app environment key: {key}"));
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_try_files(entries: &[String]) -> Result<(), String> {

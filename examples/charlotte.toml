@@ -29,6 +29,11 @@
 # `vhost_dir` is also relative to this file; visible `*.toml` files in that
 # directory are watched for additions, changes, deletions and atomic renames.
 # Invalid updates are rejected and the last valid configuration remains active.
+#
+# This file, the `vhost_dir` directory and the files in it decide which
+# accounts and programs the server runs, so they must be owned by root or by
+# the user running the server and must not be world-writable; otherwise the
+# server refuses to load them.
 
 vhost_dir = "vhosts.d"
 
@@ -47,7 +52,8 @@ server_names = ["example.com", "www.example.com"]
 # Required. Document root served by this virtual host's worker.
 root = "/srv/www/example.com/public"
 
-# Required. The worker drops to this user. The account must exist.
+# Required. The worker drops to this user. The account must exist and must
+# not be root.
 user = "www-example"
 
 # Optional. Defaults to the user's primary group.
