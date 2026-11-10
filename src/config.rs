@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, net::SocketAddr, path::PathBuf, time::Duration};
+use std::{collections::BTreeMap, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 #[derive(Clone, Debug)]
 pub struct FastCgiBackend {
@@ -11,6 +11,7 @@ pub enum FastCgiAddress {
     Tcp(String),
     Unix(PathBuf),
     Spawn(FastCgiApp),
+    Pool(Arc<crate::fastcgi_app::AppPool>),
 }
 
 #[derive(Clone, Debug)]
@@ -18,7 +19,8 @@ pub struct FastCgiApp {
     pub program: PathBuf,
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
-    pub workers: usize,
+    pub max_workers: usize,
+    pub idle_timeout: Duration,
 }
 
 #[derive(Clone, Debug)]
@@ -80,7 +82,8 @@ impl Config {
         let mut try_files = Vec::new();
         let mut fastcgi = Vec::new();
         let mut fastcgi_app_args = Vec::new();
-        let mut fastcgi_app_workers = Vec::new();
+        let mut fastcgi_app_max_workers = Vec::new();
+        let mut fastcgi_app_idle_timeouts = Vec::new();
         let mut fastcgi_app_env = Vec::new();
         let mut fastcgi_timeout = Duration::from_secs(60);
         let mut threads = None;
@@ -161,22 +164,39 @@ impl Config {
                     }
                     fastcgi_app_args.push((normalize_extension(extension)?, arg.to_owned()));
                 }
-                "--fastcgi-app-workers" => {
-                    let value = next_value(&mut args, "--fastcgi-app-workers")?;
-                    let (extension, workers) = value.split_once('=').ok_or_else(|| {
-                        format!("invalid FastCGI app worker count: {value}; expected EXT=N")
+                "--fastcgi-app-max-workers" | "--fastcgi-app-workers" => {
+                    let value = next_value(&mut args, "--fastcgi-app-max-workers")?;
+                    let (extension, max_workers) = value.split_once('=').ok_or_else(|| {
+                        format!("invalid FastCGI app max worker count: {value}; expected EXT=N")
                     })?;
                     let extension = normalize_extension(extension)?;
-                    let workers = parse_fastcgi_app_workers(workers)?;
-                    if fastcgi_app_workers
+                    let max_workers = parse_fastcgi_app_max_workers(max_workers)?;
+                    if fastcgi_app_max_workers
                         .iter()
                         .any(|(existing, _): &(String, usize)| existing == &extension)
                     {
                         return Err(format!(
-                            "duplicate FastCGI app worker count for extension: {extension}"
+                            "duplicate FastCGI app max worker count for extension: {extension}"
                         ));
                     }
-                    fastcgi_app_workers.push((extension, workers));
+                    fastcgi_app_max_workers.push((extension, max_workers));
+                }
+                "--fastcgi-app-idle-timeout" => {
+                    let value = next_value(&mut args, "--fastcgi-app-idle-timeout")?;
+                    let (extension, timeout) = value.split_once('=').ok_or_else(|| {
+                        format!("invalid FastCGI app idle timeout: {value}; expected EXT=SECS")
+                    })?;
+                    let extension = normalize_extension(extension)?;
+                    let timeout = parse_fastcgi_app_idle_timeout(timeout)?;
+                    if fastcgi_app_idle_timeouts
+                        .iter()
+                        .any(|(existing, _): &(String, Duration)| existing == &extension)
+                    {
+                        return Err(format!(
+                            "duplicate FastCGI app idle timeout for extension: {extension}"
+                        ));
+                    }
+                    fastcgi_app_idle_timeouts.push((extension, timeout));
                 }
                 "--fastcgi-app-env" => {
                     let value = next_value(&mut args, "--fastcgi-app-env")?;
@@ -331,7 +351,7 @@ impl Config {
             };
             app.args.push(arg);
         }
-        for (extension, workers) in fastcgi_app_workers {
+        for (extension, max_workers) in fastcgi_app_max_workers {
             let Some(FastCgiBackend {
                 address: FastCgiAddress::Spawn(app),
                 ..
@@ -340,10 +360,24 @@ impl Config {
                 .find(|backend| backend.extension == extension)
             else {
                 return Err(format!(
-                    "FastCGI app worker count references undeclared app extension: {extension}"
+                    "FastCGI app max worker count references undeclared app extension: {extension}"
                 ));
             };
-            app.workers = workers;
+            app.max_workers = max_workers;
+        }
+        for (extension, idle_timeout) in fastcgi_app_idle_timeouts {
+            let Some(FastCgiBackend {
+                address: FastCgiAddress::Spawn(app),
+                ..
+            }) = fastcgi
+                .iter_mut()
+                .find(|backend| backend.extension == extension)
+            else {
+                return Err(format!(
+                    "FastCGI app idle timeout references undeclared app extension: {extension}"
+                ));
+            };
+            app.idle_timeout = idle_timeout;
         }
         for (extension, key, value) in fastcgi_app_env {
             add_fastcgi_app_env(&mut fastcgi, &extension, key, value)?;
@@ -430,7 +464,7 @@ impl Config {
     }
 
     pub fn usage() -> &'static str {
-        "Usage: project-charlotte [--user USER [--group GROUP]] [--bind ADDRESS] [--tls-bind ADDRESS] [--root DIRECTORY] [--index NAME] [--no-listing] [--try-files ENTRY]... [--fastcgi EXT=ADDR]... [--fastcgi-app EXT=PROGRAM]... [--fastcgi-app-arg EXT=ARG]... [--fastcgi-app-workers EXT=N]... [--fastcgi-app-env EXT=KEY=VALUE]... [--fastcgi-timeout SECS] [--threads N] [--worker-threads N] [--modsecurity-rules FILE]... [--modsecurity-body-limit BYTES] [--config FILE] [--vhost-dir DIRECTORY] [--tls-cert PATH --tls-key PATH] [--acme-directory URL|letsencrypt|letsencrypt-staging --acme-cache DIR] [--acme-contact URI]... [--acme-ca-root PEM] [--http3-bind ADDRESS] [--help]"
+        "Usage: project-charlotte [--user USER [--group GROUP]] [--bind ADDRESS] [--tls-bind ADDRESS] [--root DIRECTORY] [--index NAME] [--no-listing] [--try-files ENTRY]... [--fastcgi EXT=ADDR]... [--fastcgi-app EXT=PROGRAM]... [--fastcgi-app-arg EXT=ARG]... [--fastcgi-app-max-workers EXT=N]... [--fastcgi-app-idle-timeout EXT=SECS]... [--fastcgi-app-env EXT=KEY=VALUE]... [--fastcgi-timeout SECS] [--threads N] [--worker-threads N] [--modsecurity-rules FILE]... [--modsecurity-body-limit BYTES] [--config FILE] [--vhost-dir DIRECTORY] [--tls-cert PATH --tls-key PATH] [--acme-directory URL|letsencrypt|letsencrypt-staging --acme-cache DIR] [--acme-contact URI]... [--acme-ca-root PEM] [--http3-bind ADDRESS] [--help]"
     }
 }
 
@@ -563,7 +597,8 @@ pub(crate) fn parse_fastcgi_app(value: &str) -> Result<FastCgiBackend, String> {
             program: PathBuf::from(program),
             args: Vec::new(),
             env: BTreeMap::new(),
-            workers: 1,
+            max_workers: 1,
+            idle_timeout: Duration::from_secs(DEFAULT_FASTCGI_APP_IDLE_TIMEOUT_SECS),
         }),
     })
 }
@@ -590,15 +625,30 @@ pub(crate) fn validate_env_key(key: &str) -> Result<(), String> {
 pub const DEFAULT_WORKER_THREADS: usize = 2;
 pub const MAX_THREADS: usize = 1024;
 pub const MAX_FASTCGI_APP_WORKERS: usize = 256;
+pub const DEFAULT_FASTCGI_APP_IDLE_TIMEOUT_SECS: u64 = 60;
+pub const MAX_FASTCGI_APP_IDLE_TIMEOUT_SECS: u64 = 86_400;
 
-pub fn parse_fastcgi_app_workers(value: &str) -> Result<usize, String> {
+pub fn parse_fastcgi_app_max_workers(value: &str) -> Result<usize, String> {
     value
         .parse::<usize>()
         .ok()
         .filter(|workers| (1..=MAX_FASTCGI_APP_WORKERS).contains(workers))
         .ok_or_else(|| {
             format!(
-                "invalid FastCGI app worker count: {value}; expected 1-{MAX_FASTCGI_APP_WORKERS}"
+                "invalid FastCGI app max worker count: {value}; expected 1-{MAX_FASTCGI_APP_WORKERS}"
+            )
+        })
+}
+
+pub fn parse_fastcgi_app_idle_timeout(value: &str) -> Result<Duration, String> {
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|seconds| (1..=MAX_FASTCGI_APP_IDLE_TIMEOUT_SECS).contains(seconds))
+        .map(Duration::from_secs)
+        .ok_or_else(|| {
+            format!(
+                "invalid FastCGI app idle timeout: {value}; expected 1-{MAX_FASTCGI_APP_IDLE_TIMEOUT_SECS} seconds"
             )
         })
 }
@@ -618,8 +668,11 @@ fn next_value(args: &mut impl Iterator<Item = String>, option: &str) -> Result<S
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, FastCgiAddress, ParseResult, validate_try_files};
-    use std::path::PathBuf;
+    use super::{
+        Config, DEFAULT_FASTCGI_APP_IDLE_TIMEOUT_SECS, FastCgiAddress, ParseResult,
+        validate_try_files,
+    };
+    use std::{path::PathBuf, time::Duration};
 
     #[test]
     fn parses_options() {
@@ -722,14 +775,16 @@ mod tests {
     }
 
     #[test]
-    fn parses_fastcgi_app_and_preserves_args_workers_and_environment() {
+    fn parses_fastcgi_app_and_preserves_args_pool_options_and_environment() {
         let parsed = Config::parse([
             "--fastcgi-app-arg".to_owned(),
             "PHP=--foreground".to_owned(),
             "--fastcgi-app-env".to_owned(),
             "php=APP_MODE=production".to_owned(),
-            "--fastcgi-app-workers".to_owned(),
+            "--fastcgi-app-max-workers".to_owned(),
             "php=4".to_owned(),
+            "--fastcgi-app-idle-timeout".to_owned(),
+            "php=12".to_owned(),
             "--fastcgi-app".to_owned(),
             "php=/usr/bin/php8.4-cgi".to_owned(),
             "--fastcgi-app-arg".to_owned(),
@@ -746,7 +801,8 @@ mod tests {
         };
         assert_eq!(app.program, PathBuf::from("/usr/bin/php8.4-cgi"));
         assert_eq!(app.args, ["--foreground", "--bind"]);
-        assert_eq!(app.workers, 4);
+        assert_eq!(app.max_workers, 4);
+        assert_eq!(app.idle_timeout, Duration::from_secs(12));
         assert_eq!(
             app.env.get("APP_MODE").map(String::as_str),
             Some("production")
@@ -762,7 +818,29 @@ mod tests {
         let FastCgiAddress::Spawn(app) = &config.fastcgi[0].address else {
             panic!("expected spawned FastCGI app")
         };
-        assert_eq!(app.workers, 1);
+        assert_eq!(app.max_workers, 1);
+        assert_eq!(
+            app.idle_timeout,
+            Duration::from_secs(DEFAULT_FASTCGI_APP_IDLE_TIMEOUT_SECS)
+        );
+    }
+
+    #[test]
+    fn fastcgi_app_workers_flag_remains_an_alias() {
+        let parsed = Config::parse([
+            "--fastcgi-app".to_owned(),
+            "php=php-cgi".to_owned(),
+            "--fastcgi-app-workers".to_owned(),
+            "php=3".to_owned(),
+        ])
+        .unwrap();
+        let ParseResult::Config(config) = parsed else {
+            panic!("expected config")
+        };
+        let FastCgiAddress::Spawn(app) = &config.fastcgi[0].address else {
+            panic!("expected spawned FastCGI app")
+        };
+        assert_eq!(app.max_workers, 3);
     }
 
     #[test]
@@ -782,7 +860,7 @@ mod tests {
         for value in ["php=0", "php=nope", "php=257", "php"] {
             assert!(
                 Config::parse([
-                    "--fastcgi-app-workers".to_owned(),
+                    "--fastcgi-app-max-workers".to_owned(),
                     value.to_owned(),
                     "--fastcgi-app".to_owned(),
                     "php=php-cgi".to_owned(),
@@ -791,17 +869,45 @@ mod tests {
                 "{value}"
             );
         }
-        assert!(Config::parse(["--fastcgi-app-workers".to_owned(), "php=2".to_owned(),]).is_err());
+        assert!(
+            Config::parse(["--fastcgi-app-max-workers".to_owned(), "php=2".to_owned(),]).is_err()
+        );
         assert!(
             Config::parse([
                 "--fastcgi-app".to_owned(),
                 "php=php-cgi".to_owned(),
-                "--fastcgi-app-workers".to_owned(),
+                "--fastcgi-app-max-workers".to_owned(),
                 "php=2".to_owned(),
                 "--fastcgi-app-workers".to_owned(),
                 ".PHP=3".to_owned(),
             ])
             .is_err()
+        );
+        for value in ["php=0", "php=nope", "php=86401", "php"] {
+            assert!(
+                Config::parse([
+                    "--fastcgi-app-idle-timeout".to_owned(),
+                    value.to_owned(),
+                    "--fastcgi-app".to_owned(),
+                    "php=php-cgi".to_owned(),
+                ])
+                .is_err(),
+                "{value}"
+            );
+        }
+        assert!(
+            Config::parse([
+                "--fastcgi-app".to_owned(),
+                "php=php-cgi".to_owned(),
+                "--fastcgi-app-idle-timeout".to_owned(),
+                "php=1".to_owned(),
+                "--fastcgi-app-idle-timeout".to_owned(),
+                ".PHP=2".to_owned(),
+            ])
+            .is_err()
+        );
+        assert!(
+            Config::parse(["--fastcgi-app-idle-timeout".to_owned(), "php=10".to_owned(),]).is_err()
         );
         assert!(
             Config::parse([

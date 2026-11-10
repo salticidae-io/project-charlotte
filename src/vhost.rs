@@ -30,7 +30,7 @@ use tokio::{io::AsyncReadExt, net::UnixStream, sync::Mutex, time::timeout};
 
 use crate::{
     acme::AcmeManager,
-    config::{Config, FastCgiAddress, FastCgiBackend, TlsFiles},
+    config::{Config, FastCgiAddress, FastCgiApp, FastCgiBackend, TlsFiles},
     handler::{self, ResponseBody},
     waf::{RuleIdSpec, Waf},
 };
@@ -104,8 +104,9 @@ struct FastCgiAppFile {
     command: Vec<String>,
     #[serde(default)]
     env: BTreeMap<String, String>,
-    #[serde(default)]
-    workers: Option<usize>,
+    #[serde(default, alias = "workers")]
+    max_workers: Option<usize>,
+    idle_timeout: Option<u64>,
 }
 
 struct Vhost {
@@ -444,8 +445,19 @@ impl Router {
                 if app_file.command.iter().any(|part| part.contains('\0')) {
                     return Err("vhost FastCGI app command cannot contain NUL".into());
                 }
-                let workers = app_file.workers.unwrap_or(1);
-                crate::config::parse_fastcgi_app_workers(&workers.to_string())
+                let max_workers = app_file.max_workers.unwrap_or(1);
+                crate::config::parse_fastcgi_app_max_workers(&max_workers.to_string())
+                    .map_err(|error| format!("vhost FastCGI app .{extension}: {error}"))?;
+                let idle_timeout = app_file
+                    .idle_timeout
+                    .map_or(
+                        Ok(Duration::from_secs(
+                            crate::config::DEFAULT_FASTCGI_APP_IDLE_TIMEOUT_SECS,
+                        )),
+                        |seconds| {
+                            crate::config::parse_fastcgi_app_idle_timeout(&seconds.to_string())
+                        },
+                    )
                     .map_err(|error| format!("vhost FastCGI app .{extension}: {error}"))?;
                 for (key, value) in &app_file.env {
                     crate::config::validate_env_key(key)?;
@@ -458,7 +470,8 @@ impl Router {
                 if let FastCgiAddress::Spawn(app) = &mut backend.address {
                     app.args = app_file.command.into_iter().skip(1).collect();
                     app.env = app_file.env;
-                    app.workers = workers;
+                    app.max_workers = max_workers;
+                    app.idle_timeout = idle_timeout;
                 }
                 fastcgi.push(backend);
             }
@@ -1006,8 +1019,19 @@ fn validate_vhost_declarations(entries: &[VhostFile]) -> Result<(), Box<dyn Erro
                 .map_err(|error| format!("vhost {} worker_threads: {error}", index + 1))?;
         }
         for app in &entry.fastcgi_app {
-            if let Some(workers) = app.workers {
-                crate::config::parse_fastcgi_app_workers(&workers.to_string()).map_err(
+            if let Some(max_workers) = app.max_workers {
+                crate::config::parse_fastcgi_app_max_workers(&max_workers.to_string()).map_err(
+                    |error| {
+                        format!(
+                            "vhost {} FastCGI app .{}: {error}",
+                            index + 1,
+                            app.extension
+                        )
+                    },
+                )?;
+            }
+            if let Some(idle_timeout) = app.idle_timeout {
+                crate::config::parse_fastcgi_app_idle_timeout(&idle_timeout.to_string()).map_err(
                     |error| {
                         format!(
                             "vhost {} FastCGI app .{}: {error}",
@@ -1194,23 +1218,24 @@ fn build_worker_args(worker: WorkerArgs<'_>) -> Vec<OsString> {
         args.push(entry.clone().into());
     }
     for backend in fastcgi {
-        match &backend.address {
-            FastCgiAddress::Spawn(app) => {
-                args.push("--fastcgi-app".into());
-                args.push(format!("{}={}", backend.extension, app.program.display()).into());
-                for arg in &app.args {
-                    args.push("--fastcgi-app-arg".into());
-                    args.push(format!("{}={arg}", backend.extension).into());
-                }
-                if app.workers != 1 {
-                    args.push("--fastcgi-app-workers".into());
-                    args.push(format!("{}={}", backend.extension, app.workers).into());
-                }
+        if let Some(app) = spawned_app(backend) {
+            args.push("--fastcgi-app".into());
+            args.push(format!("{}={}", backend.extension, app.program.display()).into());
+            for arg in &app.args {
+                args.push("--fastcgi-app-arg".into());
+                args.push(format!("{}={arg}", backend.extension).into());
             }
-            _ => {
-                args.push("--fastcgi".into());
-                args.push(format_backend(backend).into());
+            if app.max_workers != 1 {
+                args.push("--fastcgi-app-max-workers".into());
+                args.push(format!("{}={}", backend.extension, app.max_workers).into());
             }
+            if app.idle_timeout.as_secs() != crate::config::DEFAULT_FASTCGI_APP_IDLE_TIMEOUT_SECS {
+                args.push("--fastcgi-app-idle-timeout".into());
+                args.push(format!("{}={}", backend.extension, app.idle_timeout.as_secs()).into());
+            }
+        } else {
+            args.push("--fastcgi".into());
+            args.push(format_backend(backend).into());
         }
     }
     args
@@ -1223,10 +1248,7 @@ fn build_worker_args(worker: WorkerArgs<'_>) -> Vec<OsString> {
 fn worker_app_env(fastcgi: &[FastCgiBackend]) -> Option<String> {
     let entries = fastcgi
         .iter()
-        .filter_map(|backend| match &backend.address {
-            FastCgiAddress::Spawn(app) => Some((&backend.extension, app)),
-            _ => None,
-        })
+        .filter_map(|backend| spawned_app(backend).map(|app| (&backend.extension, app)))
         .flat_map(|(extension, app)| {
             app.env
                 .iter()
@@ -1239,6 +1261,14 @@ fn worker_app_env(fastcgi: &[FastCgiBackend]) -> Option<String> {
     Some(serde_json::to_string(&entries).expect("strings serialize to JSON"))
 }
 
+fn spawned_app(backend: &FastCgiBackend) -> Option<&FastCgiApp> {
+    match &backend.address {
+        FastCgiAddress::Spawn(app) => Some(app),
+        FastCgiAddress::Pool(pool) => Some(pool.app()),
+        FastCgiAddress::Tcp(_) | FastCgiAddress::Unix(_) => None,
+    }
+}
+
 /// Variables a worker keeps from the server's environment. Everything else,
 /// including whatever credentials the server was started with, is withheld.
 const WORKER_INHERITED_ENV: [&str; 5] = ["PATH", "TMPDIR", "LD_LIBRARY_PATH", "LANG", "TZ"];
@@ -1248,6 +1278,9 @@ fn format_backend(backend: &FastCgiBackend) -> String {
         FastCgiAddress::Tcp(address) => format!("{}={address}", backend.extension),
         FastCgiAddress::Unix(path) => format!("{}=unix:{}", backend.extension, path.display()),
         FastCgiAddress::Spawn(app) => format!("{}={}", backend.extension, app.program.display()),
+        FastCgiAddress::Pool(pool) => {
+            format!("{}={}", backend.extension, pool.app().program.display())
+        }
     }
 }
 
@@ -1439,12 +1472,14 @@ mod tests {
                 extension = "php"
                 command = ["php8.4-cgi", "--foreground"]
                 env = { APP_MODE = "test" }
-                workers = 4
+                max_workers = 4
+                idle_timeout = 12
             "#,
         )
         .unwrap();
         assert_eq!(parsed.vhost[0].fastcgi_app[0].extension, "php");
-        assert_eq!(parsed.vhost[0].fastcgi_app[0].workers, Some(4));
+        assert_eq!(parsed.vhost[0].fastcgi_app[0].max_workers, Some(4));
+        assert_eq!(parsed.vhost[0].fastcgi_app[0].idle_timeout, Some(12));
         assert!(validate_vhost_declarations(&parsed.vhost).is_ok());
         assert_eq!(
             parsed.vhost[0].fastcgi_app[0].command,
@@ -1459,8 +1494,27 @@ mod tests {
         );
 
         let mut invalid = parsed.vhost[0].clone();
-        invalid.fastcgi_app[0].workers = Some(0);
+        invalid.fastcgi_app[0].max_workers = Some(0);
         assert!(validate_vhost_declarations(&[invalid]).is_err());
+        let mut invalid = parsed.vhost[0].clone();
+        invalid.fastcgi_app[0].idle_timeout = Some(0);
+        assert!(validate_vhost_declarations(&[invalid]).is_err());
+
+        let legacy: FileConfig = toml::from_str(
+            r#"
+                [[vhost]]
+                server_names = ["legacy.example"]
+                root = "/srv/legacy"
+                user = "legacy"
+
+                [[vhost.fastcgi_app]]
+                extension = "php"
+                command = ["php-cgi"]
+                workers = 3
+            "#,
+        )
+        .unwrap();
+        assert_eq!(legacy.vhost[0].fastcgi_app[0].max_workers, Some(3));
     }
 
     #[test]
@@ -1524,7 +1578,8 @@ mod tests {
                     program: "/usr/bin/php8.4-cgi".into(),
                     args: vec!["--foreground".to_owned()],
                     env: BTreeMap::from([("APP_MODE".to_owned(), "worker".to_owned())]),
-                    workers: 4,
+                    max_workers: 4,
+                    idle_timeout: Duration::from_secs(12),
                 }),
             },
         ];
@@ -1560,7 +1615,11 @@ mod tests {
         );
         assert!(
             args.windows(2)
-                .any(|pair| { pair == ["--fastcgi-app-workers", "cgi=4"] })
+                .any(|pair| { pair == ["--fastcgi-app-max-workers", "cgi=4"] })
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| { pair == ["--fastcgi-app-idle-timeout", "cgi=12"] })
         );
         // App environment may hold credentials, so it must stay off the
         // command line, which every local user can read.

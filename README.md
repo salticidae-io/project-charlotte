@@ -75,14 +75,18 @@ see all command-line options. Common options include:
 | `--http3-bind ADDRESS` | Enable the HTTP/3 listener; TLS configuration is required. |
 | `--fastcgi EXT=ADDR` | Route a file extension to a FastCGI TCP or Unix-socket backend. |
 | `--fastcgi-app EXT=PROGRAM` | Start and supervise a FastCGI application for an extension. |
-| `--fastcgi-app-workers EXT=N` | Run 1–256 supervised processes for a spawned FastCGI app; defaults to one. |
+| `--fastcgi-app-max-workers EXT=N` | Set the on-demand FastCGI app pool limit (1–256); defaults to one. |
+| `--fastcgi-app-idle-timeout EXT=SECS` | Reap surplus idle app workers after 1–86,400 seconds; defaults to 60 seconds. |
 | `--modsecurity-rules FILE` | Load ModSecurity rules; can be repeated to load multiple files. |
 | `--acme-directory URL --acme-cache DIR` | Configure ACME certificate provisioning and its cache. |
 
-Server-managed FastCGI apps restart immediately after a clean exit if they ran
-for at least 50 ms; failed or very short-lived processes are delayed to avoid a
-rapid restart loop. Increase `--fastcgi-app-workers` when the application should
-handle concurrent requests.
+Server-managed FastCGI apps start with one worker and spawn additional workers
+only when concurrent requests need them, up to `--fastcgi-app-max-workers`.
+Surplus idle workers are reaped after `--fastcgi-app-idle-timeout`, while one
+worker stays ready. The old `--fastcgi-app-workers` option remains as a
+deprecated alias for `--fastcgi-app-max-workers`. Workers restart immediately
+after a clean exit if they ran for at least 50 ms; failed or very short-lived
+processes are delayed to avoid a rapid restart loop.
 
 The master normally keeps the identity of the account that starts it. To start
 as root and run the master as an unprivileged account, use `--user` and

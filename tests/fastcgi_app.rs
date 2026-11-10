@@ -291,7 +291,7 @@ async fn spreads_concurrent_requests_across_cli_workers() {
         None,
         None,
         &["CHARLOTTE_FCGI_DELAY_MS=300"],
-        &["--fastcgi-app-workers", "php=3"],
+        &["--fastcgi-app-max-workers", "php=3"],
     )
     .await;
     let (first, second, third) = tokio::join!(
@@ -329,7 +329,187 @@ async fn spreads_concurrent_requests_across_cli_workers() {
     assert_eq!(
         pids.len(),
         3,
-        "requests should reach all configured workers"
+        "requests should reach all workers spawned for the concurrent burst"
+    );
+}
+
+#[tokio::test]
+async fn sequential_requests_reuse_one_on_demand_worker() {
+    let fixture = Fixture::start_with(
+        new_root(),
+        None,
+        None,
+        &[],
+        &["--fastcgi-app-max-workers", "php=3"],
+    )
+    .await;
+    let mut pids = HashSet::new();
+    for index in 1..=4 {
+        let response = request(
+            fixture.address,
+            "localhost",
+            "GET",
+            &format!("/echo.php?request={index}"),
+            &[],
+            b"",
+        )
+        .await;
+        assert_eq!(response.status, 200);
+        let body = String::from_utf8(response.body).unwrap();
+        pids.insert(field(&body, "pid").to_owned());
+    }
+    assert_eq!(
+        pids.len(),
+        1,
+        "sequential traffic should reuse an idle worker"
+    );
+}
+
+#[tokio::test]
+async fn reaps_extra_workers_after_the_pool_becomes_idle() {
+    let fixture = Fixture::start_with(
+        new_root(),
+        None,
+        None,
+        &["CHARLOTTE_FCGI_DELAY_MS=300"],
+        &[
+            "--fastcgi-app-max-workers",
+            "php=3",
+            "--fastcgi-app-idle-timeout",
+            "php=1",
+        ],
+    )
+    .await;
+    let (first, second, third) = tokio::join!(
+        request(
+            fixture.address,
+            "localhost",
+            "GET",
+            "/echo.php?burst=1",
+            &[],
+            b""
+        ),
+        request(
+            fixture.address,
+            "localhost",
+            "GET",
+            "/echo.php?burst=2",
+            &[],
+            b""
+        ),
+        request(
+            fixture.address,
+            "localhost",
+            "GET",
+            "/echo.php?burst=3",
+            &[],
+            b""
+        ),
+    );
+    let pids = [first, second, third]
+        .into_iter()
+        .map(|response| {
+            assert_eq!(response.status, 200);
+            let body = String::from_utf8(response.body).unwrap();
+            field(&body, "pid").parse::<u32>().unwrap()
+        })
+        .collect::<HashSet<_>>();
+    assert_eq!(pids.len(), 3, "the burst should spawn three workers");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let remaining = pids
+            .iter()
+            .filter(|pid| std::path::Path::new("/proc").join(pid.to_string()).exists())
+            .count();
+        if remaining == 1 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "expected idle workers to be reaped, but {remaining} of 3 remain"
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[tokio::test]
+async fn scales_pool_within_max_workers_and_back_up_after_reaping() {
+    let fixture = Fixture::start_with(
+        new_root(),
+        None,
+        None,
+        &["CHARLOTTE_FCGI_DELAY_MS=300"],
+        &[
+            "--fastcgi-app-max-workers",
+            "php=2",
+            "--fastcgi-app-idle-timeout",
+            "php=1",
+        ],
+    )
+    .await;
+
+    let started = tokio::time::Instant::now();
+    let mut requests = tokio::task::JoinSet::new();
+    for index in 1..=5 {
+        let address = fixture.address;
+        requests.spawn(async move {
+            let path = format!("/echo.php?burst=1-{index}");
+            request(address, "localhost", "GET", &path, &[], b"").await
+        });
+    }
+    let mut first_pids = HashSet::new();
+    while let Some(response) = requests.join_next().await {
+        first_pids.insert(response_pid(response.unwrap()));
+    }
+    assert_eq!(first_pids.len(), 2, "pool must not exceed max_workers");
+    assert!(
+        started.elapsed() >= Duration::from_millis(800),
+        "five delayed requests on two workers should queue in three rounds"
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let survivor = loop {
+        let alive = first_pids
+            .iter()
+            .copied()
+            .filter(|pid| std::path::Path::new("/proc").join(pid.to_string()).exists())
+            .collect::<Vec<_>>();
+        if alive.len() == 1 {
+            break alive[0];
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "expected idle pool to shrink to one worker, but {} of 2 remain",
+            alive.len()
+        );
+        sleep(Duration::from_millis(100)).await;
+    };
+
+    let mut requests = tokio::task::JoinSet::new();
+    for index in 1..=2 {
+        let address = fixture.address;
+        requests.spawn(async move {
+            let path = format!("/echo.php?burst=2-{index}");
+            request(address, "localhost", "GET", &path, &[], b"").await
+        });
+    }
+    let mut second_pids = HashSet::new();
+    while let Some(response) = requests.join_next().await {
+        second_pids.insert(response_pid(response.unwrap()));
+    }
+    assert_eq!(
+        second_pids.len(),
+        2,
+        "second burst should scale up to two workers"
+    );
+    assert!(
+        second_pids.contains(&survivor),
+        "the worker retained after reaping should be reused"
+    );
+    assert!(
+        second_pids.iter().any(|pid| !first_pids.contains(pid)),
+        "the second burst should spawn a replacement worker"
     );
 }
 
@@ -340,7 +520,7 @@ async fn restarts_each_cli_worker_independently() {
         None,
         Some(1),
         &[],
-        &["--fastcgi-app-workers", "php=2"],
+        &["--fastcgi-app-max-workers", "php=2"],
     )
     .await;
     let mut pids = HashSet::new();
@@ -368,7 +548,7 @@ async fn immediately_restarts_cleanly_exited_cli_app() {
         None,
         Some(1),
         &["CHARLOTTE_FCGI_DELAY_MS=100"],
-        &["--fastcgi-app-workers", "php=1"],
+        &["--fastcgi-app-max-workers", "php=1"],
     )
     .await;
     let started = tokio::time::Instant::now();
@@ -436,7 +616,7 @@ async fn starts_vhost_application_inside_privileged_worker_identity() {
     let command = std::env::current_exe().unwrap();
     let user = User::from_uid(geteuid()).unwrap().unwrap().name;
     let config = format!(
-        "[[vhost]]\nserver_names = [\"app.test\"]\nroot = {:?}\nuser = {:?}\n\n[[vhost.fastcgi_app]]\nextension = \"php\"\ncommand = [{:?}, \"--exact\", \"fcgi_app_helper\", \"--nocapture\"]\nenv = {{ CHARLOTTE_FCGI_HELPER = \"1\", APP_MODE = \"vhost\", CHARLOTTE_FCGI_DELAY_MS = \"200\" }}\nworkers = 3\n",
+        "[[vhost]]\nserver_names = [\"app.test\"]\nroot = {:?}\nuser = {:?}\n\n[[vhost.fastcgi_app]]\nextension = \"php\"\ncommand = [{:?}, \"--exact\", \"fcgi_app_helper\", \"--nocapture\"]\nenv = {{ CHARLOTTE_FCGI_HELPER = \"1\", APP_MODE = \"vhost\", CHARLOTTE_FCGI_DELAY_MS = \"200\" }}\nmax_workers = 3\n",
         site.to_string_lossy(),
         user,
         command.to_string_lossy()
@@ -664,4 +844,10 @@ fn field<'a>(body: &'a str, name: &str) -> &'a str {
     body.lines()
         .find_map(|line| line.strip_prefix(&format!("{name}=")))
         .unwrap_or("<missing>")
+}
+
+fn response_pid(response: HttpResponse) -> u32 {
+    assert_eq!(response.status, 200);
+    let body = String::from_utf8(response.body).unwrap();
+    field(&body, "pid").parse().unwrap()
 }

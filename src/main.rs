@@ -197,6 +197,7 @@ async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> 
             FastCgiAddress::Tcp(address) => address.clone(),
             FastCgiAddress::Unix(path) => format!("unix:{}", path.display()),
             FastCgiAddress::Spawn(app) => format!("spawn:{}", app.program.display()),
+            FastCgiAddress::Pool(pool) => format!("spawn:{}", pool.app().program.display()),
         };
         eprintln!("FastCGI .{} -> {address}", backend.extension);
     }

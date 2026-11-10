@@ -12,7 +12,7 @@ use fastcgi_client::{Client, Params, Request as FastCgiRequest, response::Conten
 use futures_util::{Stream, StreamExt, stream};
 use http::{HeaderMap, HeaderName, HeaderValue, Response, StatusCode, header, request::Parts};
 use http_body::{Body, Frame};
-use http_body_util::{BodyExt, Limited, StreamBody};
+use http_body_util::{BodyExt, BodyStream, Limited, StreamBody};
 use tokio::{
     io::{AsyncRead, AsyncWrite, BufWriter},
     net::TcpStream,
@@ -254,6 +254,15 @@ where
                     Err("Unix FastCGI sockets are not supported on this platform".to_owned())
                 }
             }
+            FastCgiAddress::Pool(pool) => {
+                let lease = pool.acquire().await.map_err(|error| error.to_string())?;
+                let stream = tokio::net::UnixStream::connect(lease.socket_path())
+                    .await
+                    .map_err(|error| error.to_string())?;
+                execute(stream, params, request_body, timeout)
+                    .await
+                    .map(|response| hold_worker_lease(response, lease))
+            }
             FastCgiAddress::Spawn(app) => Err(format!(
                 "FastCGI app {} was not started",
                 app.program.display()
@@ -271,6 +280,26 @@ where
             handler::error_response(StatusCode::GATEWAY_TIMEOUT, "FastCGI backend timed out\n")
         }
     }
+}
+
+fn hold_worker_lease(
+    response: Response<ResponseBody>,
+    lease: crate::fastcgi_app::WorkerLease,
+) -> Response<ResponseBody> {
+    let (parts, body) = response.into_parts();
+    let stream = stream::unfold(
+        (BodyStream::new(body), Some(lease)),
+        |(mut body, lease)| async move {
+            match body.next().await {
+                Some(frame) => Some((frame, (body, lease))),
+                None => {
+                    drop(lease);
+                    None
+                }
+            }
+        },
+    );
+    Response::from_parts(parts, StreamBody::new(stream).boxed_unsync())
 }
 
 fn build_params(

@@ -70,6 +70,20 @@ Workers can run under configured UID/GID credentials. The master asks workers
 to terminate cleanly and uses a bounded wait before forcibly stopping one, so
 worker-managed FastCGI applications can clean up as well.
 
+## FastCGI application pools
+
+Each server-managed FastCGI app starts with one supervised process. Requests
+lease an idle process; if all existing processes are busy, the pool starts
+another up to `max_workers` (1–256, default 1). Each process has its own Unix
+listening socket in a private per-app directory. When the pool is idle, extra
+processes are reaped after `idle_timeout` seconds (1–86,400, default 60), while
+one process remains available. The CLI options are
+`--fastcgi-app-max-workers EXT=N` and
+`--fastcgi-app-idle-timeout EXT=SECS`; virtual-host TOML uses `max_workers` and
+`idle_timeout` (the older `workers` TOML field and
+`--fastcgi-app-workers` option remain aliases for `max_workers`). Each process
+is supervised and restarted independently.
+
 ## TLS, SNI, and ACME
 
 `tls` builds Rustls server configurations and resolves certificates by SNI.
