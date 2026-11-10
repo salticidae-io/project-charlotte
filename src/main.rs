@@ -8,6 +8,7 @@ mod handler;
 mod http3;
 mod httpdate;
 mod mime;
+mod privileges;
 mod reload;
 mod tls;
 mod vhost;
@@ -113,6 +114,7 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             .build()?;
         return runtime.block_on(worker::run(config));
     }
+    privileges::drop_master(&config)?;
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     if let Some(threads) = config.threads {
         builder.worker_threads(threads);

@@ -43,6 +43,8 @@ pub struct Config {
     pub worker: bool,
     pub worker_uid: Option<u32>,
     pub worker_gid: Option<u32>,
+    pub master_user: Option<String>,
+    pub master_group: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -95,12 +97,28 @@ impl Config {
         let mut worker = false;
         let mut worker_uid = None;
         let mut worker_gid = None;
+        let mut master_user = None;
+        let mut master_group = None;
         let mut args = args.into_iter();
 
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--help" | "-h" => return Ok(ParseResult::Help),
                 "--worker" => worker = true,
+                "--user" => {
+                    let value = next_value(&mut args, "--user")?;
+                    if value.is_empty() {
+                        return Err("--user requires a non-empty user name".to_owned());
+                    }
+                    master_user = Some(value);
+                }
+                "--group" => {
+                    let value = next_value(&mut args, "--group")?;
+                    if value.is_empty() {
+                        return Err("--group requires a non-empty group name".to_owned());
+                    }
+                    master_group = Some(value);
+                }
                 "--no-listing" => listing = false,
                 "--try-files" => try_files.push(next_value(&mut args, "--try-files")?),
                 "--fastcgi" => {
@@ -319,6 +337,12 @@ impl Config {
             (None, None) => None,
         };
 
+        if master_group.is_some() && master_user.is_none() {
+            return Err("--group requires --user".to_owned());
+        }
+        if worker && (master_user.is_some() || master_group.is_some()) {
+            return Err("--user and --group cannot be used with --worker".to_owned());
+        }
         if worker_uid.is_some() != worker_gid.is_some() {
             return Err("--worker-uid and --worker-gid must be supplied together".to_owned());
         }
@@ -351,6 +375,8 @@ impl Config {
             worker,
             worker_uid,
             worker_gid,
+            master_user,
+            master_group,
         })))
     }
 
@@ -371,7 +397,7 @@ impl Config {
     }
 
     pub fn usage() -> &'static str {
-        "Usage: project-charlotte [--bind ADDRESS] [--tls-bind ADDRESS] [--root DIRECTORY] [--index NAME] [--no-listing] [--try-files ENTRY]... [--fastcgi EXT=ADDR]... [--fastcgi-app EXT=PROGRAM]... [--fastcgi-app-arg EXT=ARG]... [--fastcgi-app-env EXT=KEY=VALUE]... [--fastcgi-timeout SECS] [--threads N] [--worker-threads N] [--modsecurity-rules FILE]... [--modsecurity-body-limit BYTES] [--config FILE] [--vhost-dir DIRECTORY] [--tls-cert PATH --tls-key PATH] [--acme-directory URL|letsencrypt|letsencrypt-staging --acme-cache DIR] [--acme-contact URI]... [--acme-ca-root PEM] [--http3-bind ADDRESS] [--help]"
+        "Usage: project-charlotte [--user USER [--group GROUP]] [--bind ADDRESS] [--tls-bind ADDRESS] [--root DIRECTORY] [--index NAME] [--no-listing] [--try-files ENTRY]... [--fastcgi EXT=ADDR]... [--fastcgi-app EXT=PROGRAM]... [--fastcgi-app-arg EXT=ARG]... [--fastcgi-app-env EXT=KEY=VALUE]... [--fastcgi-timeout SECS] [--threads N] [--worker-threads N] [--modsecurity-rules FILE]... [--modsecurity-body-limit BYTES] [--config FILE] [--vhost-dir DIRECTORY] [--tls-cert PATH --tls-key PATH] [--acme-directory URL|letsencrypt|letsencrypt-staging --acme-cache DIR] [--acme-contact URI]... [--acme-ca-root PEM] [--http3-bind ADDRESS] [--help]"
     }
 }
 
@@ -901,6 +927,41 @@ mod tests {
     fn rejects_worker_identity_without_worker_mode() {
         assert!(
             Config::parse([
+                "--worker-uid".to_owned(),
+                "1000".to_owned(),
+                "--worker-gid".to_owned(),
+                "1000".to_owned(),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn parses_master_identity_options() {
+        let parsed = Config::parse([
+            "--user".to_owned(),
+            "charlotte".to_owned(),
+            "--group".to_owned(),
+            "www-data".to_owned(),
+        ])
+        .unwrap();
+        let ParseResult::Config(config) = parsed else {
+            panic!("expected config")
+        };
+        assert_eq!(config.master_user.as_deref(), Some("charlotte"));
+        assert_eq!(config.master_group.as_deref(), Some("www-data"));
+    }
+
+    #[test]
+    fn rejects_invalid_master_identity_options() {
+        assert!(Config::parse(["--group".to_owned(), "www-data".to_owned()]).is_err());
+        assert!(Config::parse(["--user".to_owned(), "".to_owned()]).is_err());
+        assert!(Config::parse(["--group".to_owned(), "".to_owned()]).is_err());
+        assert!(
+            Config::parse([
+                "--user".to_owned(),
+                "charlotte".to_owned(),
+                "--worker".to_owned(),
                 "--worker-uid".to_owned(),
                 "1000".to_owned(),
                 "--worker-gid".to_owned(),

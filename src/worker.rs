@@ -15,7 +15,7 @@ use tokio::{
     signal::unix::{SignalKind, signal},
 };
 
-use crate::{config::Config, fastcgi_app, handler, vhost::TlsSni};
+use crate::{config::Config, fastcgi_app, handler, privileges, vhost::TlsSni};
 
 pub(crate) fn drop_privileges(config: &Config) -> Result<(), Box<dyn Error + Send + Sync>> {
     let uid = Uid::from_raw(config.worker_uid.ok_or("worker uid is missing")?);
@@ -31,6 +31,7 @@ pub(crate) fn drop_privileges(config: &Config) -> Result<(), Box<dyn Error + Sen
         // user's groups is safe only when the worker keeps that same identity.
         eprintln!("virtual host worker retains the server user's supplementary groups");
     }
+    privileges::clear_all()?;
     Ok(())
 }
 

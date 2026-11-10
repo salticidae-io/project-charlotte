@@ -65,6 +65,7 @@ see all command-line options. Common options include:
 | --- | --- |
 | `--bind ADDRESS` | Plain HTTP listener; defaults to `127.0.0.1:8080`. |
 | `--root DIRECTORY` | Fallback document root when no virtual host handles a request; defaults to `.`. |
+| `--user USER [--group GROUP]` | Drop the master process to this account before starting; requires root. |
 | `--index NAME` | Fallback index file name; defaults to `index.html`. |
 | `--no-listing` | Disable directory listings, which are enabled by default. |
 | `--try-files ENTRY` | Add a candidate or fallback rule; may be specified more than once. |
@@ -76,6 +77,24 @@ see all command-line options. Common options include:
 | `--fastcgi-app EXT=PROGRAM` | Start and supervise a FastCGI application for an extension. |
 | `--modsecurity-rules FILE` | Load ModSecurity rules; can be repeated to load multiple files. |
 | `--acme-directory URL --acme-cache DIR` | Configure ACME certificate provisioning and its cache. |
+
+The master normally keeps the identity of the account that starts it. To start
+as root and run the master as an unprivileged account, use `--user` and
+optionally override its primary group with `--group`. The master clears
+supplementary groups and retains only the capabilities needed to launch
+virtual-host workers as their configured users and groups (plus
+`CAP_NET_BIND_SERVICE` if it had that capability before dropping privileges).
+
+Alternatively, an unprivileged account can run the binary with file
+capabilities:
+
+```sh
+sudo setcap cap_setuid,cap_setgid=ep /path/to/project-charlotte
+```
+
+Add `cap_net_bind_service` to that command if the master must bind privileged
+ports. `CAP_SETUID` is powerful: a compromised master with this capability can
+switch to UID 0. Protect the binary and its configuration accordingly.
 
 Virtual-host configuration is provided as TOML. For example, a basic host
 declaration looks like this:

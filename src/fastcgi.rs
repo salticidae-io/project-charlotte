@@ -618,6 +618,8 @@ mod tests {
             worker: false,
             worker_uid: None,
             worker_gid: None,
+            master_user: None,
+            master_group: None,
         }
     }
 

@@ -4,7 +4,10 @@ use std::{
     ffi::OsString,
     io,
     net::SocketAddr,
-    os::{fd::OwnedFd, unix::net::UnixStream as StdUnixStream},
+    os::{
+        fd::OwnedFd,
+        unix::{net::UnixStream as StdUnixStream, process::CommandExt},
+    },
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{Arc, RwLock},
@@ -696,17 +699,20 @@ impl Worker {
         let (parent, child_socket) = StdUnixStream::pair()?;
         parent.set_nonblocking(true)?;
         let mut command = Command::new(std::env::current_exe()?);
+        if crate::privileges::can_set_ids()? {
+            command.uid(self.uid).gid(self.gid);
+        }
         command
-            .args(build_worker_args(
-                self.uid,
-                self.gid,
-                &self.root,
-                &self.index,
-                self.listing,
-                &self.try_files,
-                &self.fastcgi,
-                self.fastcgi_timeout,
-            ))
+            .args(build_worker_args(WorkerArgs {
+                uid: self.uid,
+                gid: self.gid,
+                root: &self.root,
+                index: &self.index,
+                listing: self.listing,
+                try_files: &self.try_files,
+                fastcgi: &self.fastcgi,
+                timeout: self.fastcgi_timeout,
+            }))
             .arg("--worker-threads")
             .arg(self.threads.to_string())
             .env_clear()
@@ -1125,16 +1131,28 @@ fn resolve_identity(
     Ok((user.uid.as_raw(), gid.as_raw()))
 }
 
-fn build_worker_args(
+struct WorkerArgs<'a> {
     uid: u32,
     gid: u32,
-    root: &Path,
-    index: &str,
+    root: &'a Path,
+    index: &'a str,
     listing: bool,
-    try_files: &[String],
-    fastcgi: &[FastCgiBackend],
+    try_files: &'a [String],
+    fastcgi: &'a [FastCgiBackend],
     timeout: Duration,
-) -> Vec<OsString> {
+}
+
+fn build_worker_args(worker: WorkerArgs<'_>) -> Vec<OsString> {
+    let WorkerArgs {
+        uid,
+        gid,
+        root,
+        index,
+        listing,
+        try_files,
+        fastcgi,
+        timeout,
+    } = worker;
     let mut args = vec![
         "--worker".into(),
         "--worker-uid".into(),
@@ -1223,11 +1241,11 @@ fn version_name(version: Version) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        FileConfig, Router, TlsSni, Vhost, VhostFile, VhostTable, Worker, build_worker_args,
-        ensure_trusted_config, match_score, normalize_host, normalize_server_name, request_host,
-        resolve_identity, scan_vhost_files, select_route, validate_index,
-        validate_vhost_declarations, validate_vhost_waf_declarations, worker_app_env,
-        worker_request,
+        FileConfig, Router, TlsSni, Vhost, VhostFile, VhostTable, Worker, WorkerArgs,
+        build_worker_args, ensure_trusted_config, match_score, normalize_host,
+        normalize_server_name, request_host, resolve_identity, scan_vhost_files, select_route,
+        validate_index, validate_vhost_declarations, validate_vhost_waf_declarations,
+        worker_app_env, worker_request,
     };
     use crate::{
         config::{
@@ -1478,16 +1496,16 @@ mod tests {
                 }),
             },
         ];
-        let args = build_worker_args(
-            1001,
-            1002,
-            Path::new("/srv/example"),
-            "home.php",
-            false,
-            &["$uri".to_owned(), "=404".to_owned()],
-            &backends,
-            Duration::from_secs(12),
-        );
+        let args = build_worker_args(WorkerArgs {
+            uid: 1001,
+            gid: 1002,
+            root: Path::new("/srv/example"),
+            index: "home.php",
+            listing: false,
+            try_files: &["$uri".to_owned(), "=404".to_owned()],
+            fastcgi: &backends,
+            timeout: Duration::from_secs(12),
+        });
         let args = args
             .iter()
             .map(|arg| arg.to_string_lossy().into_owned())
@@ -1863,16 +1881,16 @@ mod tests {
             return;
         }
 
-        let args = build_worker_args(
-            1000,
-            1001,
-            Path::new(&root),
-            &index,
+        let args = build_worker_args(WorkerArgs {
+            uid: 1000,
+            gid: 1001,
+            root: Path::new(&root),
+            index: &index,
             listing,
-            &try_files,
-            &backends,
-            Duration::from_secs(timeout),
-        )
+            try_files: &try_files,
+            fastcgi: &backends,
+            timeout: Duration::from_secs(timeout),
+        })
         .into_iter()
         .map(|arg| arg.into_string().expect("worker arguments are UTF-8"))
         .collect::<Vec<_>>();
