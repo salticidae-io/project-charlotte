@@ -78,6 +78,7 @@ struct VhostFile {
     default: bool,
     #[serde(default)]
     modsecurity_disable_rules: Vec<RuleIdFile>,
+    modsecurity_block_status: Option<u16>,
     acme: Option<bool>,
 }
 
@@ -380,6 +381,12 @@ impl Router {
         let default = file.vhost.iter().position(|entry| entry.default);
 
         for entry in file.vhost {
+            let block_status = entry
+                .modsecurity_block_status
+                .or(fallback.modsecurity_block_status)
+                .map(|status| {
+                    http::StatusCode::from_u16(status).expect("validated ModSecurity block status")
+                });
             let disabled_rules = entry
                 .modsecurity_disable_rules
                 .iter()
@@ -394,6 +401,7 @@ impl Router {
                         .without_rules(&disabled_rules)?,
                 )
             };
+            let vhost_waf = vhost_waf.map(|waf| waf.with_block_status(block_status));
             let mut normalized_names = Vec::with_capacity(entry.server_names.len());
             for name in entry.server_names {
                 let normalized = normalize_server_name(&name)
@@ -1018,6 +1026,11 @@ fn validate_vhost_declarations(entries: &[VhostFile]) -> Result<(), Box<dyn Erro
             crate::config::parse_thread_count(&threads.to_string())
                 .map_err(|error| format!("vhost {} worker_threads: {error}", index + 1))?;
         }
+        if let Some(status) = entry.modsecurity_block_status {
+            crate::config::parse_modsecurity_block_status(&status.to_string()).map_err(
+                |error| format!("vhost {} modsecurity_block_status: {error}", index + 1),
+            )?;
+        }
         for app in &entry.fastcgi_app {
             if let Some(max_workers) = app.max_workers {
                 crate::config::parse_fastcgi_app_max_workers(&max_workers.to_string()).map_err(
@@ -1079,6 +1092,13 @@ fn validate_vhost_waf_declarations(
             .any(|entry| !entry.modsecurity_disable_rules.is_empty())
     {
         return Err("modsecurity_disable_rules requires --modsecurity-rules".into());
+    }
+    if !has_global_waf
+        && entries
+            .iter()
+            .any(|entry| entry.modsecurity_block_status.is_some())
+    {
+        return Err("modsecurity_block_status requires --modsecurity-rules".into());
     }
     Ok(())
 }
@@ -1364,6 +1384,7 @@ mod tests {
             tls_key: None,
             default: is_default,
             modsecurity_disable_rules: Vec::new(),
+            modsecurity_block_status: None,
             acme: None,
         }
     }
@@ -1456,6 +1477,30 @@ mod tests {
                 validate_vhost_declarations(&parsed.vhost).is_err(),
                 "{rule}"
             );
+        }
+    }
+
+    #[test]
+    fn parses_and_validates_modsecurity_block_status() {
+        let parsed: FileConfig = toml::from_str(
+            r#"
+                [[vhost]]
+                server_names = ["example.test"]
+                root = "/tmp/site"
+                user = "example"
+                modsecurity_block_status = 451
+            "#,
+        )
+        .unwrap();
+        assert_eq!(parsed.vhost[0].modsecurity_block_status, Some(451));
+        assert!(validate_vhost_declarations(&parsed.vhost).is_ok());
+        assert!(validate_vhost_waf_declarations(&parsed.vhost, true).is_ok());
+        assert!(validate_vhost_waf_declarations(&parsed.vhost, false).is_err());
+
+        for status in [399, 600] {
+            let mut entry = parsed.vhost[0].clone();
+            entry.modsecurity_block_status = Some(status);
+            assert!(validate_vhost_declarations(&[entry]).is_err());
         }
     }
 

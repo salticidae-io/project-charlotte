@@ -16,7 +16,9 @@
 #
 # The file only describes virtual hosts. Listening sockets, the fallback
 # document root, the fallback TLS certificate and the ModSecurity rule set are
-# command-line options; see `project-charlotte --help`.
+# command-line options; see `project-charlotte --help`. Set the global blocking
+# response status with `--modsecurity-block-status CODE` (400-599); a vhost may
+# override it with `modsecurity_block_status` below.
 #
 # Every virtual host runs in its own worker process, re-executing this binary
 # with `--worker` and dropping privileges to the configured user and group.
@@ -75,6 +77,11 @@ listing = false
 # and inclusive ID ranges can be disabled for this vhost only; the rule-file
 # ruleset remains active for every other host. For example:
 # modsecurity_disable_rules = [100001, "2000-2099"]
+
+# Optional. Requires global ModSecurity rules. Overrides the global
+# --modsecurity-block-status for blocking interventions on this vhost; valid
+# values are 400-599. Redirect interventions retain their configured status.
+# modsecurity_block_status = 451
 
 # Optional. At most one virtual host in the file may set this. It receives
 # every request that matches no other host (and supplies the fallback

@@ -26,6 +26,7 @@ pub(crate) struct Waf {
     rule_files: &'static [PathBuf],
     request_body_limit: usize,
     response_body_limit: usize,
+    block_status: Option<StatusCode>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -88,6 +89,7 @@ impl Waf {
         rule_files: &[PathBuf],
         request_body_limit: usize,
         response_body_limit: usize,
+        block_status: Option<StatusCode>,
     ) -> Result<Self, Box<dyn Error + Send + Sync>> {
         let mut modsecurity = ModSecurity::new()?;
         modsecurity.set_connector_info(CONNECTOR_INFO)?;
@@ -104,7 +106,13 @@ impl Waf {
             rule_files,
             request_body_limit,
             response_body_limit,
+            block_status,
         })
+    }
+
+    pub(crate) fn with_block_status(mut self, block_status: Option<StatusCode>) -> Self {
+        self.block_status = block_status;
+        self
     }
 
     pub(crate) fn without_rules(
@@ -118,6 +126,7 @@ impl Waf {
             rule_files: self.rule_files,
             request_body_limit: self.request_body_limit,
             response_body_limit: self.response_body_limit,
+            block_status: self.block_status,
         })
     }
 
@@ -156,7 +165,7 @@ impl Waf {
             }
         };
         if let Some(intervention) = intervention {
-            return finish_intervention(&mut transaction, intervention).await;
+            return finish_intervention(&mut transaction, intervention, self.block_status).await;
         }
 
         let collecting = Limited::new(body, self.request_body_limit).collect();
@@ -207,7 +216,8 @@ impl Waf {
         })();
         match body_intervention {
             Ok(Some(intervention)) => {
-                return finish_intervention(&mut transaction, intervention).await;
+                return finish_intervention(&mut transaction, intervention, self.block_status)
+                    .await;
             }
             Ok(None) => {}
             Err(error) => {
@@ -245,7 +255,8 @@ impl Waf {
         });
         match phase_result {
             Ok(Some(intervention)) => {
-                return finish_intervention(&mut transaction, intervention).await;
+                return finish_intervention(&mut transaction, intervention, self.block_status)
+                    .await;
             }
             Ok(None) => {}
             Err(error) => {
@@ -267,8 +278,12 @@ impl Waf {
                                 let prefix = data.slice(..available);
                                 match transaction.append_response_body(&prefix) {
                                     Ok(Some(intervention)) => {
-                                        return finish_intervention(&mut transaction, intervention)
-                                            .await;
+                                        return finish_intervention(
+                                            &mut transaction,
+                                            intervention,
+                                            self.block_status,
+                                        )
+                                        .await;
                                     }
                                     Ok(None) => {}
                                     Err(error) => {
@@ -294,7 +309,12 @@ impl Waf {
 
                         match transaction.append_response_body(data) {
                             Ok(Some(intervention)) => {
-                                return finish_intervention(&mut transaction, intervention).await;
+                                return finish_intervention(
+                                    &mut transaction,
+                                    intervention,
+                                    self.block_status,
+                                )
+                                .await;
                             }
                             Ok(None) => {}
                             Err(error) => {
@@ -313,7 +333,12 @@ impl Waf {
                 None => {
                     match transaction.process_response_body() {
                         Ok(Some(intervention)) => {
-                            return finish_intervention(&mut transaction, intervention).await;
+                            return finish_intervention(
+                                &mut transaction,
+                                intervention,
+                                self.block_status,
+                            )
+                            .await;
                         }
                         Ok(None) => {}
                         Err(error) => {
@@ -410,6 +435,7 @@ fn response_protocol(version: Version) -> &'static str {
 async fn finish_intervention(
     transaction: &mut Transaction<'static>,
     intervention: Intervention,
+    block_status: Option<StatusCode>,
 ) -> Response<ResponseBody> {
     eprintln!("ModSecurity intervention: {intervention}");
     pause_for_intervention(&intervention).await;
@@ -421,17 +447,11 @@ async fn finish_intervention(
         );
     }
 
-    let status = if intervention.url.is_some() {
-        StatusCode::from_u16(intervention.status as u16)
-            .ok()
-            .filter(|status| (300..400).contains(&status.as_u16()))
-            .unwrap_or(StatusCode::FOUND)
-    } else {
-        StatusCode::from_u16(intervention.status as u16)
-            .ok()
-            .filter(|status| (400..600).contains(&status.as_u16()))
-            .unwrap_or(StatusCode::FORBIDDEN)
-    };
+    let status = intervention_status(
+        intervention.url.is_some(),
+        intervention.status as u16,
+        block_status,
+    );
     let mut response = handler::error_response(status, "Request blocked by ModSecurity\n");
     if let Some(url) = intervention.url {
         let Ok(value) = HeaderValue::from_str(&url) else {
@@ -443,6 +463,26 @@ async fn finish_intervention(
         response.headers_mut().insert(header::LOCATION, value);
     }
     response
+}
+
+fn intervention_status(
+    redirect: bool,
+    rule_status: u16,
+    block_status: Option<StatusCode>,
+) -> StatusCode {
+    if redirect {
+        StatusCode::from_u16(rule_status)
+            .ok()
+            .filter(|status| (300..400).contains(&status.as_u16()))
+            .unwrap_or(StatusCode::FOUND)
+    } else {
+        block_status.unwrap_or_else(|| {
+            StatusCode::from_u16(rule_status)
+                .ok()
+                .filter(|status| (400..600).contains(&status.as_u16()))
+                .unwrap_or(StatusCode::FORBIDDEN)
+        })
+    }
 }
 
 async fn pause_for_intervention(intervention: &Intervention) {
@@ -598,7 +638,8 @@ mod tests {
         vhost::Router,
     };
 
-    use super::{RuleIdSpec, Waf};
+    use super::{RuleIdSpec, Waf, intervention_status};
+    use http::StatusCode;
 
     /// Request bodies above this size are refused by the fuzz WAF. It is kept
     /// small so that the limit is within reach of fuzzer-sized inputs.
@@ -608,6 +649,36 @@ mod tests {
     const RESPONSE_BODY_LIMIT: usize = 1024 * 1024;
     const _: () = assert!(fuzz_support::LARGE_FILE_LEN > RESPONSE_BODY_LIMIT);
 
+    #[test]
+    fn blocking_status_override_takes_precedence() {
+        assert_eq!(
+            intervention_status(false, 418, Some(StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS)),
+            StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS
+        );
+    }
+
+    #[test]
+    fn blocking_status_uses_rule_status_or_forbidden_fallback() {
+        assert_eq!(
+            intervention_status(false, 418, None),
+            StatusCode::IM_A_TEAPOT
+        );
+        assert_eq!(intervention_status(false, 399, None), StatusCode::FORBIDDEN);
+        assert_eq!(intervention_status(false, 600, None), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn redirect_status_ignores_block_override() {
+        assert_eq!(
+            intervention_status(true, 302, Some(StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS)),
+            StatusCode::FOUND
+        );
+        assert_eq!(
+            intervention_status(true, 403, Some(StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS)),
+            StatusCode::FOUND
+        );
+    }
+
     fn fuzz_waf() -> Waf {
         static WAF: OnceLock<Waf> = OnceLock::new();
         *WAF.get_or_init(|| {
@@ -616,6 +687,7 @@ mod tests {
                 std::slice::from_ref(&fixture.rules),
                 REQUEST_BODY_LIMIT,
                 RESPONSE_BODY_LIMIT,
+                None,
             )
             .expect("fuzz ModSecurity rules load")
         })

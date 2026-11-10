@@ -221,6 +221,7 @@ pub(crate) fn fuzz_config(root: PathBuf) -> Config {
         threads: None,
         worker_threads: 2,
         modsecurity_rules: Vec::new(),
+        modsecurity_block_status: None,
         modsecurity_body_limit: 16 * 1024 * 1024,
         modsecurity_response_body_limit: 1024 * 1024,
         tls: None,

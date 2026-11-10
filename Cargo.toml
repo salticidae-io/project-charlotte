@@ -2,7 +2,7 @@
 name = "project-charlotte"
 version = "0.6.0"
 edition = "2024"
-description = "Asynchronous web server for static sites and virtual-hosted applications"
+description = "Asynchronous web server for static sites and fastcgi dynamic content"
 
 [dependencies]
 bytes = "1"
@@ -35,7 +35,7 @@ rcgen = { version = "0.14.10", features = ["x509-parser"] }
 test-fuzz = "8.1.1"
 
 [package.metadata.deb]
-maintainer = "Fzy Logic <fzylogic@users.noreply.github.com>"
+maintainer = "Jeremy Hanmer <jhanmer@proton.me>"
 copyright = "Copyright 2026, project-charlotte contributors"
 section = "web"
 depends = "$auto"

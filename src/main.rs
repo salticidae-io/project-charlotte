@@ -20,6 +20,7 @@ mod fuzz_support;
 
 use std::{error::Error, net::SocketAddr, sync::Arc, time::Duration};
 
+use http::StatusCode;
 use hyper::{Request, service::service_fn};
 use hyper_util::{
     rt::{TokioExecutor, TokioIo, TokioTimer},
@@ -139,6 +140,9 @@ async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> 
             &config.modsecurity_rules,
             config.modsecurity_body_limit,
             config.modsecurity_response_body_limit,
+            config
+                .modsecurity_block_status
+                .map(|status| StatusCode::from_u16(status).expect("validated ModSecurity status")),
         )?)
     };
     let mut router =

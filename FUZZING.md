@@ -61,6 +61,12 @@ test. On a machine set up as above, a nightly cron entry is enough:
 A non-zero exit status means there is something under `fuzz/findings/`.
 Commit the grown `fuzz/corpus/` periodically.
 
+GitHub Actions runs the full test suite and a short fuzz pass on pushes to
+`main` and pull requests. A nightly run fuzzes each target for five minutes;
+manual runs can set the per-target duration. Fuzz logs, findings, and the
+updated corpus are uploaded as workflow artifacts, and any crash or hang fails
+the fuzz job.
+
 ## Seed corpus and fixture
 
 The `fuzz_seed_*` unit tests call each target with representative inputs;

@@ -78,7 +78,31 @@ see all command-line options. Common options include:
 | `--fastcgi-app-max-workers EXT=N` | Set the on-demand FastCGI app pool limit (1–256); defaults to one. |
 | `--fastcgi-app-idle-timeout EXT=SECS` | Reap surplus idle app workers after 1–86,400 seconds; defaults to 60 seconds. |
 | `--modsecurity-rules FILE` | Load ModSecurity rules; can be repeated to load multiple files. |
+| `--modsecurity-block-status CODE` | Override the status for ModSecurity blocking interventions (400–599; defaults to the rule status or 403). |
 | `--acme-directory URL --acme-cache DIR` | Configure ACME certificate provisioning and its cache. |
+
+### OWASP Core Rule Set
+
+`examples/modsecurity-crs.conf` is a main rules file for Debian/Ubuntu
+installations of the OWASP Core Rule Set. It enables the engine and request and
+response body inspection, then includes the packaged CRS setup, exclusions, and
+rules. The packaged `owasp-crs.load` uses Apache's `IncludeOptional`, which
+libmodsecurity does not support, so use the example directly:
+
+```sh
+project-charlotte --modsecurity-rules examples/modsecurity-crs.conf
+```
+
+The example expects `crs-setup.conf`, the CRS rules directory, and the exclusion
+files at their standard Debian/Ubuntu paths under `/etc/modsecurity/crs` and
+`/usr/share/modsecurity-crs`.
+
+Use `--modsecurity-block-status 403` to choose the status returned for
+ModSecurity deny/drop interventions. The value must be between 400 and 599;
+without it, the rule's `status` is used when valid, otherwise Charlotte returns
+403. A redirect intervention keeps its configured redirect status. A virtual
+host can override the global setting with `modsecurity_block_status = CODE` in
+its TOML declaration; this requires global ModSecurity rules.
 
 Server-managed FastCGI apps start with one worker and spawn additional workers
 only when concurrent requests need them, up to `--fastcgi-app-max-workers`.

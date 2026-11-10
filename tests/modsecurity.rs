@@ -38,6 +38,44 @@ impl Fixture {
         with_vhost: bool,
         disable_vhost_rule: bool,
     ) -> Self {
+        Self::start_with_rules(
+            body_limit,
+            with_fastcgi,
+            with_vhost,
+            disable_vhost_rule,
+            None,
+        )
+        .await
+    }
+
+    async fn start_with_rules(
+        body_limit: Option<usize>,
+        with_fastcgi: bool,
+        with_vhost: bool,
+        disable_vhost_rule: bool,
+        rules_path: Option<PathBuf>,
+    ) -> Self {
+        Self::start_with_options(
+            body_limit,
+            with_fastcgi,
+            with_vhost,
+            disable_vhost_rule,
+            rules_path,
+            &[],
+            None,
+        )
+        .await
+    }
+
+    async fn start_with_options(
+        body_limit: Option<usize>,
+        with_fastcgi: bool,
+        with_vhost: bool,
+        disable_vhost_rule: bool,
+        rules_path: Option<PathBuf>,
+        extra_args: &[&str],
+        vhost_block_status: Option<u16>,
+    ) -> Self {
         let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
             "project-charlotte-modsecurity-{}-{sequence}",
@@ -78,10 +116,13 @@ impl Fixture {
             } else {
                 ""
             };
+            let block_status = vhost_block_status
+                .map(|status| format!("modsecurity_block_status = {status}\n"))
+                .unwrap_or_default();
             std::fs::write(
                 &config_path,
                 format!(
-                    "[[vhost]]\nserver_names = [\"waf.example.test\"]\nroot = {:?}\nuser = {:?}\n{disable_rules}",
+                    "[[vhost]]\nserver_names = [\"waf.example.test\"]\nroot = {:?}\nuser = {:?}\n{disable_rules}{block_status}",
                     vhost_root.to_string_lossy(),
                     user.name
                 ),
@@ -100,7 +141,7 @@ impl Fixture {
             .arg("--root")
             .arg(&root)
             .arg("--modsecurity-rules")
-            .arg(root.join("rules.conf"));
+            .arg(rules_path.unwrap_or_else(|| root.join("rules.conf")));
         if let Some(limit) = body_limit {
             command
                 .arg("--modsecurity-body-limit")
@@ -114,6 +155,7 @@ impl Fixture {
                 .arg("--fastcgi")
                 .arg(format!("php={backend_address}"));
         }
+        command.args(extra_args);
         let mut server = command
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
@@ -156,6 +198,99 @@ impl Drop for Fixture {
 }
 
 #[tokio::test]
+async fn crs_example_blocks_common_attacks() {
+    let Some(rules_path) = crs_example_rules() else {
+        return;
+    };
+    let fixture = Fixture::start_with_rules(None, false, false, false, Some(rules_path)).await;
+
+    let clean = send_request(&fixture, "GET", "/clean.txt", "", "").await;
+    assert_eq!(clean.status, 200);
+    let clean_query = send_request(&fixture, "GET", "/clean.txt?q=hello+world", "", "").await;
+    assert_eq!(clean_query.status, 200);
+
+    for (name, path) in [
+        ("SQL injection", "/clean.txt?id=1%27%20OR%20%271%27=%271"),
+        (
+            "cross-site scripting",
+            "/clean.txt?q=%3Cscript%3Ealert(1)%3C/script%3E",
+        ),
+        (
+            "local file inclusion",
+            "/clean.txt?file=../../../../etc/passwd",
+        ),
+        ("remote code execution", "/clean.txt?cmd=;cat%20/etc/passwd"),
+        ("restricted file", "/.htaccess"),
+    ] {
+        let response = send_request(&fixture, "GET", path, "", "").await;
+        assert_eq!(response.status, 403, "{name} should be blocked");
+    }
+
+    let scanner = send_request(&fixture, "GET", "/clean.txt", "User-Agent: Nikto\r\n", "").await;
+    assert_eq!(scanner.status, 403, "scanner user-agent should be blocked");
+
+    let body_sqli = send_request(
+        &fixture,
+        "POST",
+        "/clean.txt",
+        "Content-Type: application/x-www-form-urlencoded\r\n",
+        "user=admin' UNION SELECT password FROM users--",
+    )
+    .await;
+    assert_eq!(
+        body_sqli.status, 403,
+        "SQL injection in a body should be blocked"
+    );
+
+    let xss_header = send_request(
+        &fixture,
+        "GET",
+        "/clean.txt",
+        "Referer: <script>alert(1)</script>\r\n",
+        "",
+    )
+    .await;
+    assert_eq!(xss_header.status, 403, "XSS in a header should be blocked");
+
+    let trace = send_request(&fixture, "TRACE", "/clean.txt", "", "").await;
+    assert_eq!(trace.status, 403, "TRACE should be blocked");
+
+    let benign_post = send_request(
+        &fixture,
+        "POST",
+        "/clean.txt",
+        "Content-Type: application/x-www-form-urlencoded\r\n",
+        "name=alice&msg=hi",
+    )
+    .await;
+    assert_ne!(benign_post.status, 403, "benign POST should pass the WAF");
+}
+
+#[tokio::test]
+async fn crs_example_inspects_vhost_requests() {
+    let Some(rules_path) = crs_example_rules() else {
+        return;
+    };
+    let fixture = Fixture::start_with_rules(None, false, true, false, Some(rules_path)).await;
+
+    let clean =
+        send_request_with_host(&fixture, "GET", "/clean.txt", "waf.example.test", "", "").await;
+    assert_eq!(clean.status, 200);
+    assert_eq!(clean.body, b"vhost response");
+
+    let blocked = send_request_with_host(
+        &fixture,
+        "GET",
+        "/clean.txt?id=1%27%20OR%20%271%27=%271",
+        "waf.example.test",
+        "",
+        "",
+    )
+    .await;
+    assert_eq!(blocked.status, 403, "vhost SQL injection should be blocked");
+}
+
+#[tokio::test]
 async fn applies_request_response_and_redirect_rules() {
     let fixture = Fixture::start(None, false, false, false).await;
 
@@ -184,6 +319,174 @@ async fn applies_request_response_and_redirect_rules() {
             .windows(6)
             .any(|window| window == b"SECRET")
     );
+}
+
+#[tokio::test]
+async fn configures_modsecurity_block_status_without_changing_redirects() {
+    let fixture = Fixture::start_with_options(
+        None,
+        false,
+        false,
+        false,
+        None,
+        &["--modsecurity-block-status", "451"],
+        None,
+    )
+    .await;
+
+    let blocked = send_request(&fixture, "GET", "/clean.txt?q=block", "", "").await;
+    assert_eq!(blocked.status, 451);
+
+    let header = send_request(&fixture, "GET", "/clean.txt", "X-Block: yes\r\n", "").await;
+    assert_eq!(header.status, 451);
+
+    let request_body = send_request(
+        &fixture,
+        "POST",
+        "/clean.txt",
+        "Content-Type: application/x-www-form-urlencoded\r\n",
+        "comment=evil",
+    )
+    .await;
+    assert_eq!(request_body.status, 451);
+
+    let response_body = send_request(&fixture, "GET", "/secret.txt", "", "").await;
+    assert_eq!(response_body.status, 451);
+    assert!(
+        !response_body
+            .body
+            .windows(6)
+            .any(|window| window == b"SECRET")
+    );
+
+    let clean = send_request(&fixture, "GET", "/clean.txt", "", "").await;
+    assert_eq!(clean.status, 200);
+
+    let redirect = send_request(&fixture, "GET", "/clean.txt?q=redirect", "", "").await;
+    assert_eq!(redirect.status, 302);
+    assert_eq!(
+        redirect.headers.get("location").map(String::as_str),
+        Some("https://example.test/blocked")
+    );
+}
+
+#[tokio::test]
+async fn vhost_modsecurity_block_status_overrides_global_status() {
+    let fixture = Fixture::start_with_options(
+        None,
+        false,
+        true,
+        false,
+        None,
+        &["--modsecurity-block-status", "451"],
+        Some(452),
+    )
+    .await;
+
+    let fallback_blocked = send_request(&fixture, "GET", "/clean.txt?q=block", "", "").await;
+    assert_eq!(fallback_blocked.status, 451);
+
+    let vhost_blocked = send_request_with_host(
+        &fixture,
+        "GET",
+        "/clean.txt?q=block",
+        "waf.example.test",
+        "",
+        "",
+    )
+    .await;
+    assert_eq!(vhost_blocked.status, 452);
+
+    let redirect = send_request_with_host(
+        &fixture,
+        "GET",
+        "/clean.txt?q=redirect",
+        "waf.example.test",
+        "",
+        "",
+    )
+    .await;
+    assert_eq!(redirect.status, 302);
+}
+
+#[tokio::test]
+async fn vhost_modsecurity_block_status_overrides_rule_status_without_global_override() {
+    let fixture = Fixture::start_with_options(None, false, true, false, None, &[], Some(452)).await;
+
+    let fallback_query = send_request(&fixture, "GET", "/clean.txt?q=block", "", "").await;
+    assert_eq!(fallback_query.status, 403);
+    let fallback_header = send_request(&fixture, "GET", "/clean.txt", "X-Block: yes\r\n", "").await;
+    assert_eq!(fallback_header.status, 406);
+
+    let vhost_query = send_request_with_host(
+        &fixture,
+        "GET",
+        "/clean.txt?q=block",
+        "waf.example.test",
+        "",
+        "",
+    )
+    .await;
+    assert_eq!(vhost_query.status, 452);
+    let vhost_header = send_request_with_host(
+        &fixture,
+        "GET",
+        "/clean.txt",
+        "waf.example.test",
+        "X-Block: yes\r\n",
+        "",
+    )
+    .await;
+    assert_eq!(vhost_header.status, 452);
+}
+
+#[test]
+fn rejects_block_status_configuration_without_global_rules() {
+    let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!(
+        "project-charlotte-modsecurity-invalid-config-{}-{sequence}",
+        std::process::id()
+    ));
+    let vhost_root = root.join("vhost-root");
+    std::fs::create_dir_all(&vhost_root).unwrap();
+    let user = User::from_uid(geteuid()).unwrap().unwrap();
+    let config_path = root.join("vhosts.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "[[vhost]]\nserver_names = [\"waf.example.test\"]\nroot = {:?}\nuser = {:?}\nmodsecurity_block_status = 452\n",
+            vhost_root.to_string_lossy(),
+            user.name
+        ),
+    )
+    .unwrap();
+
+    let missing_rules = Command::new(env!("CARGO_BIN_EXE_project-charlotte"))
+        .args(["--bind", "127.0.0.1:0", "--root"])
+        .arg(&root)
+        .arg("--config")
+        .arg(&config_path)
+        .output()
+        .unwrap();
+    assert!(!missing_rules.status.success());
+    assert!(
+        String::from_utf8_lossy(&missing_rules.stderr)
+            .contains("modsecurity_block_status requires --modsecurity-rules")
+    );
+
+    let invalid_global_status = Command::new(env!("CARGO_BIN_EXE_project-charlotte"))
+        .args(["--bind", "127.0.0.1:0", "--root"])
+        .arg(&root)
+        .args(["--modsecurity-block-status", "600"])
+        .output()
+        .unwrap();
+    assert!(!invalid_global_status.status.success());
+    assert!(
+        String::from_utf8_lossy(&invalid_global_status.stderr)
+            .contains("invalid ModSecurity block status")
+    );
+
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test]
@@ -347,4 +650,18 @@ SecRule ARGS:q "@streq redirect" "id:100003,phase:1,redirect:'https://example.te
 SecRule ARGS:comment "@contains evil" "id:100004,phase:2,deny,status:418,log"
 SecRule RESPONSE_BODY "@contains SECRET" "id:100005,phase:4,deny,status:500,log"
 "#
+}
+
+fn crs_example_rules() -> Option<PathBuf> {
+    let crs_setup = PathBuf::from("/etc/modsecurity/crs/crs-setup.conf");
+    let crs_rules = PathBuf::from("/usr/share/modsecurity-crs/rules");
+    if !crs_setup.is_file() || !crs_rules.is_dir() {
+        eprintln!(
+            "skipping CRS integration test: install the OWASP CRS package (expected {} and {})",
+            crs_setup.display(),
+            crs_rules.display()
+        );
+        return None;
+    }
+    Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/modsecurity-crs.conf"))
 }

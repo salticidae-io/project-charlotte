@@ -39,6 +39,7 @@ pub struct Config {
     pub threads: Option<usize>,
     pub worker_threads: usize,
     pub modsecurity_rules: Vec<PathBuf>,
+    pub modsecurity_block_status: Option<u16>,
     pub modsecurity_body_limit: usize,
     pub modsecurity_response_body_limit: usize,
     pub tls: Option<TlsFiles>,
@@ -89,6 +90,7 @@ impl Config {
         let mut threads = None;
         let mut worker_threads = DEFAULT_WORKER_THREADS;
         let mut modsecurity_rules = Vec::new();
+        let mut modsecurity_block_status = None;
         let mut modsecurity_body_limit = 16 * 1024 * 1024;
         let mut modsecurity_response_body_limit = 1024 * 1024;
         let mut tls_cert = None;
@@ -235,6 +237,12 @@ impl Config {
                 "--modsecurity-rules" => {
                     modsecurity_rules
                         .push(PathBuf::from(next_value(&mut args, "--modsecurity-rules")?));
+                }
+                "--modsecurity-block-status" => {
+                    modsecurity_block_status = Some(parse_modsecurity_block_status(&next_value(
+                        &mut args,
+                        "--modsecurity-block-status",
+                    )?)?);
                 }
                 "--modsecurity-body-limit" => {
                     let value = next_value(&mut args, "--modsecurity-body-limit")?;
@@ -435,6 +443,7 @@ impl Config {
             threads,
             worker_threads,
             modsecurity_rules,
+            modsecurity_block_status,
             modsecurity_body_limit,
             modsecurity_response_body_limit,
             tls,
@@ -464,7 +473,7 @@ impl Config {
     }
 
     pub fn usage() -> &'static str {
-        "Usage: project-charlotte [--user USER [--group GROUP]] [--bind ADDRESS] [--tls-bind ADDRESS] [--root DIRECTORY] [--index NAME] [--no-listing] [--try-files ENTRY]... [--fastcgi EXT=ADDR]... [--fastcgi-app EXT=PROGRAM]... [--fastcgi-app-arg EXT=ARG]... [--fastcgi-app-max-workers EXT=N]... [--fastcgi-app-idle-timeout EXT=SECS]... [--fastcgi-app-env EXT=KEY=VALUE]... [--fastcgi-timeout SECS] [--threads N] [--worker-threads N] [--modsecurity-rules FILE]... [--modsecurity-body-limit BYTES] [--config FILE] [--vhost-dir DIRECTORY] [--tls-cert PATH --tls-key PATH] [--acme-directory URL|letsencrypt|letsencrypt-staging --acme-cache DIR] [--acme-contact URI]... [--acme-ca-root PEM] [--http3-bind ADDRESS] [--help]"
+        "Usage: project-charlotte [--user USER [--group GROUP]] [--bind ADDRESS] [--tls-bind ADDRESS] [--root DIRECTORY] [--index NAME] [--no-listing] [--try-files ENTRY]... [--fastcgi EXT=ADDR]... [--fastcgi-app EXT=PROGRAM]... [--fastcgi-app-arg EXT=ARG]... [--fastcgi-app-max-workers EXT=N]... [--fastcgi-app-idle-timeout EXT=SECS]... [--fastcgi-app-env EXT=KEY=VALUE]... [--fastcgi-timeout SECS] [--threads N] [--worker-threads N] [--modsecurity-rules FILE]... [--modsecurity-block-status CODE] [--modsecurity-body-limit BYTES] [--config FILE] [--vhost-dir DIRECTORY] [--tls-cert PATH --tls-key PATH] [--acme-directory URL|letsencrypt|letsencrypt-staging --acme-cache DIR] [--acme-contact URI]... [--acme-ca-root PEM] [--http3-bind ADDRESS] [--help]"
     }
 }
 
@@ -628,6 +637,14 @@ pub const MAX_FASTCGI_APP_WORKERS: usize = 256;
 pub const DEFAULT_FASTCGI_APP_IDLE_TIMEOUT_SECS: u64 = 60;
 pub const MAX_FASTCGI_APP_IDLE_TIMEOUT_SECS: u64 = 86_400;
 
+pub fn parse_modsecurity_block_status(value: &str) -> Result<u16, String> {
+    value
+        .parse::<u16>()
+        .ok()
+        .filter(|status| (400..=599).contains(status))
+        .ok_or_else(|| format!("invalid ModSecurity block status: {value}; expected 400-599"))
+}
+
 pub fn parse_fastcgi_app_max_workers(value: &str) -> Result<usize, String> {
     value
         .parse::<usize>()
@@ -670,7 +687,7 @@ fn next_value(args: &mut impl Iterator<Item = String>, option: &str) -> Result<S
 mod tests {
     use super::{
         Config, DEFAULT_FASTCGI_APP_IDLE_TIMEOUT_SECS, FastCgiAddress, ParseResult,
-        validate_try_files,
+        parse_modsecurity_block_status, validate_try_files,
     };
     use std::{path::PathBuf, time::Duration};
 
@@ -1101,6 +1118,28 @@ mod tests {
         );
         assert_eq!(config.modsecurity_body_limit, 4096);
         assert_eq!(config.modsecurity_response_body_limit, 4096);
+    }
+
+    #[test]
+    fn parses_modsecurity_block_status() {
+        let parsed =
+            Config::parse(["--modsecurity-block-status".to_owned(), "451".to_owned()]).unwrap();
+        let ParseResult::Config(config) = parsed else {
+            panic!("expected config")
+        };
+        assert_eq!(config.modsecurity_block_status, Some(451));
+        assert_eq!(parse_modsecurity_block_status("400").unwrap(), 400);
+        assert_eq!(parse_modsecurity_block_status("599").unwrap(), 599);
+        for invalid in ["399", "600", "0", "abc", "-1"] {
+            assert!(
+                parse_modsecurity_block_status(invalid).is_err(),
+                "{invalid}"
+            );
+            assert!(
+                Config::parse(["--modsecurity-block-status".to_owned(), invalid.to_owned()])
+                    .is_err()
+            );
+        }
     }
 
     #[test]
