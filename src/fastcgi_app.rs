@@ -28,8 +28,8 @@ use tokio::{
 use crate::config::{Config, FastCgiAddress, FastCgiApp};
 
 static NEXT_SOCKET_ID: AtomicU64 = AtomicU64::new(0);
-const QUICK_EXIT: Duration = Duration::from_secs(5);
 const RESTART_DELAY: Duration = Duration::from_secs(1);
+const MIN_CLEAN_RUN: Duration = Duration::from_millis(50);
 
 pub(crate) struct AppHandle {
     supervisors: Vec<(JoinHandle<()>, Arc<AtomicU32>)>,
@@ -85,12 +85,13 @@ pub(crate) async fn start_apps(
         for _ in 0..app.workers {
             let worker_listener = listener.try_clone()?;
             let pid = Arc::new(AtomicU32::new(0));
-            let child = spawn_app(&app, &root, &worker_listener, &pid)?;
+            let (child, started) = spawn_app(&app, &root, &worker_listener, &pid)?;
             let supervisor = tokio::spawn(supervise(
                 worker_listener,
                 app.clone(),
                 root.clone(),
                 child,
+                started,
                 Arc::clone(&pid),
             ));
             handle.supervisors.push((supervisor, pid));
@@ -136,7 +137,7 @@ fn spawn_app(
     root: &Path,
     listener: &UnixListener,
     pid: &AtomicU32,
-) -> io::Result<Child> {
+) -> io::Result<(Child, Instant)> {
     let path = std::env::var_os("PATH").unwrap_or_default();
     let listener_fd = listener.as_fd().try_clone_to_owned()?;
     let mut command = Command::new(&app.program);
@@ -155,7 +156,7 @@ fn spawn_app(
     // Recorded with no intervening await so that `AppHandle` never observes a
     // pid that has already been reaped and possibly recycled.
     pid.store(child.id().unwrap_or(0), Ordering::SeqCst);
-    Ok(child)
+    Ok((child, Instant::now()))
 }
 
 async fn supervise(
@@ -163,27 +164,34 @@ async fn supervise(
     app: FastCgiApp,
     root: PathBuf,
     mut child: Child,
+    mut started: Instant,
     pid: Arc<AtomicU32>,
 ) {
     loop {
-        let started = Instant::now();
         let status = child.wait().await;
         pid.store(0, Ordering::SeqCst);
-        match status {
-            Ok(status) => eprintln!("FastCGI app {} exited with {status}", app.program.display()),
-            Err(error) => eprintln!(
-                "could not wait for FastCGI app {}: {error}",
-                app.program.display()
-            ),
-        }
-        if started.elapsed() < QUICK_EXIT {
+        let clean_exit = match status {
+            Ok(status) => {
+                eprintln!("FastCGI app {} exited with {status}", app.program.display());
+                status.success()
+            }
+            Err(error) => {
+                eprintln!(
+                    "could not wait for FastCGI app {}: {error}",
+                    app.program.display()
+                );
+                false
+            }
+        };
+        if !clean_exit || started.elapsed() < MIN_CLEAN_RUN {
             sleep(RESTART_DELAY).await;
         }
 
         loop {
             match spawn_app(&app, &root, &listener, &pid) {
-                Ok(restarted) => {
+                Ok((restarted, restarted_at)) => {
                     child = restarted;
+                    started = restarted_at;
                     break;
                 }
                 Err(error) => {

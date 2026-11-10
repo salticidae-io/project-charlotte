@@ -79,6 +79,11 @@ see all command-line options. Common options include:
 | `--modsecurity-rules FILE` | Load ModSecurity rules; can be repeated to load multiple files. |
 | `--acme-directory URL --acme-cache DIR` | Configure ACME certificate provisioning and its cache. |
 
+Server-managed FastCGI apps restart immediately after a clean exit if they ran
+for at least 50 ms; failed or very short-lived processes are delayed to avoid a
+rapid restart loop. Increase `--fastcgi-app-workers` when the application should
+handle concurrent requests.
+
 The master normally keeps the identity of the account that starts it. To start
 as root and run the master as an unprivileged account, use `--user` and
 optionally override its primary group with `--group`. The master clears

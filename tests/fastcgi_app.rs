@@ -362,6 +362,39 @@ async fn restarts_each_cli_worker_independently() {
 }
 
 #[tokio::test]
+async fn immediately_restarts_cleanly_exited_cli_app() {
+    let fixture = Fixture::start_with(
+        new_root(),
+        None,
+        Some(1),
+        &["CHARLOTTE_FCGI_DELAY_MS=100"],
+        &["--fastcgi-app-workers", "php=1"],
+    )
+    .await;
+    let started = tokio::time::Instant::now();
+    let mut pids = HashSet::new();
+    for index in 1..=4 {
+        let response = request(
+            fixture.address,
+            "localhost",
+            "GET",
+            &format!("/echo.php?request={index}"),
+            &[],
+            b"",
+        )
+        .await;
+        assert_eq!(response.status, 200);
+        let body = String::from_utf8(response.body).unwrap();
+        pids.insert(field(&body, "pid").to_owned());
+    }
+    assert_eq!(pids.len(), 4, "each cleanly exited app should be replaced");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "clean exits should not incur the crash-loop restart delay"
+    );
+}
+
+#[tokio::test]
 async fn rejects_missing_application_at_startup() {
     let root = new_root();
     std::fs::create_dir_all(&root).unwrap();

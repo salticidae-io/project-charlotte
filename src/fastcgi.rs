@@ -14,9 +14,9 @@ use http::{HeaderMap, HeaderName, HeaderValue, Response, StatusCode, header, req
 use http_body::{Body, Frame};
 use http_body_util::{BodyExt, Limited, StreamBody};
 use tokio::{
-    fs,
-    io::{AsyncRead, AsyncWrite},
+    io::{AsyncRead, AsyncWrite, BufWriter},
     net::TcpStream,
+    task::spawn_blocking,
 };
 
 use crate::{
@@ -34,6 +34,21 @@ pub struct ResolvedScript {
     backend: FastCgiBackend,
 }
 
+enum ScriptCandidate {
+    DirectoryIndex {
+        directory: PathBuf,
+        index: String,
+        script_name: String,
+        backend: FastCgiBackend,
+    },
+    File {
+        path: PathBuf,
+        script_name: String,
+        path_info: String,
+        backend: FastCgiBackend,
+    },
+}
+
 pub async fn resolve_script(
     relative_path: &Path,
     raw_path: &str,
@@ -47,25 +62,16 @@ pub async fn resolve_script(
         })
         .collect::<Option<Vec<_>>>()?;
 
+    let mut candidates = Vec::new();
     if raw_path.ends_with('/')
         && let Some(backend) = backend_for_name(&config.index, config)
-        && let Ok(directory) = fs::canonicalize(config.root.join(relative_path)).await
-        && directory.starts_with(&config.root)
-        && fs::metadata(&directory)
-            .await
-            .is_ok_and(|metadata| metadata.is_dir())
-        && let Ok(index_path) = fs::canonicalize(directory.join(&config.index)).await
-        && index_path.starts_with(&config.root)
-        && fs::metadata(&index_path)
-            .await
-            .is_ok_and(|metadata| metadata.is_file())
     {
         let mut script_segments = segments.clone();
         script_segments.push(&config.index);
-        return Some(ResolvedScript {
-            path: index_path,
+        candidates.push(ScriptCandidate::DirectoryIndex {
+            directory: config.root.join(relative_path),
+            index: config.index.clone(),
             script_name: uri_path(&script_segments),
-            path_info: String::new(),
             backend: backend.clone(),
         });
     }
@@ -74,21 +80,10 @@ pub async fn resolve_script(
         let Some(backend) = backend_for_name(segments[script_length - 1], config) else {
             continue;
         };
-        let mut candidate = config.root.clone();
+        let mut path = config.root.clone();
         for segment in &segments[..script_length] {
-            candidate.push(segment);
+            path.push(segment);
         }
-        let Ok(path) = fs::canonicalize(candidate).await else {
-            continue;
-        };
-        if !path.starts_with(&config.root)
-            || !fs::metadata(&path)
-                .await
-                .is_ok_and(|metadata| metadata.is_file())
-        {
-            continue;
-        }
-
         let path_info = if segments.len() == script_length {
             String::new()
         } else {
@@ -103,14 +98,72 @@ pub async fn resolve_script(
         } else {
             path_info
         };
-        return Some(ResolvedScript {
+        candidates.push(ScriptCandidate::File {
             path,
             script_name: uri_path(&segments[..script_length]),
             path_info,
             backend: backend.clone(),
         });
     }
-    None
+
+    if candidates.is_empty() {
+        return None;
+    }
+
+    let root = config.root.clone();
+    spawn_blocking(move || {
+        candidates
+            .into_iter()
+            .find_map(|candidate| match candidate {
+                ScriptCandidate::DirectoryIndex {
+                    directory,
+                    index,
+                    script_name,
+                    backend,
+                } => {
+                    let directory = std::fs::canonicalize(directory).ok()?;
+                    if !directory.starts_with(&root)
+                        || !std::fs::metadata(&directory).is_ok_and(|metadata| metadata.is_dir())
+                    {
+                        return None;
+                    }
+                    let path = std::fs::canonicalize(directory.join(index)).ok()?;
+                    if !path.starts_with(&root)
+                        || !std::fs::metadata(&path).is_ok_and(|metadata| metadata.is_file())
+                    {
+                        return None;
+                    }
+                    Some(ResolvedScript {
+                        path,
+                        script_name,
+                        path_info: String::new(),
+                        backend,
+                    })
+                }
+                ScriptCandidate::File {
+                    path,
+                    script_name,
+                    path_info,
+                    backend,
+                } => {
+                    let path = std::fs::canonicalize(path).ok()?;
+                    if !path.starts_with(&root)
+                        || !std::fs::metadata(&path).is_ok_and(|metadata| metadata.is_file())
+                    {
+                        return None;
+                    }
+                    Some(ResolvedScript {
+                        path,
+                        script_name,
+                        path_info,
+                        backend,
+                    })
+                }
+            })
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 fn backend_for_name<'a>(name: &str, config: &'a Config) -> Option<&'a FastCgiBackend> {
@@ -374,7 +427,7 @@ async fn execute<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let client = Client::new_tokio(stream);
+    let client = Client::new_tokio(BufWriter::with_capacity(64 * 1024, stream));
     let stdin = tokio::io::BufReader::new(std::io::Cursor::new(request_body));
     let request = FastCgiRequest::new_tokio(params, stdin);
     let mut output = client
