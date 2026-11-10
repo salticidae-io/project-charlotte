@@ -1,0 +1,126 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      seconds_per_target:
+        description: Fuzzing time for each target, in seconds
+        required: true
+        default: 300
+        type: number
+  schedule:
+    - cron: "0 2 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Tests
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential \
+            pkg-config \
+            libmodsecurity-dev \
+            modsecurity-crs
+
+      - name: Check out project-charlotte
+        uses: actions/checkout@v4
+        with:
+          path: project-charlotte
+
+      - name: Check out modsecurity-rs
+        uses: actions/checkout@v4
+        with:
+          repository: fzylogic/modsecurity-rs
+          token: ${{ secrets.MODSECURITY_RS_TOKEN || github.token }}
+          path: modsecurity-rs
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: project-charlotte -> target
+
+      - name: Check formatting
+        working-directory: project-charlotte
+        run: cargo fmt --all -- --check
+
+      - name: Run all tests
+        working-directory: project-charlotte
+        run: cargo test --locked
+
+  fuzz:
+    name: Fuzz targets
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    env:
+      AFL_NO_UI: "1"
+      AFL_SKIP_CPUFREQ: "1"
+      FUZZ_SECONDS: ${{ github.event_name == 'schedule' && '300' || (github.event_name == 'workflow_dispatch' && inputs.seconds_per_target) || '20' }}
+    steps:
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential \
+            pkg-config \
+            libmodsecurity-dev \
+            modsecurity-crs \
+            python3-dev
+
+      - name: Check out project-charlotte
+        uses: actions/checkout@v4
+        with:
+          path: project-charlotte
+
+      - name: Check out modsecurity-rs
+        uses: actions/checkout@v4
+        with:
+          repository: fzylogic/modsecurity-rs
+          token: ${{ secrets.MODSECURITY_RS_TOKEN || github.token }}
+          path: modsecurity-rs
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: project-charlotte -> target
+
+      - name: Install AFL and test-fuzz
+        run: |
+          cargo install cargo-afl --locked
+          cargo afl config --build
+          cargo install cargo-test-fuzz --version 8.1.1 --locked
+          sudo cargo afl system-config
+
+      - name: Fuzz every target
+        working-directory: project-charlotte
+        run: scripts/fuzz.sh "$FUZZ_SECONDS"
+
+      - name: Upload fuzz findings, corpus, and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-results-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            project-charlotte/fuzz/findings/
+            project-charlotte/fuzz/corpus/
+            project-charlotte/target/fuzz-*.log
+          if-no-files-found: warn
+          retention-days: 30
