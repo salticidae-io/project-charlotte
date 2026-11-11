@@ -78,7 +78,12 @@ for target in "${targets[@]}"; do
     for kind in crashes hangs; do
         if compgen -G "$output/$kind/id*" >/dev/null; then
             mkdir -p "$findings/$safe_target/$kind"
-            cp "$output/$kind"/id* "$findings/$safe_target/$kind"/
+            # AFL names inputs like `id:000000,sig:06,...`; drop the colons
+            # so the findings can be uploaded as an artifact.
+            for input in "$output/$kind"/id*; do
+                base=${input##*/}
+                cp "$input" "$findings/$safe_target/$kind/${base//:/_}"
+            done
             failed+=("$target ($kind)")
         fi
     done
