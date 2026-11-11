@@ -34,7 +34,7 @@ struct Fixture {
 impl Fixture {
     async fn start(root: PathBuf, config: String, backend: Option<JoinHandle<()>>) -> Self {
         let guard = TEST_LOCK.lock().await;
-        let config_path = root.join("vhosts.toml");
+        let config_path = root.join("vhosts.yaml");
         std::fs::write(&config_path, config).unwrap();
         let reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = reservation.local_addr().unwrap();
@@ -102,7 +102,7 @@ fn current_user_name() -> String {
 
 fn vhost(name: &str, root: &Path, user: &str, extra: &str) -> String {
     format!(
-        "[[vhost]]\nserver_names = {name}\nroot = {:?}\nuser = {:?}\n{extra}\n",
+        "  - server_names: {name}\n    root: {:?}\n    user: {:?}\n{extra}\n",
         root.to_string_lossy(),
         user
     )
@@ -232,7 +232,7 @@ async fn routes_exact_wildcard_unknown_and_traversal_requests() {
     std::fs::write(root.join("page.txt"), "fallback site").unwrap();
     let user = current_user_name();
     let config = format!(
-        "{}{}{}",
+        "vhost:\n{}{}{}",
         vhost("[\"alpha.test\", \"www.alpha.test\"]", &alpha, &user, ""),
         vhost("[\"beta.test\"]", &beta, &user, ""),
         vhost("[\"*.wild.test\"]", &wildcard, &user, "")
@@ -305,11 +305,14 @@ async fn uses_default_vhost_for_unknown_hosts() {
     let default_root = root.join("default");
     std::fs::create_dir_all(&default_root).unwrap();
     std::fs::write(default_root.join("page.txt"), "default vhost").unwrap();
-    let config = vhost(
-        "[\"known.test\"]",
-        &default_root,
-        &current_user_name(),
-        "default = true",
+    let config = format!(
+        "vhost:\n{}",
+        vhost(
+            "[\"known.test\"]",
+            &default_root,
+            &current_user_name(),
+            "    default: true",
+        )
     );
     let fixture = Fixture::start(root, config, None).await;
     let response = request(
@@ -346,9 +349,9 @@ async fn forwards_fastcgi_through_worker_and_strips_internal_headers() {
         "[\"php.test\"]",
         &site,
         &current_user_name(),
-        &format!("fastcgi = [\"php={backend_address}\"]"),
+        &format!("    fastcgi: [\"php={backend_address}\"]"),
     );
-    let fixture = Fixture::start(root, config, Some(backend)).await;
+    let fixture = Fixture::start(root, format!("vhost:\n{config}"), Some(backend)).await;
     let response = request(
         fixture.address,
         "php.test",
@@ -485,8 +488,11 @@ async fn refuses_privilege_change_when_server_is_non_root() {
     }
     let root = new_root();
     std::fs::create_dir(root.join("site")).unwrap();
-    let config = vhost("[\"nobody.test\"]", &root.join("site"), "nobody", "");
-    let config_path = root.join("vhosts.toml");
+    let config = format!(
+        "vhost:\n{}",
+        vhost("[\"nobody.test\"]", &root.join("site"), "nobody", "")
+    );
+    let config_path = root.join("vhosts.yaml");
     std::fs::write(&config_path, config).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_project-charlotte"))
         .arg("--bind")

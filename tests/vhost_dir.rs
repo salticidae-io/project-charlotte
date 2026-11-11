@@ -40,14 +40,14 @@ impl Fixture {
         std::fs::write(default_root.join("page.txt"), "fallback").unwrap();
         let has_main_config = main_config.is_some();
         if let Some(config) = main_config {
-            std::fs::write(path.join("main.toml"), config).unwrap();
+            std::fs::write(path.join("main.yaml"), config).unwrap();
         }
         if let Some((hostname, body)) = initial_vhost {
             let root = path.join("initial-root");
             std::fs::create_dir_all(&root).unwrap();
             std::fs::write(root.join("page.txt"), body).unwrap();
             std::fs::write(
-                vhost_dir.join("initial.toml"),
+                vhost_dir.join("initial.yaml"),
                 vhost_config(hostname, &root),
             )
             .unwrap();
@@ -67,7 +67,7 @@ impl Fixture {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         if has_main_config {
-            command.arg("--config").arg(path.join("main.toml"));
+            command.arg("--config").arg(path.join("main.yaml"));
         }
         let mut server = command.spawn().unwrap();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
@@ -183,7 +183,7 @@ fn current_user_name() -> String {
 
 fn vhost_config(hostname: &str, root: &Path) -> String {
     format!(
-        "[[vhost]]\nserver_names = [{hostname:?}]\nroot = {:?}\nuser = {:?}\n",
+        "vhost:\n  - server_names: [{hostname:?}]\n    root: {:?}\n    user: {:?}\n",
         root.to_string_lossy(),
         current_user_name()
     )
@@ -198,13 +198,13 @@ async fn loads_and_reloads_added_modified_and_deleted_vhost_files() {
     fixture.wait_for_body("alpha.test", "alpha").await;
     assert_eq!(fixture.body("unknown.test").await, "fallback");
 
-    fixture.config("beta.toml", "beta.test", &beta_root);
+    fixture.config("beta.yaml", "beta.test", &beta_root);
     fixture.wait_for_body("beta.test", "beta").await;
 
-    fixture.config("beta.toml", "beta.test", &changed_root);
+    fixture.config("beta.yaml", "beta.test", &changed_root);
     fixture.wait_for_body("beta.test", "changed").await;
 
-    std::fs::remove_file(fixture.vhost_dir.join("beta.toml")).unwrap();
+    std::fs::remove_file(fixture.vhost_dir.join("beta.yaml")).unwrap();
     fixture.wait_for_body("beta.test", "fallback").await;
 }
 
@@ -224,11 +224,15 @@ async fn invalid_or_duplicate_files_keep_the_previous_configuration_and_merge_ma
     fixture.wait_for_body("main.test", "main").await;
     fixture.wait_for_body("beta.test", "beta").await;
 
-    std::fs::write(fixture.vhost_dir.join("initial.toml"), "[[vhost]\ninvalid").unwrap();
+    std::fs::write(
+        fixture.vhost_dir.join("initial.yaml"),
+        "vhost:\n  - [invalid",
+    )
+    .unwrap();
     sleep(Duration::from_millis(600)).await;
     assert_eq!(fixture.body("beta.test").await, "beta");
 
-    fixture.config("duplicate.toml", "main.test", &duplicate_root);
+    fixture.config("duplicate.yaml", "main.test", &duplicate_root);
     sleep(Duration::from_millis(600)).await;
     assert_eq!(fixture.body("beta.test").await, "beta");
     assert_eq!(fixture.body("main.test").await, "main");

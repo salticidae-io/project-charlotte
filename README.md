@@ -13,7 +13,7 @@ For a deeper description of the runtime and request flow, see
 
 - Static file serving with MIME types, index files, optional directory
   listings, `try_files`, byte ranges, and conditional requests.
-- TOML virtual hosts with exact and wildcard names, per-host document roots,
+- YAML virtual hosts with exact and wildcard names, per-host document roots,
   and isolated worker processes that can drop to configured user/group IDs.
 - FastCGI over TCP or Unix sockets, with optional server-managed FastCGI
   application processes.
@@ -69,8 +69,8 @@ see all command-line options. Common options include:
 | `--index NAME` | Fallback index file name; defaults to `index.html`. |
 | `--no-listing` | Disable directory listings, which are enabled by default. |
 | `--try-files ENTRY` | Add a candidate or fallback rule; may be specified more than once. |
-| `--config FILE` | Load virtual-host declarations from a TOML file. |
-| `--vhost-dir DIRECTORY` | Load and watch additional virtual-host TOML files in a directory. |
+| `--config FILE` | Load virtual-host declarations from a YAML file. |
+| `--vhost-dir DIRECTORY` | Load and watch additional `.yaml` and `.yml` virtual-host files in a directory. |
 | `--tls-bind ADDRESS` | Listen for HTTPS; configure a certificate with `--tls-cert` and `--tls-key`, or use eligible ACME virtual hosts. |
 | `--http3-bind ADDRESS` | Enable the HTTP/3 listener; TLS configuration is required. |
 | `--fastcgi EXT=ADDR` | Route a file extension to a FastCGI TCP or Unix-socket backend. |
@@ -101,8 +101,8 @@ Use `--modsecurity-block-status 403` to choose the status returned for
 ModSecurity deny/drop interventions. The value must be between 400 and 599;
 without it, the rule's `status` is used when valid, otherwise Charlotte returns
 403. A redirect intervention keeps its configured redirect status. A virtual
-host can override the global setting with `modsecurity_block_status = CODE` in
-its TOML declaration; this requires global ModSecurity rules.
+host can override the global setting with `modsecurity_block_status: CODE` in
+its YAML declaration; this requires global ModSecurity rules.
 
 Server-managed FastCGI apps start with one worker and spawn additional workers
 only when concurrent requests need them, up to `--fastcgi-app-max-workers`.
@@ -130,24 +130,24 @@ Add `cap_net_bind_service` to that command if the master must bind privileged
 ports. `CAP_SETUID` is powerful: a compromised master with this capability can
 switch to UID 0. Protect the binary and its configuration accordingly.
 
-Virtual-host configuration is provided as TOML. For example, a basic host
+Virtual-host configuration is provided as YAML. For example, a basic host
 declaration looks like this:
 
-```toml
-[[vhost]]
-server_names = ["www.example.com", "example.com"]
-root = "/srv/www/example.com/public"
-user = "www-example"
-group = "www-data"
-index = "index.html"
-listing = false
+```yaml
+vhost:
+  - server_names: [www.example.com, example.com]
+    root: /srv/www/example.com/public
+    user: www-example
+    group: www-data
+    index: index.html
+    listing: false
 ```
 
 The root and worker user are required for each host. Each configured host is
 served by a worker process. See
-[`examples/charlotte.toml`](examples/charlotte.toml) for FastCGI, TLS,
+[`examples/charlotte.yaml`](examples/charlotte.yaml) for FastCGI, TLS,
 catch-all, ACME, and additional settings, and
-[`examples/vhosts.d/example.toml`](examples/vhosts.d/example.toml) for a
+[`examples/vhosts.d/example.yaml`](examples/vhosts.d/example.yaml) for a
 per-host file. Paths in virtual-host files are resolved relative to their
 configuration file.
 

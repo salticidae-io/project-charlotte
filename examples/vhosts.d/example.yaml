@@ -1,0 +1,9 @@
+# Example per-vhost file. Every non-hidden *.yaml or *.yml file in this directory is
+# loaded at startup and watched for additions, changes, deletions and renames.
+vhost:
+  - server_names: [shop.example.com]
+    root: /srv/www/shop.example.com/public
+    user: www-shop
+    group: www-data
+    index: index.html
+    listing: false

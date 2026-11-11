@@ -96,9 +96,9 @@ impl Fixture {
         );
 
         let username = User::from_uid(geteuid()).unwrap().unwrap().name;
-        let config_path = root.join("vhosts.toml");
+        let config_path = root.join("vhosts.yaml");
         let default_certificate = if options.default_vhost_certificate {
-            "tls_cert = \"beta.pem\"\ntls_key = \"beta-key.pem\"\n"
+            "    tls_cert: beta.pem\n    tls_key: beta-key.pem\n"
         } else {
             ""
         };
@@ -106,10 +106,10 @@ impl Fixture {
             &config_path,
             format!(
                 concat!(
-                    "[[vhost]]\nserver_names = [\"alpha.test\"]\nroot = {:?}\nuser = {:?}\n",
-                    "tls_cert = {:?}\ntls_key = {:?}\n\n",
-                    "[[vhost]]\nserver_names = [\"*.beta.test\"]\nroot = {:?}\nuser = {:?}\n",
-                    "{}default = true\n"
+                    "vhost:\n  - server_names: [alpha.test]\n    root: {:?}\n    user: {:?}\n",
+                    "    tls_cert: {:?}\n    tls_key: {:?}\n",
+                    "  - server_names: [\"*.beta.test\"]\n    root: {:?}\n    user: {:?}\n",
+                    "{}    default: true\n"
                 ),
                 alpha_root.to_string_lossy(),
                 username,

@@ -473,7 +473,7 @@ impl Config {
     }
 
     pub fn usage() -> &'static str {
-        "Usage: project-charlotte [--user USER [--group GROUP]] [--bind ADDRESS] [--tls-bind ADDRESS] [--root DIRECTORY] [--index NAME] [--no-listing] [--try-files ENTRY]... [--fastcgi EXT=ADDR]... [--fastcgi-app EXT=PROGRAM]... [--fastcgi-app-arg EXT=ARG]... [--fastcgi-app-max-workers EXT=N]... [--fastcgi-app-idle-timeout EXT=SECS]... [--fastcgi-app-env EXT=KEY=VALUE]... [--fastcgi-timeout SECS] [--threads N] [--worker-threads N] [--modsecurity-rules FILE]... [--modsecurity-block-status CODE] [--modsecurity-body-limit BYTES] [--config FILE] [--vhost-dir DIRECTORY] [--tls-cert PATH --tls-key PATH] [--acme-directory URL|letsencrypt|letsencrypt-staging --acme-cache DIR] [--acme-contact URI]... [--acme-ca-root PEM] [--http3-bind ADDRESS] [--help]"
+        "Usage: project-charlotte [--user USER [--group GROUP]] [--bind ADDRESS] [--tls-bind ADDRESS] [--root DIRECTORY] [--index NAME] [--no-listing] [--try-files ENTRY]... [--fastcgi EXT=ADDR]... [--fastcgi-app EXT=PROGRAM]... [--fastcgi-app-arg EXT=ARG]... [--fastcgi-app-max-workers EXT=N]... [--fastcgi-app-idle-timeout EXT=SECS]... [--fastcgi-app-env EXT=KEY=VALUE]... [--fastcgi-timeout SECS] [--threads N] [--worker-threads N] [--modsecurity-rules FILE]... [--modsecurity-block-status CODE] [--modsecurity-body-limit BYTES] [--config YAML_FILE] [--vhost-dir DIRECTORY] [--tls-cert PATH --tls-key PATH] [--acme-directory URL|letsencrypt|letsencrypt-staging --acme-cache DIR] [--acme-contact URI]... [--acme-ca-root PEM] [--http3-bind ADDRESS] [--help]"
     }
 }
 
@@ -1081,7 +1081,7 @@ mod tests {
     fn parses_config_file_and_worker_identity() {
         let parsed = Config::parse([
             "--config".to_owned(),
-            "sites.toml".to_owned(),
+            "sites.yaml".to_owned(),
             "--worker".to_owned(),
             "--worker-uid".to_owned(),
             "1000".to_owned(),
@@ -1092,7 +1092,7 @@ mod tests {
         let ParseResult::Config(config) = parsed else {
             panic!("expected config")
         };
-        assert_eq!(config.config_file, Some(PathBuf::from("sites.toml")));
+        assert_eq!(config.config_file, Some(PathBuf::from("sites.yaml")));
         assert!(config.worker);
         assert_eq!(config.worker_uid, Some(1000));
         assert_eq!(config.worker_gid, Some(1001));
