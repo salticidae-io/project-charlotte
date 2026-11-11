@@ -14,9 +14,11 @@ For a deeper description of the runtime and request flow, see
 - Static file serving with MIME types, index files, optional directory
   listings, `try_files`, byte ranges, and conditional requests.
 - YAML virtual hosts with exact and wildcard names, per-host document roots,
-  and isolated worker processes that can drop to configured user/group IDs.
+  isolated worker processes that can drop to configured user/group IDs, or
+  transparent reverse proxies.
 - FastCGI over TCP or Unix sockets, with optional server-managed FastCGI
   application processes.
+- Classic CGI scripts, run directly or through a configured interpreter.
 - Optional ModSecurity request and response inspection.
 - Optional TLS with SNI-based certificate selection, ACME HTTP-01 certificate
   provisioning and renewal, and HTTP/3 over QUIC.
@@ -74,6 +76,7 @@ see all command-line options. Common options include:
 | `--tls-bind ADDRESS` | Listen for HTTPS; configure a certificate with `--tls-cert` and `--tls-key`, or use eligible ACME virtual hosts. |
 | `--http3-bind ADDRESS` | Enable the HTTP/3 listener; TLS configuration is required. |
 | `--fastcgi EXT=ADDR` | Route a file extension to a FastCGI TCP or Unix-socket backend. |
+| `--cgi EXT[=INTERPRETER]` | Execute matching scripts directly or with an interpreter; repeatable. |
 | `--fastcgi-app EXT=PROGRAM` | Start and supervise a FastCGI application for an extension. |
 | `--fastcgi-app-max-workers EXT=N` | Set the on-demand FastCGI app pool limit (1–256); defaults to one. |
 | `--fastcgi-app-idle-timeout EXT=SECS` | Reap surplus idle app workers after 1–86,400 seconds; defaults to 60 seconds. |
@@ -112,6 +115,20 @@ deprecated alias for `--fastcgi-app-max-workers`. Workers restart immediately
 after a clean exit if they ran for at least 50 ms; failed or very short-lived
 processes are delayed to avoid a rapid restart loop.
 
+Classic CGI entries can be configured from the command line or in each virtual
+host's YAML `cgi` list. Without an interpreter, the script must be executable;
+with one, the interpreter receives the script path as its argument:
+
+```sh
+project-charlotte --root public --cgi cgi --cgi py=/usr/bin/python3
+```
+
+The equivalent vhost setting is `cgi: [cgi, "py=/usr/bin/python3"]`. CGI
+scripts are resolved under the document root, run as the server or vhost
+worker's user, and receive CGI request variables plus the request body on
+standard input. Their response headers are parsed as CGI headers and stdout is
+streamed to the client.
+
 The master normally keeps the identity of the account that starts it. To start
 as root and run the master as an unprivileged account, use `--user` and
 optionally override its primary group with `--group`. The master clears
@@ -143,8 +160,32 @@ vhost:
     listing: false
 ```
 
-The root and worker user are required for each host. Each configured host is
-served by a worker process. See
+Worker-backed hosts require a document root and worker user. A host configured
+with `proxy_pass` is served directly by the master and does not need `root` or
+`user`. A proxy vhost can forward requests arriving over
+HTTP/1.1, HTTP/2, or HTTP/3 to an HTTP or HTTPS upstream:
+
+```yaml
+vhost:
+  - server_names: [api.example.com]
+    proxy_pass: https://backend.internal:8443/api
+    proxy_preserve_host: true
+    proxy_timeout: 60
+    proxy_ca_root: trust/backend-ca.pem
+```
+
+`proxy_pass` may include a path prefix but not a query. The original request
+path and query are appended to that prefix. `proxy_preserve_host` defaults to
+`true`; set it to `false` to send the upstream authority as `Host` instead.
+`proxy_timeout` is the response-header timeout in seconds and defaults to 60.
+HTTPS upstreams use the system trust roots unless `proxy_ca_root` points to a
+PEM CA bundle; that path is relative to the YAML file. Request bodies and
+upstream response bodies are streamed. Charlotte removes hop-by-hop headers and
+sets `X-Forwarded-For`, `X-Forwarded-Proto`, and `X-Forwarded-Host`. Connection
+upgrades, WebSockets, and CONNECT tunnelling are not supported; upstream
+connection failures return 502 and response-header timeouts return 504.
+
+See
 [`examples/charlotte.yaml`](examples/charlotte.yaml) for FastCGI, TLS,
 catch-all, ACME, and additional settings, and
 [`examples/vhosts.d/example.yaml`](examples/vhosts.d/example.yaml) for a

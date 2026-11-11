@@ -10,6 +10,7 @@ pub struct FastCgiBackend {
 pub enum FastCgiAddress {
     Tcp(String),
     Unix(PathBuf),
+    Cgi(Option<PathBuf>),
     Spawn(FastCgiApp),
     Pool(Arc<crate::fastcgi_app::AppPool>),
 }
@@ -131,30 +132,17 @@ impl Config {
                 "--fastcgi" => {
                     let value = next_value(&mut args, "--fastcgi")?;
                     let backend = parse_fastcgi_backend(&value)?;
-                    if fastcgi
-                        .iter()
-                        .any(|existing: &FastCgiBackend| existing.extension == backend.extension)
-                    {
-                        return Err(format!(
-                            "duplicate FastCGI extension: {}",
-                            backend.extension
-                        ));
-                    }
-                    fastcgi.push(backend);
+                    add_backend(&mut fastcgi, backend)?;
+                }
+                "--cgi" => {
+                    let value = next_value(&mut args, "--cgi")?;
+                    let backend = parse_cgi_backend(&value)?;
+                    add_backend(&mut fastcgi, backend)?;
                 }
                 "--fastcgi-app" => {
                     let value = next_value(&mut args, "--fastcgi-app")?;
                     let backend = parse_fastcgi_app(&value)?;
-                    if fastcgi
-                        .iter()
-                        .any(|existing: &FastCgiBackend| existing.extension == backend.extension)
-                    {
-                        return Err(format!(
-                            "duplicate FastCGI extension: {}",
-                            backend.extension
-                        ));
-                    }
-                    fastcgi.push(backend);
+                    add_backend(&mut fastcgi, backend)?;
                 }
                 "--fastcgi-app-arg" => {
                     let value = next_value(&mut args, "--fastcgi-app-arg")?;
@@ -473,7 +461,7 @@ impl Config {
     }
 
     pub fn usage() -> &'static str {
-        "Usage: project-charlotte [--user USER [--group GROUP]] [--bind ADDRESS] [--tls-bind ADDRESS] [--root DIRECTORY] [--index NAME] [--no-listing] [--try-files ENTRY]... [--fastcgi EXT=ADDR]... [--fastcgi-app EXT=PROGRAM]... [--fastcgi-app-arg EXT=ARG]... [--fastcgi-app-max-workers EXT=N]... [--fastcgi-app-idle-timeout EXT=SECS]... [--fastcgi-app-env EXT=KEY=VALUE]... [--fastcgi-timeout SECS] [--threads N] [--worker-threads N] [--modsecurity-rules FILE]... [--modsecurity-block-status CODE] [--modsecurity-body-limit BYTES] [--config YAML_FILE] [--vhost-dir DIRECTORY] [--tls-cert PATH --tls-key PATH] [--acme-directory URL|letsencrypt|letsencrypt-staging --acme-cache DIR] [--acme-contact URI]... [--acme-ca-root PEM] [--http3-bind ADDRESS] [--help]"
+        "Usage: project-charlotte [--user USER [--group GROUP]] [--bind ADDRESS] [--tls-bind ADDRESS] [--root DIRECTORY] [--index NAME] [--no-listing] [--try-files ENTRY]... [--fastcgi EXT=ADDR]... [--cgi EXT[=INTERPRETER]]... [--fastcgi-app EXT=PROGRAM]... [--fastcgi-app-arg EXT=ARG]... [--fastcgi-app-max-workers EXT=N]... [--fastcgi-app-idle-timeout EXT=SECS]... [--fastcgi-app-env EXT=KEY=VALUE]... [--fastcgi-timeout SECS] [--threads N] [--worker-threads N] [--modsecurity-rules FILE]... [--modsecurity-block-status CODE] [--modsecurity-body-limit BYTES] [--config YAML_FILE] [--vhost-dir DIRECTORY] [--tls-cert PATH --tls-key PATH] [--acme-directory URL|letsencrypt|letsencrypt-staging --acme-cache DIR] [--acme-contact URI]... [--acme-ca-root PEM] [--http3-bind ADDRESS] [--help]"
     }
 }
 
@@ -590,6 +578,37 @@ pub(crate) fn parse_fastcgi_backend(value: &str) -> Result<FastCgiBackend, Strin
         FastCgiAddress::Tcp(address.to_owned())
     };
     Ok(FastCgiBackend { extension, address })
+}
+
+fn add_backend(fastcgi: &mut Vec<FastCgiBackend>, backend: FastCgiBackend) -> Result<(), String> {
+    if fastcgi
+        .iter()
+        .any(|existing| existing.extension == backend.extension)
+    {
+        return Err(format!(
+            "duplicate backend extension: {}",
+            backend.extension
+        ));
+    }
+    fastcgi.push(backend);
+    Ok(())
+}
+
+pub(crate) fn parse_cgi_backend(value: &str) -> Result<FastCgiBackend, String> {
+    let (extension, interpreter) = match value.split_once('=') {
+        Some((extension, interpreter)) => {
+            if interpreter.is_empty() || interpreter.contains('\0') {
+                return Err("CGI interpreter cannot be empty or contain NUL".to_owned());
+            }
+            (extension, Some(PathBuf::from(interpreter)))
+        }
+        None => (value, None),
+    };
+    let extension = normalize_extension(extension)?;
+    Ok(FastCgiBackend {
+        extension,
+        address: FastCgiAddress::Cgi(interpreter),
+    })
 }
 
 pub(crate) fn parse_fastcgi_app(value: &str) -> Result<FastCgiBackend, String> {
@@ -775,6 +794,40 @@ mod tests {
         assert!(matches!(config.fastcgi[0].address, FastCgiAddress::Tcp(_)));
         assert!(matches!(config.fastcgi[1].address, FastCgiAddress::Unix(_)));
         assert_eq!(config.fastcgi_timeout, std::time::Duration::from_secs(12));
+    }
+
+    #[test]
+    fn parses_classic_cgi_backends_and_rejects_duplicate_extensions() {
+        let parsed = Config::parse([
+            "--cgi".to_owned(),
+            "cgi".to_owned(),
+            "--cgi".to_owned(),
+            "py=/usr/bin/python3".to_owned(),
+        ])
+        .unwrap();
+        let ParseResult::Config(config) = parsed else {
+            panic!("expected config")
+        };
+        assert!(matches!(
+            config.fastcgi[0].address,
+            FastCgiAddress::Cgi(None)
+        ));
+        assert!(matches!(
+            &config.fastcgi[1].address,
+            FastCgiAddress::Cgi(Some(path)) if path == std::path::Path::new("/usr/bin/python3")
+        ));
+        for value in ["", "=sh", "sh=", "sh=bad\0path"] {
+            assert!(Config::parse(["--cgi".to_owned(), value.to_owned()]).is_err());
+        }
+        assert!(
+            Config::parse([
+                "--fastcgi".to_owned(),
+                "php=127.0.0.1:9000".to_owned(),
+                "--cgi".to_owned(),
+                ".PHP".to_owned(),
+            ])
+            .is_err()
+        );
     }
 
     #[test]

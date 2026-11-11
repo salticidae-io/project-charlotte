@@ -5,6 +5,7 @@ use std::{
     io,
     net::SocketAddr,
     path::{Component, Path, PathBuf},
+    process::Stdio,
     sync::Arc,
     time::Duration,
 };
@@ -16,8 +17,11 @@ use http::{HeaderMap, HeaderName, HeaderValue, Response, StatusCode, header, req
 use http_body::{Body, Frame};
 use http_body_util::{BodyExt, BodyStream, Limited, StreamBody};
 use tokio::{
-    io::{AsyncRead, AsyncWrite, BufWriter},
+    io::{
+        AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter,
+    },
     net::TcpStream,
+    process::{Child, ChildStdout, Command},
     task::spawn_blocking,
 };
 
@@ -262,6 +266,16 @@ where
                     .await
                     .map(|response| hold_worker_lease(response, lease))
             }
+            FastCgiAddress::Cgi(interpreter) => {
+                execute_cgi(
+                    interpreter.as_deref(),
+                    &script,
+                    params,
+                    request_body,
+                    timeout,
+                )
+                .await
+            }
             FastCgiAddress::Spawn(app) => Err(format!(
                 "FastCGI app {} was not started",
                 app.program.display()
@@ -279,6 +293,216 @@ where
             handler::error_response(StatusCode::GATEWAY_TIMEOUT, "FastCGI backend timed out\n")
         }
     }
+}
+
+async fn execute_cgi(
+    interpreter: Option<&Path>,
+    script: &ResolvedScript,
+    params: Params<'_>,
+    request_body: Bytes,
+    timeout: Duration,
+) -> Result<Response<ResponseBody>, String> {
+    let mut command = match interpreter {
+        Some(interpreter) => {
+            let mut command = Command::new(interpreter);
+            command.arg(&script.path);
+            command
+        }
+        None => Command::new(&script.path),
+    };
+    let path = std::env::var_os("PATH").unwrap_or_else(|| "/usr/local/bin:/usr/bin:/bin".into());
+    let mut child = command
+        .env_clear()
+        .env("PATH", path)
+        .envs(
+            params
+                .iter()
+                .map(|(key, value)| (key.as_ref(), value.as_ref())),
+        )
+        .current_dir(script.path.parent().unwrap_or_else(|| Path::new("/")))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|error| error.to_string())?;
+
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "could not capture CGI stdout".to_owned())?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "could not capture CGI stdin".to_owned())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "could not capture CGI stderr".to_owned())?;
+    let input_task = tokio::spawn(async move {
+        let mut stdin = stdin;
+        if let Err(error) = stdin.write_all(&request_body).await
+            && error.kind() != io::ErrorKind::BrokenPipe
+        {
+            eprintln!("could not write CGI request body: {error}");
+        }
+    });
+    let stderr_task = tokio::spawn(async move {
+        let mut lines = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            eprintln!("CGI stderr: {line}");
+        }
+    });
+
+    let (headers, initial_body) = match read_cgi_headers(&mut stdout, timeout).await {
+        Ok(response) => response,
+        Err(error) => {
+            input_task.abort();
+            stderr_task.abort();
+            terminate_cgi(&mut child).await;
+            return Err(error);
+        }
+    };
+    let body = cgi_response_body(
+        stdout,
+        child,
+        initial_body,
+        input_task,
+        stderr_task,
+        timeout,
+    );
+    let mut response = handler::response(headers.status, body);
+    response.headers_mut().extend(headers.headers);
+    Ok(response)
+}
+
+async fn read_cgi_headers(
+    stdout: &mut ChildStdout,
+    timeout: Duration,
+) -> Result<(ParsedHeaders, Bytes), String> {
+    let mut output = BytesMut::new();
+    let mut chunk = [0; 8192];
+    loop {
+        if let Some((header_end, delimiter_length)) = find_header_end(&output) {
+            if header_end > MAX_CGI_HEADER {
+                return Err("CGI response headers exceeded the limit".to_owned());
+            }
+            let headers = parse_cgi_headers(&output[..header_end])?;
+            let initial_body = output.split_off(header_end + delimiter_length).freeze();
+            return Ok((headers, initial_body));
+        }
+        if output.len() > MAX_CGI_HEADER {
+            return Err("CGI response headers exceeded the limit".to_owned());
+        }
+        let read = tokio::time::timeout(timeout, stdout.read(&mut chunk))
+            .await
+            .map_err(|_| "CGI response timed out before headers".to_owned())?
+            .map_err(|error| error.to_string())?;
+        if read == 0 {
+            return Err("CGI response ended before headers".to_owned());
+        }
+        output.extend_from_slice(&chunk[..read]);
+    }
+}
+
+async fn terminate_cgi(child: &mut Child) {
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
+struct CgiOutput {
+    stdout: ChildStdout,
+    child: Child,
+    initial_body: Option<Bytes>,
+    input_task: tokio::task::JoinHandle<()>,
+    stderr_task: tokio::task::JoinHandle<()>,
+    buffer: [u8; 16 * 1024],
+    timeout: Duration,
+}
+
+fn cgi_response_body(
+    stdout: ChildStdout,
+    child: Child,
+    initial_body: Bytes,
+    input_task: tokio::task::JoinHandle<()>,
+    stderr_task: tokio::task::JoinHandle<()>,
+    timeout: Duration,
+) -> ResponseBody {
+    let output = CgiOutput {
+        stdout,
+        child,
+        initial_body: Some(initial_body),
+        input_task,
+        stderr_task,
+        buffer: [0; 16 * 1024],
+        timeout,
+    };
+    let chunks = stream::unfold(Some(output), |output| async move {
+        let mut output = output?;
+        if let Some(body) = output.initial_body.take()
+            && !body.is_empty()
+        {
+            return Some((Ok(Frame::data(body)), Some(output)));
+        }
+        match tokio::time::timeout(output.timeout, output.stdout.read(&mut output.buffer)).await {
+            Err(_) => {
+                terminate_cgi(&mut output.child).await;
+                output.input_task.abort();
+                output.stderr_task.abort();
+                Some((
+                    Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "CGI response timed out",
+                    )),
+                    None,
+                ))
+            }
+            Ok(Err(error)) => {
+                terminate_cgi(&mut output.child).await;
+                output.input_task.abort();
+                output.stderr_task.abort();
+                Some((Err(error), None))
+            }
+            Ok(Ok(read)) if read > 0 => Some((
+                Ok(Frame::data(Bytes::copy_from_slice(&output.buffer[..read]))),
+                Some(output),
+            )),
+            Ok(Ok(_)) => match tokio::time::timeout(output.timeout, output.child.wait()).await {
+                Err(_) => {
+                    terminate_cgi(&mut output.child).await;
+                    output.input_task.abort();
+                    output.stderr_task.abort();
+                    Some((
+                        Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "CGI process did not exit after closing stdout",
+                        )),
+                        None,
+                    ))
+                }
+                Ok(Err(error)) => Some((Err(error), None)),
+                Ok(Ok(status)) => {
+                    if !status.success() {
+                        eprintln!("CGI process exited with {status}");
+                    }
+                    if tokio::time::timeout(output.timeout, &mut output.input_task)
+                        .await
+                        .is_err()
+                    {
+                        output.input_task.abort();
+                    }
+                    if tokio::time::timeout(output.timeout, &mut output.stderr_task)
+                        .await
+                        .is_err()
+                    {
+                        output.stderr_task.abort();
+                    }
+                    None
+                }
+            },
+        }
+    });
+    StreamBody::new(chunks).boxed_unsync()
 }
 
 fn hold_worker_lease(

@@ -10,8 +10,8 @@ shutdown.
 ## Configuration and startup
 
 `config::Config::parse` reads command-line options for listener addresses,
-document roots, static-file behavior, FastCGI, TLS, ACME, ModSecurity, thread
-counts, and worker privileges. An optional YAML configuration file declares
+document roots, static-file behavior, FastCGI and CGI, TLS, ACME, ModSecurity,
+thread counts, and worker privileges. An optional YAML configuration file declares
 virtual hosts and can name a directory of additional virtual-host files.
 Paths in those declarations are resolved relative to their configuration
 source. The [examples](examples/) directory contains project examples.
@@ -43,10 +43,10 @@ The request path is:
    global WAF, before normal routing.
 4. Routing checks that a TLS request's SNI and HTTP authority select the same
    virtual host. A mismatch is rejected with `421 Misdirected Request`.
-   Requests for a configured virtual host are forwarded to its worker; if no
-   virtual host matches and no default is configured, the master uses the
-   fallback `Config` directly.
-5. `handler::handle_request` applies `try_files` rules, resolves FastCGI
+   Proxy virtual hosts forward directly from the master. Worker-backed hosts
+   are forwarded to their worker; if no virtual host matches and no default is
+   configured, the master uses the fallback `Config` directly.
+5. `handler::handle_request` applies `try_files` rules, resolves FastCGI or CGI
    scripts, or serves a static file or directory listing. Static responses
    include MIME types, validators, conditional-request handling, and byte
    ranges. `HEAD` responses omit the body.
@@ -56,7 +56,7 @@ The request path is:
 
 ## Virtual-host workers
 
-Each configured virtual host has a worker that runs the same executable in
+Each worker-backed virtual host has a worker that runs the same executable in
 `--worker` mode. The process is started on the first request and reused while
 its connection remains healthy. The router connects to it through a Unix
 socket pair; the private connection uses HTTP/2 and is not a public listener.
@@ -69,6 +69,20 @@ then calls the same request handler used by the fallback path.
 Workers can run under configured UID/GID credentials. The master asks workers
 to terminate cleanly and uses a bounded wait before forcibly stopping one, so
 worker-managed FastCGI applications can clean up as well.
+
+## Reverse proxies
+
+A vhost with `proxy_pass` is handled directly in the master and does not need
+a document root or worker process. Its upstream URL may use HTTP or HTTPS and
+include a path prefix; the incoming path and query are appended. A pooled
+Hyper client negotiates HTTP/1.1 or HTTP/2 with HTTPS upstreams using ALPN.
+TCP HTTP/1.1, HTTP/2, and QUIC HTTP/3 clients all use this same routing path.
+Request and response bodies are streamed, hop-by-hop headers (including
+headers named by `Connection`) are removed, and the proxy sets
+`X-Forwarded-For`, `X-Forwarded-Proto`, and `X-Forwarded-Host`. HTTPS upstreams
+use system roots by default or a configured PEM CA bundle. Header acquisition
+has a configurable timeout; WebSocket/Upgrade and CONNECT tunnelling are not
+implemented.
 
 ## FastCGI application pools
 
@@ -83,6 +97,15 @@ one process remains available. The CLI options are
 `idle_timeout` (the older `workers` YAML field and
 `--fastcgi-app-workers` option remain aliases for `max_workers`). Each process
 is supervised and restarted independently.
+
+## Classic CGI
+
+Configured CGI extensions use the same root-confined script resolver and CGI
+request variables as FastCGI. Each request starts a process directly or via an
+optional interpreter; the request body is written to stdin, CGI headers are
+parsed before returning the response, and stdout is streamed while the child
+is supervised. The process receives a cleared environment populated with CGI
+parameters and `PATH`. Virtual-host scripts run with the worker's credentials.
 
 ## TLS, SNI, and ACME
 
@@ -121,8 +144,9 @@ cleanup is handled when their router-owned handles are dropped.
 | `vhost` | Virtual-host loading and matching, routing, worker management, and request dispatch. |
 | `worker` | Private HTTP/2 worker service, metadata validation, and privilege dropping. |
 | `handler` | Request handling, static files, listings, ranges, validators, and response helpers. |
-| `fastcgi` | FastCGI script resolution, request parameters, and backend exchange. |
+| `fastcgi` | FastCGI and CGI script resolution, request parameters, and backend exchange. |
 | `fastcgi_app` | Lifecycle management for FastCGI applications started by the server. |
+| `proxy` | Pooled HTTP/HTTPS upstream clients and reverse-proxy header/body handling. |
 | `waf` | ModSecurity rule loading and request/response inspection. |
 | `tls` | Rustls configuration, static certificates, and SNI certificate selection. |
 | `acme` | ACME account, HTTP-01 challenges, certificate cache, and renewal. |
@@ -165,8 +189,8 @@ and bounds the time a client may take to deliver a request body. A failed
 it was started with; it terminates TLS, parses requests, serves the fallback
 site, and runs ModSecurity in that one process.
 
-Unit and integration tests cover routing, handlers, TLS, ACME, FastCGI, and
-ModSecurity. Fuzz targets exercise parsed inputs and request-handling paths;
+Unit and integration tests cover routing, handlers, TLS, ACME, FastCGI, CGI,
+and ModSecurity. Fuzz targets exercise parsed inputs and request-handling paths;
 see [FUZZING.md](FUZZING.md) for target names, setup, and commands. HTTP wire
 parsing itself is delegated to Hyper and `h3` and is outside those fuzz
 targets.

@@ -20,14 +20,16 @@
 # response status with `--modsecurity-block-status CODE` (400-599); a vhost may
 # override it with `modsecurity_block_status` below.
 #
-# Every virtual host runs in its own worker process, re-executing this binary
-# with `--worker` and dropping privileges to the configured user and group.
-# A request whose Host header matches no virtual host is served by the master
-# process from the `--root` directory, unless a virtual host is marked
-# `default: true`.
+# Worker-backed virtual hosts run in their own worker process, re-executing
+# this binary with `--worker` and dropping privileges to the configured user
+# and group. Proxy virtual hosts use `proxy_pass` and run in the master without
+# a document root or worker user. A request whose Host header matches no
+# virtual host is served by the master from `--root`, unless a virtual host is
+# marked `default: true`.
 #
-# Relative paths (root, tls_cert, tls_key, unix: FastCGI sockets) are resolved
-# against the directory containing this file, not the working directory.
+# Relative paths (root, tls_cert, tls_key, proxy_ca_root, interpreter, unix:
+# FastCGI sockets) are resolved against the directory containing this file,
+# not the working directory.
 # `vhost_dir` is also relative to this file; visible `*.yaml` and `*.yml` files
 # in that directory are watched for additions, changes, deletions and renames.
 # Invalid updates are rejected and the last valid configuration remains active.
@@ -96,6 +98,18 @@ vhost:
 
 
 # --------------------------------------------------------------------------
+# A reverse proxy virtual host. It needs no document root or worker user.
+# Supports HTTP/1.1, HTTP/2 and HTTP/3 clients; HTTPS upstreams use system
+# trust roots unless `proxy_ca_root` names a PEM CA bundle.
+# --------------------------------------------------------------------------
+#  -
+#    server_names: [api.example.com]
+#    proxy_pass: https://backend.internal:8443/api
+#    proxy_preserve_host: true
+#    proxy_timeout: 60
+#    proxy_ca_root: tls/backend-ca.pem
+
+# --------------------------------------------------------------------------
 # PHP over an existing FastCGI pool (php-fpm), reached over a Unix socket.
 # --------------------------------------------------------------------------
   -
@@ -111,6 +125,11 @@ vhost:
 # virtual host. The address is either "unix:/path/to/socket" or "HOST:PORT"
 # (bracket IPv6 literals, e.g. "[::1]:9000").
     fastcgi: ["php=unix:/run/php/php8.4-fpm.sock"]
+
+# Classic CGI uses the same extension list. With no interpreter, the script
+# must be executable; otherwise the configured interpreter receives its path.
+# The script itself must resolve to a file inside this vhost's document root.
+# Example: cgi: [cgi, "py=/usr/bin/python3"]
 
 # Optional. Seconds to wait for the FastCGI backend before giving up.
 # Falls back to --fastcgi-timeout (default 60). Must be greater than zero.

@@ -9,6 +9,7 @@ mod http3;
 mod httpdate;
 mod mime;
 mod privileges;
+mod proxy;
 mod reload;
 mod tls;
 mod vhost;
@@ -197,9 +198,18 @@ async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> 
         eprintln!("Listening on {} (HTTP/3)", address);
     }
     for backend in &config.fastcgi {
+        if let FastCgiAddress::Cgi(interpreter) = &backend.address {
+            let interpreter = interpreter.as_ref().map_or_else(
+                || "direct executable".to_owned(),
+                |path| path.display().to_string(),
+            );
+            eprintln!("CGI .{} -> {interpreter}", backend.extension);
+            continue;
+        }
         let address = match &backend.address {
             FastCgiAddress::Tcp(address) => address.clone(),
             FastCgiAddress::Unix(path) => format!("unix:{}", path.display()),
+            FastCgiAddress::Cgi(_) => unreachable!("CGI backends were logged above"),
             FastCgiAddress::Spawn(app) => format!("spawn:{}", app.program.display()),
             FastCgiAddress::Pool(pool) => format!("spawn:{}", pool.app().program.display()),
         };
