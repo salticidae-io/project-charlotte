@@ -1,0 +1,1 @@
+--bind127.0.0.1:8080	--fastcgi>php=127--fastcgi*php=127astcgiphp=1.t.0.0.1p=127--fastcg:9000
