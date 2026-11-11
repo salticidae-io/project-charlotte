@@ -193,7 +193,7 @@ struct LoadedSource {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct TlsSni(pub Option<String>);
+pub(crate) struct TlsSni(pub Option<Arc<str>>);
 
 impl Router {
     pub(crate) async fn load(
@@ -263,12 +263,12 @@ impl Router {
             candidates.push((path, content, entries));
         }
 
-        let mut all_entries = sources.main_entries.clone();
-        for (_, _, entries) in &candidates {
-            all_entries.extend(entries.iter().cloned());
-        }
-        validate_vhost_declarations(&all_entries)?;
-        validate_vhost_waf_declarations(&all_entries, self.waf.is_some())?;
+        let all_entries = sources
+            .main_entries
+            .iter()
+            .chain(candidates.iter().flat_map(|(_, _, entries)| entries));
+        validate_vhost_declarations(all_entries.clone())?;
+        validate_vhost_waf_declarations(all_entries, self.waf.is_some())?;
 
         let mut changed = sources.main_vhosts.is_none()
             || sources.files.len() != candidates.len()
@@ -607,22 +607,24 @@ impl Router {
             request.headers_mut().insert(HOST, value);
         }
         let table = self.snapshot();
+        // Nothing below changes the authority or `Host`, so the host is
+        // worked out once and shared by every step that routes on it.
+        let host = request_host(&request);
+        let host = host.as_deref();
         if let Some(acme) = &self.acme {
-            let host = request_host(&request);
             if request.method() == http::Method::GET
-                && let Some(host) = host.as_deref()
+                && let Some(host) = host
                 && let Some(body) = acme.challenge_response(host, request.uri().path()).await
             {
                 return handler::text_response(StatusCode::OK, body);
             }
             if request.extensions().get::<TlsSni>().is_none()
-                && let Some(host) = host.as_deref()
+                && let Some(host) = host
             {
                 acme.maybe_provision(host);
             }
         }
-        let selected = request_host(&request)
-            .as_deref()
+        let selected = host
             .and_then(|host| Self::select_vhost(&table, host))
             .or(table.default);
         let waf = selected
@@ -631,11 +633,11 @@ impl Router {
         if let Some(waf) = waf {
             return waf
                 .inspect(request, peer, local, |request| {
-                    self.route(request, peer, local, Arc::clone(&table))
+                    self.route(request, host, peer, local, &table)
                 })
                 .await;
         }
-        self.route(request, peer, local, table).await
+        self.route(request, host, peer, local, &table).await
     }
 
     pub(crate) fn sni_certificates(&self) -> (Vec<(String, TlsFiles)>, Option<TlsFiles>) {
@@ -664,16 +666,16 @@ impl Router {
     async fn route<B>(
         &self,
         request: Request<B>,
+        host: Option<&str>,
         peer: SocketAddr,
         local: SocketAddr,
-        table: Arc<VhostTable>,
+        table: &VhostTable,
     ) -> Response<ResponseBody>
     where
         B: Body<Data = Bytes> + Send + 'static,
         B::Error: Into<Box<dyn Error + Send + Sync>>,
     {
-        let host = request_host(&request);
-        let index = match select_route(&table, &request, host.as_deref()) {
+        let index = match select_route(table, &request, host) {
             Ok(Some(index)) => index,
             Ok(None) => {
                 return handler::handle_request(request, Arc::clone(&self.fallback), peer, local)
@@ -681,7 +683,7 @@ impl Router {
             }
             Err((status, message)) => return handler::error_response(status, message),
         };
-        let request = match worker_request(request, host.as_deref(), peer, local) {
+        let request = match worker_request(request, host, peer, local) {
             Ok(request) => request,
             Err((status, message)) => return handler::error_response(status, message),
         };
@@ -1013,10 +1015,12 @@ fn validate_index(index: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
     Ok(())
 }
 
-fn validate_vhost_declarations(entries: &[VhostFile]) -> Result<(), Box<dyn Error + Send + Sync>> {
+fn validate_vhost_declarations<'a>(
+    entries: impl IntoIterator<Item = &'a VhostFile>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut names = std::collections::HashSet::new();
     let mut has_default = false;
-    for (index, entry) in entries.iter().enumerate() {
+    for (index, entry) in entries.into_iter().enumerate() {
         if entry.tls_cert.is_some() != entry.tls_key.is_some() {
             return Err(
                 format!("vhost {} must provide both tls_cert and tls_key", index + 1).into(),
@@ -1074,7 +1078,7 @@ fn validate_vhost_declarations(entries: &[VhostFile]) -> Result<(), Box<dyn Erro
         for name in &entry.server_names {
             let normalized = normalize_server_name(name)
                 .ok_or_else(|| format!("invalid virtual host name: {name}"))?;
-            if !names.insert(normalized.clone()) {
+            if let Some(normalized) = names.replace(normalized) {
                 return Err(format!("duplicate virtual host name: {normalized}").into());
             }
         }
@@ -1082,22 +1086,19 @@ fn validate_vhost_declarations(entries: &[VhostFile]) -> Result<(), Box<dyn Erro
     Ok(())
 }
 
-fn validate_vhost_waf_declarations(
-    entries: &[VhostFile],
+fn validate_vhost_waf_declarations<'a>(
+    entries: impl IntoIterator<Item = &'a VhostFile, IntoIter: Clone>,
     has_global_waf: bool,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let mut entries = entries.into_iter();
     if !has_global_waf
         && entries
-            .iter()
+            .clone()
             .any(|entry| !entry.modsecurity_disable_rules.is_empty())
     {
         return Err("modsecurity_disable_rules requires --modsecurity-rules".into());
     }
-    if !has_global_waf
-        && entries
-            .iter()
-            .any(|entry| entry.modsecurity_block_status.is_some())
-    {
+    if !has_global_waf && entries.any(|entry| entry.modsecurity_block_status.is_some()) {
         return Err("modsecurity_block_status requires --modsecurity-rules".into());
     }
     Ok(())
@@ -1820,7 +1821,7 @@ mod tests {
         };
         let has_sni = sni.is_some();
         if let Some(sni) = sni {
-            request.extensions_mut().insert(TlsSni(Some(sni)));
+            request.extensions_mut().insert(TlsSni(Some(sni.into())));
         }
         let table = fuzz_table(default);
         let host = request_host(&request);

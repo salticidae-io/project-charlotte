@@ -1,5 +1,6 @@
 use std::{
     convert::Infallible,
+    fmt::Write as _,
     fs as std_fs,
     io::{self, Read, Seek, SeekFrom as StdSeekFrom, Write},
     net::SocketAddr,
@@ -113,7 +114,7 @@ where
 
 async fn apply_try_files<B>(
     request: &mut Request<B>,
-    config: &Config,
+    config: &Arc<Config>,
 ) -> Option<Response<ResponseBody>> {
     if config.try_files.is_empty() {
         return None;
@@ -135,13 +136,14 @@ async fn apply_try_files<B>(
         let Some(relative_path) = decode_request_path(candidate_path) else {
             continue;
         };
-        let root = config.root.clone();
+        let config = Arc::clone(config);
         let directory_candidate = candidate_path.ends_with('/');
         let matches = tokio::task::spawn_blocking(move || {
+            let root = &config.root;
             let Ok(canonical) = std_fs::canonicalize(root.join(relative_path)) else {
                 return false;
             };
-            if !canonical.starts_with(&root) {
+            if !canonical.starts_with(root) {
                 return false;
             }
             let Ok(metadata) = std_fs::metadata(canonical) else {
@@ -259,7 +261,7 @@ fn request_uri(uri: &http::Uri) -> String {
         .map_or_else(|| uri.path().to_owned(), |value| value.as_str().to_owned())
 }
 
-async fn route_file_request<B>(request: &Request<B>, config: &Config) -> Response<ResponseBody>
+async fn route_file_request<B>(request: &Request<B>, config: &Arc<Config>) -> Response<ResponseBody>
 where
     B: Body<Data = Bytes>,
 {
@@ -268,12 +270,17 @@ where
         Some(path) => path,
         None => return error_response(StatusCode::NOT_FOUND, "Not found\n"),
     };
-    let root = config.root.clone();
-    let index = config.index.clone();
     let raw_path_is_dir = raw_path.ends_with('/');
     let read_small = request.method() == Method::GET;
+    let blocking_config = Arc::clone(config);
     let resolution = tokio::task::spawn_blocking(move || {
-        resolve_static(&root, &index, &relative_path, raw_path_is_dir, read_small)
+        resolve_static(
+            &blocking_config.root,
+            &blocking_config.index,
+            &relative_path,
+            raw_path_is_dir,
+            read_small,
+        )
     })
     .await;
     match resolution {
@@ -483,10 +490,9 @@ where
     response
         .headers_mut()
         .insert(header::CONTENT_TYPE, header_value(mime::for_path(path)));
-    response.headers_mut().insert(
-        header::CONTENT_LENGTH,
-        header_value(&body_length.to_string()),
-    );
+    response
+        .headers_mut()
+        .insert(header::CONTENT_LENGTH, HeaderValue::from(body_length));
     response
         .headers_mut()
         .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
@@ -595,9 +601,9 @@ async fn directory_listing(path: &str, directory: &Path) -> Response<ResponseBod
 
     let mut html =
         String::from("<!doctype html><html><head><meta charset=\"utf-8\"><title>Index of ");
-    html.push_str(&escape_html(path));
+    escape_html_into(&mut html, path);
     html.push_str("</title></head><body><h1>Index of ");
-    html.push_str(&escape_html(path));
+    escape_html_into(&mut html, path);
     html.push_str("</h1><ul>");
     if path != "/" {
         let parent = path
@@ -609,36 +615,32 @@ async fn directory_listing(path: &str, directory: &Path) -> Response<ResponseBod
                     if parent.is_empty() { "/" } else { parent }
                 },
             );
-        html.push_str(&format!(
-            "<li><a href=\"{}\">../</a></li>",
-            escape_html(parent)
-        ));
-    }
-    for (name, is_dir) in entries {
-        let href = format!(
-            "{}{}{}",
-            path,
-            percent_encode(&name),
-            if is_dir { "/" } else { "" }
-        );
-        let label = format!("{}{}", name, if is_dir { "/" } else { "" });
         html.push_str("<li><a href=\"");
-        html.push_str(&escape_html(&href));
+        escape_html_into(&mut html, parent);
+        html.push_str("\">../</a></li>");
+    }
+    for (name, is_dir) in &entries {
+        let suffix = if *is_dir { "/" } else { "" };
+        html.push_str("<li><a href=\"");
+        escape_html_into(&mut html, path);
+        // Percent-encoding leaves nothing for HTML escaping to change.
+        percent_encode_into(&mut html, name);
+        html.push_str(suffix);
         html.push_str("\">");
-        html.push_str(&escape_html(&label));
+        escape_html_into(&mut html, name);
+        html.push_str(suffix);
         html.push_str("</a></li>");
     }
     html.push_str("</ul></body></html>");
-    let bytes = Bytes::from(html);
-    let mut response = response(StatusCode::OK, full_body(bytes.clone()));
+    let length = html.len();
+    let mut response = response(StatusCode::OK, full_body(Bytes::from(html)));
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("text/html; charset=utf-8"),
     );
-    response.headers_mut().insert(
-        header::CONTENT_LENGTH,
-        header_value(&bytes.len().to_string()),
-    );
+    response
+        .headers_mut()
+        .insert(header::CONTENT_LENGTH, HeaderValue::from(length));
     response
 }
 
@@ -694,8 +696,7 @@ fn hex_value(value: u8) -> Option<u8> {
     }
 }
 
-fn escape_html(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len());
+fn escape_html_into(escaped: &mut String, value: &str) {
     for character in value.chars() {
         match character {
             '&' => escaped.push_str("&amp;"),
@@ -706,19 +707,18 @@ fn escape_html(value: &str) -> String {
             character => escaped.push(character),
         }
     }
-    escaped
 }
 
-fn percent_encode(value: &str) -> String {
-    let mut encoded = String::new();
+/// Appends `value` to `encoded`, percent-encoding every byte outside the
+/// URI unreserved set.
+pub(crate) fn percent_encode_into(encoded: &mut String, value: &str) {
     for byte in value.bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
             encoded.push(char::from(byte));
         } else {
-            encoded.push_str(&format!("%{byte:02X}"));
+            let _ = write!(encoded, "%{byte:02X}");
         }
     }
-    encoded
 }
 
 fn file_body(file: File, length: u64) -> ResponseBody {
@@ -783,15 +783,15 @@ fn cached_date_header() -> HeaderValue {
 
 pub(crate) fn error_response(status: StatusCode, message: &'static str) -> Response<ResponseBody> {
     let bytes = Bytes::from_static(message.as_bytes());
-    let mut response = response(status, full_body(bytes.clone()));
+    let length = bytes.len();
+    let mut response = response(status, full_body(bytes));
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("text/plain; charset=utf-8"),
     );
-    response.headers_mut().insert(
-        header::CONTENT_LENGTH,
-        header_value(&bytes.len().to_string()),
-    );
+    response
+        .headers_mut()
+        .insert(header::CONTENT_LENGTH, HeaderValue::from(length));
     response
 }
 
@@ -823,7 +823,11 @@ pub(crate) fn empty_body() -> ResponseBody {
 }
 
 pub(crate) fn coalesce_ready_body(mut body: ResponseBody) -> ResponseBody {
+    // A body is very often a single chunk. That chunk is kept as it arrived,
+    // and bytes are copied together only once a second one follows it.
+    let mut first: Option<Bytes> = None;
     let mut buffered = BytesMut::new();
+    let mut buffered_len = 0;
     let mut pending = None;
     let mut complete = false;
 
@@ -839,9 +843,17 @@ pub(crate) fn coalesce_ready_body(mut body: ResponseBody) -> ResponseBody {
                     pending = Some(Ok(Frame::data(bytes)));
                     break;
                 }
-                Ok(bytes) if buffered.len() + bytes.len() <= COALESCE_BODY_LIMIT => {
-                    buffered.extend_from_slice(&bytes);
-                    if buffered.len() == COALESCE_BODY_LIMIT {
+                Ok(bytes) if buffered_len + bytes.len() <= COALESCE_BODY_LIMIT => {
+                    buffered_len += bytes.len();
+                    if buffered_len == bytes.len() {
+                        first = Some(bytes);
+                    } else {
+                        if let Some(first) = first.take() {
+                            buffered.extend_from_slice(&first);
+                        }
+                        buffered.extend_from_slice(&bytes);
+                    }
+                    if buffered_len == COALESCE_BODY_LIMIT {
                         break;
                     }
                 }
@@ -861,13 +873,14 @@ pub(crate) fn coalesce_ready_body(mut body: ResponseBody) -> ResponseBody {
         }
     }
 
+    let buffered = first.unwrap_or_else(|| buffered.freeze());
     if complete && pending.is_none() {
-        return full_body(buffered.freeze());
+        return full_body(buffered);
     }
 
     let mut frames = Vec::with_capacity(2);
     if !buffered.is_empty() {
-        frames.push(Ok(Frame::data(buffered.freeze())));
+        frames.push(Ok(Frame::data(buffered)));
     }
     if let Some(frame) = pending {
         frames.push(frame);
@@ -885,7 +898,7 @@ fn full_body(bytes: Bytes) -> ResponseBody {
 mod tests {
     use super::{
         OriginalUri, ResponseBody, apply_try_files, coalesce_ready_body, decode_request_path,
-        escape_html, parse_byte_range,
+        escape_html_into, parse_byte_range,
     };
     use chrono::{DateTime, Utc};
     use std::{
@@ -1035,7 +1048,10 @@ mod tests {
         tokio::fs::write(root.join("existing.txt"), b"existing file")
             .await
             .unwrap();
-        let config = try_files_config(root.clone(), &["$uri", "/fallback.txt", "=404"]);
+        let config = Arc::new(try_files_config(
+            root.clone(),
+            &["$uri", "/fallback.txt", "=404"],
+        ));
         let mut request = http::Request::builder()
             .uri("/existing.txt?original=1")
             .body(())
@@ -1090,7 +1106,7 @@ mod tests {
             ("/index.html$is_args$query_string", "/index.html?original=1"),
             ("/index.html", "/index.html"),
         ] {
-            let config = try_files_config(root.clone(), &["$uri", fallback]);
+            let config = Arc::new(try_files_config(root.clone(), &["$uri", fallback]));
             let mut request = http::Request::builder()
                 .uri("/missing?original=1")
                 .body(())
@@ -1142,6 +1158,12 @@ mod tests {
         assert_eq!(parse_byte_range("bytes=-3", 10), Ok(Some((7, 9))));
         assert!(parse_byte_range("bytes=10-", 10).is_err());
         assert!(parse_byte_range("bytes=0-1,4-5", 10).is_err());
+    }
+
+    fn escape_html(value: &str) -> String {
+        let mut escaped = String::new();
+        escape_html_into(&mut escaped, value);
+        escaped
     }
 
     #[test]

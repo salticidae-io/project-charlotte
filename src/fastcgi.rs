@@ -1,9 +1,11 @@
 use std::{
+    borrow::Cow,
     collections::HashSet,
     fmt::Display,
     io,
     net::SocketAddr,
     path::{Component, Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
@@ -20,7 +22,7 @@ use tokio::{
 };
 
 use crate::{
-    config::{Config, FastCgiAddress, FastCgiBackend},
+    config::{Config, FastCgiAddress},
     handler::{self, ResponseBody},
 };
 
@@ -31,28 +33,28 @@ pub struct ResolvedScript {
     path: PathBuf,
     script_name: String,
     path_info: String,
-    backend: FastCgiBackend,
+    /// Position of the script's backend in `Config::fastcgi`.
+    backend: usize,
 }
 
 enum ScriptCandidate {
     DirectoryIndex {
         directory: PathBuf,
-        index: String,
         script_name: String,
-        backend: FastCgiBackend,
+        backend: usize,
     },
     File {
         path: PathBuf,
         script_name: String,
         path_info: String,
-        backend: FastCgiBackend,
+        backend: usize,
     },
 }
 
 pub async fn resolve_script(
     relative_path: &Path,
     raw_path: &str,
-    config: &Config,
+    config: &Arc<Config>,
 ) -> Option<ResolvedScript> {
     let segments = relative_path
         .components()
@@ -66,13 +68,13 @@ pub async fn resolve_script(
     if raw_path.ends_with('/')
         && let Some(backend) = backend_for_name(&config.index, config)
     {
-        let mut script_segments = segments.clone();
-        script_segments.push(&config.index);
+        let mut script_name = uri_path(&segments);
+        script_name.push('/');
+        handler::percent_encode_into(&mut script_name, &config.index);
         candidates.push(ScriptCandidate::DirectoryIndex {
             directory: config.root.join(relative_path),
-            index: config.index.clone(),
-            script_name: uri_path(&script_segments),
-            backend: backend.clone(),
+            script_name,
+            backend,
         });
     }
 
@@ -102,7 +104,7 @@ pub async fn resolve_script(
             path,
             script_name: uri_path(&segments[..script_length]),
             path_info,
-            backend: backend.clone(),
+            backend,
         });
     }
 
@@ -110,25 +112,25 @@ pub async fn resolve_script(
         return None;
     }
 
-    let root = config.root.clone();
+    let config = Arc::clone(config);
     spawn_blocking(move || {
+        let root = &config.root;
         candidates
             .into_iter()
             .find_map(|candidate| match candidate {
                 ScriptCandidate::DirectoryIndex {
                     directory,
-                    index,
                     script_name,
                     backend,
                 } => {
                     let directory = std::fs::canonicalize(directory).ok()?;
-                    if !directory.starts_with(&root)
+                    if !directory.starts_with(root)
                         || !std::fs::metadata(&directory).is_ok_and(|metadata| metadata.is_dir())
                     {
                         return None;
                     }
-                    let path = std::fs::canonicalize(directory.join(index)).ok()?;
-                    if !path.starts_with(&root)
+                    let path = std::fs::canonicalize(directory.join(&config.index)).ok()?;
+                    if !path.starts_with(root)
                         || !std::fs::metadata(&path).is_ok_and(|metadata| metadata.is_file())
                     {
                         return None;
@@ -147,7 +149,7 @@ pub async fn resolve_script(
                     backend,
                 } => {
                     let path = std::fs::canonicalize(path).ok()?;
-                    if !path.starts_with(&root)
+                    if !path.starts_with(root)
                         || !std::fs::metadata(&path).is_ok_and(|metadata| metadata.is_file())
                     {
                         return None;
@@ -166,25 +168,22 @@ pub async fn resolve_script(
     .flatten()
 }
 
-fn backend_for_name<'a>(name: &str, config: &'a Config) -> Option<&'a FastCgiBackend> {
-    let extension = Path::new(name).extension()?.to_str()?.to_ascii_lowercase();
+/// Finds the backend for a file name, as its position in `Config::fastcgi`.
+/// Configured extensions are lower case, so the comparison ignores the case
+/// of the name instead of allocating a lowered copy of its extension.
+fn backend_for_name(name: &str, config: &Config) -> Option<usize> {
+    let extension = Path::new(name).extension()?.to_str()?;
     config
         .fastcgi
         .iter()
-        .find(|backend| backend.extension == extension)
+        .position(|backend| backend.extension.eq_ignore_ascii_case(extension))
 }
 
 fn uri_path(segments: &[&str]) -> String {
     let mut path = String::new();
     for segment in segments {
         path.push('/');
-        for byte in segment.bytes() {
-            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
-                path.push(char::from(byte));
-            } else {
-                path.push_str(&format!("%{byte:02X}"));
-            }
-        }
+        handler::percent_encode_into(&mut path, segment);
     }
     path
 }
@@ -232,8 +231,8 @@ where
     let request_body = collected.to_bytes();
     let params = build_params(&parts, &script, config, peer, local, request_body.len());
     let timeout = config.fastcgi_timeout;
-    let operation = async move {
-        match script.backend.address {
+    let operation = async {
+        match &config.fastcgi[script.backend].address {
             FastCgiAddress::Tcp(address) => {
                 let stream = TcpStream::connect(address.as_str())
                     .await
@@ -302,25 +301,24 @@ fn hold_worker_lease(
     Response::from_parts(parts, StreamBody::new(stream).boxed_unsync())
 }
 
-fn build_params(
-    parts: &Parts,
-    script: &ResolvedScript,
-    config: &Config,
+/// Builds the CGI environment for a request. Values are borrowed from the
+/// request, the script and the configuration wherever they can be.
+fn build_params<'a>(
+    parts: &'a Parts,
+    script: &'a ResolvedScript,
+    config: &'a Config,
     peer: SocketAddr,
     local: SocketAddr,
     content_length: usize,
-) -> Params<'static> {
+) -> Params<'a> {
     let path = parts.uri.path();
-    let request_uri = parts
-        .extensions
-        .get::<handler::OriginalUri>()
-        .map(|uri| uri.0.clone())
-        .unwrap_or_else(|| {
-            parts
-                .uri
-                .query()
-                .map_or_else(|| path.to_owned(), |query| format!("{path}?{query}"))
-        });
+    let request_uri = match parts.extensions.get::<handler::OriginalUri>() {
+        Some(uri) => Cow::Borrowed(uri.0.as_str()),
+        None => match parts.uri.query() {
+            Some(query) => Cow::Owned(format!("{path}?{query}")),
+            None => Cow::Borrowed(path),
+        },
+    };
     let server_name = parts
         .headers
         .get(header::HOST)
@@ -346,19 +344,15 @@ fn build_params(
         .headers
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
-        .unwrap_or_default()
-        .to_owned();
+        .unwrap_or_default();
     let mut params = Params::default()
         .custom("GATEWAY_INTERFACE", "CGI/1.1")
         .custom("SERVER_SOFTWARE", "project-charlotte")
-        .custom("SERVER_PROTOCOL", protocol.to_owned())
-        .custom("REQUEST_METHOD", parts.method.as_str().to_owned())
-        .custom(
-            "SCRIPT_FILENAME",
-            script.path.to_string_lossy().into_owned(),
-        )
-        .custom("SCRIPT_NAME", script.script_name.clone())
-        .custom("PATH_INFO", script.path_info.clone())
+        .custom("SERVER_PROTOCOL", protocol)
+        .custom("REQUEST_METHOD", parts.method.as_str())
+        .custom("SCRIPT_FILENAME", script.path.to_string_lossy())
+        .custom("SCRIPT_NAME", script.script_name.as_str())
+        .custom("PATH_INFO", script.path_info.as_str())
         .custom(
             "PATH_TRANSLATED",
             if script.path_info.is_empty() {
@@ -371,13 +365,10 @@ fn build_params(
                     .into_owned()
             },
         )
-        .custom(
-            "QUERY_STRING",
-            parts.uri.query().unwrap_or_default().to_owned(),
-        )
+        .custom("QUERY_STRING", parts.uri.query().unwrap_or_default())
         .custom("REQUEST_URI", request_uri)
-        .custom("DOCUMENT_ROOT", config.root.to_string_lossy().into_owned())
-        .custom("DOCUMENT_URI", path.to_owned())
+        .custom("DOCUMENT_ROOT", config.root.to_string_lossy())
+        .custom("DOCUMENT_URI", path)
         .custom("REMOTE_ADDR", peer.ip().to_string())
         .custom("REMOTE_PORT", peer.port().to_string())
         .custom("SERVER_ADDR", local.ip().to_string())
@@ -420,13 +411,17 @@ fn build_params(
                 .collect::<String>()
         );
         let separator = if name == header::COOKIE { "; " } else { ", " };
-        let value = parts
-            .headers
-            .get_all(name)
-            .iter()
-            .map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned())
-            .collect::<Vec<_>>()
-            .join(separator);
+        let mut values = parts.headers.get_all(name).iter();
+        let Some(first) = values.next() else {
+            continue;
+        };
+        // A header nearly always has one value, which is passed on as it is.
+        let mut value = String::from_utf8_lossy(first.as_bytes());
+        for next in values {
+            let value = value.to_mut();
+            value.push_str(separator);
+            value.push_str(&String::from_utf8_lossy(next.as_bytes()));
+        }
         params = params.custom(key, value);
     }
     params
@@ -449,7 +444,7 @@ fn is_cgi_excluded_header(name: &HeaderName, connection_headers: &HashSet<String
 
 async fn execute<S>(
     stream: S,
-    params: Params<'static>,
+    params: Params<'_>,
     request_body: Bytes,
     timeout: Duration,
 ) -> Result<Response<ResponseBody>, String>
@@ -463,30 +458,36 @@ where
         .execute_once_stream(request)
         .await
         .map_err(|error| error.to_string())?;
-    let mut stdout = BytesMut::new();
+    // Holds the headers only when they span more than one chunk. Usually the
+    // first chunk carries all of them, and is parsed and sliced where it is.
+    let mut partial = BytesMut::new();
 
     loop {
         match output.next().await {
             Some(Ok(Content::Stdout(chunk))) => {
-                stdout.extend_from_slice(&chunk);
+                let mut stdout = if partial.is_empty() {
+                    chunk
+                } else {
+                    partial.extend_from_slice(&chunk);
+                    std::mem::take(&mut partial).freeze()
+                };
                 if let Some((header_end, delimiter_length)) = find_header_end(&stdout) {
                     if header_end > MAX_CGI_HEADER {
                         return Err("FastCGI response headers exceeded the limit".to_owned());
                     }
                     let parsed = parse_cgi_headers(&stdout[..header_end])?;
-                    let body_start = header_end + delimiter_length;
-                    let initial_body = Bytes::copy_from_slice(&stdout[body_start..]);
+                    let initial_body = stdout.split_off(header_end + delimiter_length);
                     let body =
                         handler::coalesce_ready_body(response_body(output, initial_body, timeout));
                     let mut response = handler::response(parsed.status, body);
-                    for (name, value) in &parsed.headers {
-                        response.headers_mut().append(name.clone(), value.clone());
-                    }
+                    // `parsed.headers` never names the headers already set.
+                    response.headers_mut().extend(parsed.headers);
                     return Ok(response);
                 }
                 if stdout.len() > MAX_CGI_HEADER {
                     return Err("FastCGI response headers exceeded the limit".to_owned());
                 }
+                partial = stdout.into();
             }
             Some(Ok(Content::Stderr(chunk))) => log_stderr(&chunk),
             Some(Err(error)) => return Err(error.to_string()),
@@ -522,7 +523,7 @@ fn parse_cgi_headers(bytes: &[u8]) -> Result<ParsedHeaders, String> {
                 }
             }
         }
-        fields.push((name, value.to_vec()));
+        fields.push((name, value));
     }
 
     let mut status = None;
@@ -530,7 +531,7 @@ fn parse_cgi_headers(bytes: &[u8]) -> Result<ParsedHeaders, String> {
     let mut headers = HeaderMap::new();
     for (name, value) in fields {
         if name.as_str().eq_ignore_ascii_case("status") {
-            let value = std::str::from_utf8(&value)
+            let value = std::str::from_utf8(value)
                 .map_err(|_| "invalid FastCGI status header".to_owned())?;
             let code = value
                 .split_ascii_whitespace()
@@ -555,7 +556,7 @@ fn parse_cgi_headers(bytes: &[u8]) -> Result<ParsedHeaders, String> {
         {
             continue;
         }
-        let value = HeaderValue::from_bytes(&value)
+        let value = HeaderValue::from_bytes(value)
             .map_err(|_| "invalid FastCGI response header value".to_owned())?;
         headers.append(name, value);
     }
@@ -665,6 +666,7 @@ mod tests {
     use http::StatusCode;
     use http_body::Body;
     use http_body_util::BodyExt;
+    use std::sync::Arc;
     use std::{
         net::SocketAddr,
         path::PathBuf,
@@ -740,7 +742,7 @@ mod tests {
         tokio::fs::write(root.join("folder/index.php"), "<?php")
             .await
             .unwrap();
-        let config = test_config(tokio::fs::canonicalize(&root).await.unwrap());
+        let config = Arc::new(test_config(tokio::fs::canonicalize(&root).await.unwrap()));
 
         let relative = decode_request_path("/app.php/extra/path").unwrap();
         let script = resolve_script(&relative, "/app.php/extra/path", &config)
@@ -769,7 +771,7 @@ mod tests {
             path: PathBuf::from("/var/www/app.php"),
             script_name: "/app.php".to_owned(),
             path_info: "/info".to_owned(),
-            backend: config.fastcgi[0].clone(),
+            backend: 0,
         };
         let request = http::Request::builder()
             .method("POST")
@@ -845,9 +847,9 @@ mod tests {
             path: PathBuf::from("/var/www/app.php"),
             script_name: "/app.php".to_owned(),
             path_info: String::new(),
-            backend: config.fastcgi[0].clone(),
+            backend: 0,
         };
-        let build = |secure: bool| {
+        let parts = |secure: bool| {
             let mut request = http::Request::builder()
                 .uri("/app.php")
                 .header("X-Real-IP", "198.51.100.7")
@@ -857,9 +859,11 @@ mod tests {
             if secure {
                 request.extensions_mut().insert(crate::vhost::TlsSni(None));
             }
-            let (parts, ()) = request.into_parts();
+            request.into_parts().0
+        };
+        let build = |parts| {
             build_params(
-                &parts,
+                parts,
                 &script,
                 &config,
                 "192.0.2.1:12345".parse().unwrap(),
@@ -867,11 +871,13 @@ mod tests {
                 0,
             )
         };
-        let plain = build(false);
+        let plain_parts = parts(false);
+        let plain = build(&plain_parts);
         assert_eq!(plain["HTTP_X_REAL_IP"], "198.51.100.7");
         assert_eq!(plain["REQUEST_SCHEME"], "http");
         assert!(!plain.contains_key("HTTPS"));
-        let secure = build(true);
+        let secure_parts = parts(true);
+        let secure = build(&secure_parts);
         assert_eq!(secure["REQUEST_SCHEME"], "https");
         assert_eq!(secure["HTTPS"], "on");
     }
@@ -908,6 +914,7 @@ mod tests {
         let mut config = fuzz_support::fuzz_config(root.clone());
         // Makes `scripts/index.php` reachable as a directory index.
         config.index = "index.php".to_owned();
+        let config = Arc::new(config);
         let uri = request.uri().clone();
         let Some(relative) = decode_request_path(uri.path()) else {
             return;

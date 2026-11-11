@@ -73,7 +73,8 @@ async fn serve_connection(
     let sni = connection
         .handshake_data()
         .and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
-        .and_then(|data| data.server_name);
+        .and_then(|data| data.server_name)
+        .map(Arc::<str>::from);
     let mut h3_connection = h3::server::builder()
         .build(h3_quinn::Connection::new(connection))
         .await?;
@@ -117,7 +118,7 @@ async fn serve_request(
     router: Arc<Router>,
     peer: SocketAddr,
     local: SocketAddr,
-    sni: Option<String>,
+    sni: Option<Arc<str>>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let (mut request, request_stream) = resolver.resolve_request().await?;
     request.extensions_mut().insert(TlsSni(sni));
