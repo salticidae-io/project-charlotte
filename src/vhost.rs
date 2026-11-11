@@ -69,6 +69,8 @@ struct VhostFile {
     #[serde(default)]
     fastcgi: Vec<String>,
     #[serde(default)]
+    cgi: Vec<String>,
+    #[serde(default)]
     fastcgi_app: Vec<FastCgiAppFile>,
     fastcgi_timeout: Option<u64>,
     worker_threads: Option<usize>,
@@ -432,11 +434,22 @@ impl Router {
             for backend in &fastcgi {
                 if !extensions.insert(backend.extension.clone()) {
                     return Err(format!(
-                        "duplicate FastCGI extension in vhost: {}",
+                        "duplicate backend extension in vhost: {}",
                         backend.extension
                     )
                     .into());
                 }
+            }
+            for value in &entry.cgi {
+                let backend = crate::config::parse_cgi_backend(value)?;
+                if !extensions.insert(backend.extension.clone()) {
+                    return Err(format!(
+                        "duplicate backend extension in vhost: {}",
+                        backend.extension
+                    )
+                    .into());
+                }
+                fastcgi.push(backend);
             }
             for app_file in entry.fastcgi_app {
                 let Some(program) = app_file.command.first() else {
@@ -448,7 +461,7 @@ impl Router {
                 };
                 let extension = crate::config::normalize_extension(&app_file.extension)?;
                 if !extensions.insert(extension.clone()) {
-                    return Err(format!("duplicate FastCGI extension in vhost: {extension}").into());
+                    return Err(format!("duplicate backend extension in vhost: {extension}").into());
                 }
                 if app_file.command.iter().any(|part| part.contains('\0')) {
                     return Err("vhost FastCGI app command cannot contain NUL".into());
@@ -490,6 +503,11 @@ impl Router {
                         && path.is_relative()
                     {
                         *path = config_dir.join(&*path);
+                    }
+                    if let FastCgiAddress::Cgi(Some(interpreter)) = &mut backend.address
+                        && interpreter.is_relative()
+                    {
+                        *interpreter = config_dir.join(&*interpreter);
                     }
                     backend
                 })
@@ -1262,6 +1280,14 @@ fn build_worker_args(worker: WorkerArgs<'_>) -> Vec<OsString> {
                 args.push("--fastcgi-app-idle-timeout".into());
                 args.push(format!("{}={}", backend.extension, app.idle_timeout.as_secs()).into());
             }
+        } else if let FastCgiAddress::Cgi(interpreter) = &backend.address {
+            args.push("--cgi".into());
+            args.push(match interpreter {
+                Some(interpreter) => {
+                    format!("{}={}", backend.extension, interpreter.display()).into()
+                }
+                None => backend.extension.clone().into(),
+            });
         } else {
             args.push("--fastcgi".into());
             args.push(format_backend(backend).into());
@@ -1294,7 +1320,7 @@ fn spawned_app(backend: &FastCgiBackend) -> Option<&FastCgiApp> {
     match &backend.address {
         FastCgiAddress::Spawn(app) => Some(app),
         FastCgiAddress::Pool(pool) => Some(pool.app()),
-        FastCgiAddress::Tcp(_) | FastCgiAddress::Unix(_) => None,
+        FastCgiAddress::Tcp(_) | FastCgiAddress::Unix(_) | FastCgiAddress::Cgi(_) => None,
     }
 }
 
@@ -1306,6 +1332,12 @@ fn format_backend(backend: &FastCgiBackend) -> String {
     match &backend.address {
         FastCgiAddress::Tcp(address) => format!("{}={address}", backend.extension),
         FastCgiAddress::Unix(path) => format!("{}=unix:{}", backend.extension, path.display()),
+        FastCgiAddress::Cgi(interpreter) => match interpreter {
+            Some(interpreter) => {
+                format!("{}={}", backend.extension, interpreter.display())
+            }
+            None => backend.extension.clone(),
+        },
         FastCgiAddress::Spawn(app) => format!("{}={}", backend.extension, app.program.display()),
         FastCgiAddress::Pool(pool) => {
             format!("{}={}", backend.extension, pool.app().program.display())
@@ -1386,6 +1418,7 @@ mod tests {
             listing: None,
             try_files: None,
             fastcgi: Vec::new(),
+            cgi: Vec::new(),
             fastcgi_app: Vec::new(),
             fastcgi_timeout: None,
             worker_threads: None,
@@ -1699,6 +1732,39 @@ mod tests {
             Some(r#"[["cgi","APP_MODE","worker"]]"#)
         );
         assert_eq!(worker_app_env(&backends[..1]), None);
+    }
+
+    #[test]
+    fn parses_and_forwards_vhost_cgi_backends() {
+        let file = parse_file_config(
+            "vhost:\n  - server_names: [cgi.example]\n    root: /srv/cgi\n    user: cgi\n    cgi: [cgi, py=/usr/bin/python3]\n",
+        )
+        .unwrap();
+        assert_eq!(file.vhost[0].cgi, ["cgi", "py=/usr/bin/python3"]);
+        let backends = file.vhost[0]
+            .cgi
+            .iter()
+            .map(|value| crate::config::parse_cgi_backend(value).unwrap())
+            .collect::<Vec<_>>();
+        let args = build_worker_args(WorkerArgs {
+            uid: 1001,
+            gid: 1002,
+            root: Path::new("/srv/cgi"),
+            index: "index.html",
+            listing: true,
+            try_files: &[],
+            fastcgi: &backends,
+            timeout: Duration::from_secs(30),
+        });
+        let args = args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(args.windows(2).any(|pair| pair == ["--cgi", "cgi"]));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--cgi", "py=/usr/bin/python3"])
+        );
     }
 
     #[test_fuzz::test_fuzz]
