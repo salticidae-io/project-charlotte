@@ -1,4 +1,0 @@
-NConnection: close, X-Private
-X-Private: 1
-Server: backend
-Location: /next

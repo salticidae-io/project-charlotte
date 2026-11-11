@@ -1,4 +1,0 @@
-K[[vhost]]
-server_names = ["example.test"]
-root = "/tmp/site"
-user = "user"
