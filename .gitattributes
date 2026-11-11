@@ -1,0 +1,3 @@
+# Fuzz inputs are raw bytes; CRLF sequences in them are test data.
+fuzz/corpus/** -text -diff
+fuzz/findings/** -text -diff
