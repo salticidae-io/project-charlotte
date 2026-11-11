@@ -146,7 +146,7 @@ Parsers and helpers:
 - `acme::tests::dns_name`, `challenge_path` — eligible names map to files
   directly inside the cache directory; challenge tokens use only the
   base64url alphabet.
-- `config::tests::cli_args`, `fastcgi_backend`, `vhost::tests::vhost_toml`,
+- `config::tests::cli_args`, `fastcgi_backend`, `vhost::tests::vhost_yaml`,
   `mime::tests::mime_for_path` — panic-only.
 
 Not fuzzed: certificate and key file loading (`rustls-pemfile`,

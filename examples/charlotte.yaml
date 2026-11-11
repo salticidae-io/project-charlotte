@@ -2,7 +2,7 @@
 #
 # Pass this file with `--config`:
 #
-#     project-charlotte --config /etc/charlotte/charlotte.toml \
+#     project-charlotte --config /etc/charlotte/charlotte.yaml \
 #         --bind 0.0.0.0:80 --tls-bind 0.0.0.0:443 \
 #         --tls-cert /etc/charlotte/default.pem \
 #         --tls-key  /etc/charlotte/default.key
@@ -24,12 +24,12 @@
 # with `--worker` and dropping privileges to the configured user and group.
 # A request whose Host header matches no virtual host is served by the master
 # process from the `--root` directory, unless a virtual host is marked
-# `default = true`.
+# `default: true`.
 #
 # Relative paths (root, tls_cert, tls_key, unix: FastCGI sockets) are resolved
 # against the directory containing this file, not the working directory.
-# `vhost_dir` is also relative to this file; visible `*.toml` files in that
-# directory are watched for additions, changes, deletions and atomic renames.
+# `vhost_dir` is also relative to this file; visible `*.yaml` and `*.yml` files
+# in that directory are watched for additions, changes, deletions and renames.
 # Invalid updates are rejected and the last valid configuration remains active.
 #
 # This file, the `vhost_dir` directory and the files in it decide which
@@ -37,109 +37,110 @@
 # the user running the server and must not be world-writable; otherwise the
 # server refuses to load them.
 
-vhost_dir = "vhosts.d"
+vhost_dir: vhosts.d
 
 
 # --------------------------------------------------------------------------
 # A plain static site, marked as the catch-all for unmatched requests.
 # --------------------------------------------------------------------------
-[[vhost]]
+vhost:
+  -
 # Required. One or more host names. A leading "*." makes it a wildcard that
 # matches one or more labels in place of the star; "*.example.com" matches
 # "www.example.com" but not "example.com" itself. Ports are not allowed, and a
 # name may only appear once across the whole file. Exact matches beat
 # wildcards, and a longer wildcard suffix beats a shorter one.
-server_names = ["example.com", "www.example.com"]
+    server_names: [example.com, www.example.com]
 
 # Required. Document root served by this virtual host's worker.
-root = "/srv/www/example.com/public"
+    root: /srv/www/example.com/public
 
 # Required. The worker drops to this user. The account must exist and must
 # not be root.
-user = "www-example"
+    user: www-example
 
 # Optional. Defaults to the user's primary group.
-group = "www-data"
+    group: www-data
 
 # Optional. Falls back to the --index value (default "index.html").
 # Must be a bare file name: no "/", no "\", not "." or "..".
-index = "index.html"
+    index: index.html
 
 # Optional. Falls back to --no-listing / the default of true.
-listing = false
+    listing: false
 
 # Optional. Try candidates in order; the final entry is an internal URI
 # fallback or a status such as =404. Supported variables are $uri, $args,
 # $query_string and $is_args. For example:
-# try_files = ["$uri", "$uri/", "/index.html", "=404"]
+# try_files: ["$uri", "$uri/", "/index.html", "=404"]
 
 # Optional. Requires global rules supplied with --modsecurity-rules. Rule IDs
 # and inclusive ID ranges can be disabled for this vhost only; the rule-file
 # ruleset remains active for every other host. For example:
-# modsecurity_disable_rules = [100001, "2000-2099"]
+# modsecurity_disable_rules: [100001, "2000-2099"]
 
 # Optional. Requires global ModSecurity rules. Overrides the global
 # --modsecurity-block-status for blocking interventions on this vhost; valid
 # values are 400-599. Redirect interventions retain their configured status.
-# modsecurity_block_status = 451
+# modsecurity_block_status: 451
 
 # Optional. At most one virtual host in the file may set this. It receives
 # every request that matches no other host (and supplies the fallback
 # certificate for TLS clients that send no SNI).
-default = true
+    default: true
 
 # Optional, but required together. The certificate presented for these server
 # names via SNI. PEM encoded; the key may be PKCS#8, PKCS#1 or SEC1.
-tls_cert = "tls/example.com.pem"
-tls_key = "tls/example.com.key"
+    tls_cert: tls/example.com.pem
+    tls_key: tls/example.com.key
 
 
 # --------------------------------------------------------------------------
 # PHP over an existing FastCGI pool (php-fpm), reached over a Unix socket.
 # --------------------------------------------------------------------------
-[[vhost]]
-server_names = ["blog.example.com"]
-root = "/srv/www/blog/public"
-user = "www-blog"
-index = "index.php"
-listing = false
+  -
+    server_names: [blog.example.com]
+    root: /srv/www/blog/public
+    user: www-blog
+    index: index.php
+    listing: false
 
 # Each entry is "EXTENSION=ADDRESS". The extension is matched
 # case-insensitively and a leading dot is optional, so "php", ".php" and
 # ".PHP" are the same backend; an extension may only be declared once per
 # virtual host. The address is either "unix:/path/to/socket" or "HOST:PORT"
 # (bracket IPv6 literals, e.g. "[::1]:9000").
-fastcgi = ["php=unix:/run/php/php8.4-fpm.sock"]
+    fastcgi: ["php=unix:/run/php/php8.4-fpm.sock"]
 
 # Optional. Seconds to wait for the FastCGI backend before giving up.
 # Falls back to --fastcgi-timeout (default 60). Must be greater than zero.
-fastcgi_timeout = 30
+    fastcgi_timeout: 30
 
 # Optional. Number of Tokio runtime threads in this vhost's worker process
 # (1-1024). Falls back to --worker-threads (default 2). The master process
 # thread count is set with --threads (default: one per CPU core).
-worker_threads = 4
+    worker_threads: 4
 
-tls_cert = "tls/blog.example.com.pem"
-tls_key = "tls/blog.example.com.key"
+    tls_cert: tls/blog.example.com.pem
+    tls_key: tls/blog.example.com.key
 
 
 # --------------------------------------------------------------------------
 # A wildcard host where charlotte spawns and supervises the FastCGI process
 # itself, instead of connecting to a pool someone else manages.
 # --------------------------------------------------------------------------
-[[vhost]]
-server_names = ["*.customers.example.com"]
-root = "/srv/www/customers/public"
-user = "www-customers"
-group = "www-customers"
-index = "index.php"
-listing = false
-fastcgi_timeout = 120
+  -
+    server_names: ["*.customers.example.com"]
+    root: /srv/www/customers/public
+    user: www-customers
+    group: www-customers
+    index: index.php
+    listing: false
+    fastcgi_timeout: 120
 
 # Backends charlotte connects to, alongside the spawned apps below. A TCP
 # pool on the loopback interface:
-fastcgi = ["cgi=127.0.0.1:9001"]
+    fastcgi: ["cgi=127.0.0.1:9001"]
 
 # Apps charlotte starts and supervises for this virtual host. One worker starts
 # at launch; additional workers are started on demand when concurrent requests
@@ -151,45 +152,44 @@ fastcgi = ["cgi=127.0.0.1:9001"]
 # charlotte restarts it.
 # Extensions must not collide with one declared in `fastcgi` above or another
 # `fastcgi_app` entry.
-[[vhost.fastcgi_app]]
-extension = "php"
+    fastcgi_app:
+      - extension: php
 
 # argv for the child process: the program first, then its arguments. Must not
 # be empty.
-command = ["/usr/bin/php8.4-cgi"]
+        command: ["/usr/bin/php8.4-cgi"]
 
 # Optional. Maximum number of independently supervised workers to spawn on
 # demand (1-256); defaults to 1.
-max_workers = 4
+        max_workers: 4
 
 # Optional. Reap surplus idle workers after this many seconds (1-86400); one
 # worker is always kept ready. Defaults to 60 seconds.
-idle_timeout = 60
+        idle_timeout: 60
 
 # Optional environment for the child. Keys must look like shell identifiers:
 # a letter or underscore, then letters, digits or underscores.
-[vhost.fastcgi_app.env]
-PHP_FCGI_CHILDREN = "8"
-PHP_FCGI_MAX_REQUESTS = "1000"
-APP_ENV = "production"
+        env:
+          PHP_FCGI_CHILDREN: "8"
+          PHP_FCGI_MAX_REQUESTS: "1000"
+          APP_ENV: production
 
 # A second independently supervised app can map another extension to the same
 # executable, with its own listening socket and environment.
-[[vhost.fastcgi_app]]
-extension = "phtml"
-command = ["/usr/bin/php8.4-cgi"]
-env = { PHP_FCGI_CHILDREN = "4", APP_ENV = "production" }
+      - extension: phtml
+        command: ["/usr/bin/php8.4-cgi"]
+        env: { PHP_FCGI_CHILDREN: "4", APP_ENV: production }
 
 
 # --------------------------------------------------------------------------
 # A host with no TLS of its own: reachable over plaintext, and over TLS only
 # through the default host's certificate.
 # --------------------------------------------------------------------------
-[[vhost]]
-server_names = ["internal.example.com"]
-root = "/srv/www/internal"
-user = "www-internal"
-listing = true
+  -
+    server_names: [internal.example.com]
+    root: /srv/www/internal
+    user: www-internal
+    listing: true
 # Optional. Set false to exclude this virtual host from automatic ACME
 # provisioning; it is enabled by default when --acme-directory is configured.
-# For example, set `acme = false` here to opt out.
+# For example, set `acme: false` here to opt out.

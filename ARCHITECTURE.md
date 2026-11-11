@@ -11,7 +11,7 @@ shutdown.
 
 `config::Config::parse` reads command-line options for listener addresses,
 document roots, static-file behavior, FastCGI, TLS, ACME, ModSecurity, thread
-counts, and worker privileges. An optional TOML configuration file declares
+counts, and worker privileges. An optional YAML configuration file declares
 virtual hosts and can name a directory of additional virtual-host files.
 Paths in those declarations are resolved relative to their configuration
 source. The [examples](examples/) directory contains project examples.
@@ -79,8 +79,8 @@ listening socket in a private per-app directory. When the pool is idle, extra
 processes are reaped after `idle_timeout` seconds (1–86,400, default 60), while
 one process remains available. The CLI options are
 `--fastcgi-app-max-workers EXT=N` and
-`--fastcgi-app-idle-timeout EXT=SECS`; virtual-host TOML uses `max_workers` and
-`idle_timeout` (the older `workers` TOML field and
+`--fastcgi-app-idle-timeout EXT=SECS`; virtual-host YAML uses `max_workers` and
+`idle_timeout` (the older `workers` YAML field and
 `--fastcgi-app-workers` option remain aliases for `max_workers`). Each process
 is supervised and restarted independently.
 

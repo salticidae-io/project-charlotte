@@ -118,14 +118,14 @@ impl Fixture {
             }
         });
 
-        let config_path = root.join("vhosts.toml");
+        let config_path = root.join("vhosts.yaml");
         let user = User::from_uid(geteuid()).unwrap().unwrap().name;
         std::fs::write(
             &config_path,
             format!(
                 concat!(
-                    "[[vhost]]\nserver_names = [\"alpha.acme.test\"]\nroot = {:?}\nuser = {:?}\n\n",
-                    "[[vhost]]\nserver_names = [\"disabled.acme.test\"]\nroot = {:?}\nuser = {:?}\nacme = false\n"
+                    "vhost:\n  - server_names: [alpha.acme.test]\n    root: {:?}\n    user: {:?}\n",
+                    "  - server_names: [disabled.acme.test]\n    root: {:?}\n    user: {:?}\n    acme: false\n"
                 ),
                 alpha.to_string_lossy(),
                 user,
@@ -372,12 +372,12 @@ impl IssuanceFixture {
             }
         });
 
-        let config_path = root.join("vhosts.toml");
+        let config_path = root.join("vhosts.yaml");
         let user = User::from_uid(geteuid()).unwrap().unwrap().name;
         std::fs::write(
             &config_path,
             format!(
-                "[[vhost]]\nserver_names = [{ISSUANCE_HOST:?}]\nroot = {:?}\nuser = {:?}\n",
+                "vhost:\n  - server_names: [{ISSUANCE_HOST:?}]\n    root: {:?}\n    user: {:?}\n",
                 site.to_string_lossy(),
                 user,
             ),
@@ -416,7 +416,7 @@ impl IssuanceFixture {
             self.address,
             self.tls_address,
             &self.root.join("fallback"),
-            &self.root.join("vhosts.toml"),
+            &self.root.join("vhosts.yaml"),
             &self.cache,
             &self.root.join("acme-ca.pem"),
             self.acme_address,

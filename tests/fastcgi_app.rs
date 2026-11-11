@@ -59,7 +59,7 @@ impl Fixture {
             .stderr(Stdio::inherit())
             .env("CHARLOTTE_INHERITED_MARKER", "must-not-reach-app");
         if let Some(config) = vhost_config {
-            let config_path = root.join("vhosts.toml");
+            let config_path = root.join("vhosts.yaml");
             std::fs::write(&config_path, config).unwrap();
             command.arg("--config").arg(config_path);
         } else {
@@ -616,7 +616,7 @@ async fn starts_vhost_application_inside_privileged_worker_identity() {
     let command = std::env::current_exe().unwrap();
     let user = User::from_uid(geteuid()).unwrap().unwrap().name;
     let config = format!(
-        "[[vhost]]\nserver_names = [\"app.test\"]\nroot = {:?}\nuser = {:?}\n\n[[vhost.fastcgi_app]]\nextension = \"php\"\ncommand = [{:?}, \"--exact\", \"fcgi_app_helper\", \"--nocapture\"]\nenv = {{ CHARLOTTE_FCGI_HELPER = \"1\", APP_MODE = \"vhost\", CHARLOTTE_FCGI_DELAY_MS = \"200\" }}\nmax_workers = 3\n",
+        "vhost:\n  - server_names: [app.test]\n    root: {:?}\n    user: {:?}\n    fastcgi_app:\n      - extension: php\n        command: [{:?}, --exact, fcgi_app_helper, --nocapture]\n        env: {{ CHARLOTTE_FCGI_HELPER: \"1\", APP_MODE: vhost, CHARLOTTE_FCGI_DELAY_MS: \"200\" }}\n        max_workers: 3\n",
         site.to_string_lossy(),
         user,
         command.to_string_lossy()

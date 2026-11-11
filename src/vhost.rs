@@ -47,7 +47,7 @@ const WORKER_SHUTDOWN_POLL: Duration = Duration::from_millis(5);
 type WorkerRequestBody = UnsyncBoxBody<Bytes, io::Error>;
 type WorkerSender = SendRequest<WorkerRequestBody>;
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileConfig {
     #[serde(default)]
@@ -218,7 +218,7 @@ impl Router {
         let file = if let Some(path) = path {
             ensure_trusted_config(path)?;
             let content = std::fs::read_to_string(path)?;
-            toml::from_str(&content)?
+            parse_file_config(&content)?
         } else {
             FileConfig {
                 vhost: Vec::new(),
@@ -257,7 +257,7 @@ impl Router {
             let entries = if old.is_some_and(|source| source.content == content) {
                 old.expect("checked source exists").entries.clone()
             } else {
-                let file: FileConfig = toml::from_str(&content)?;
+                let file = parse_file_config(&content)?;
                 file.vhost
             };
             candidates.push((path, content, entries));
@@ -1170,7 +1170,7 @@ fn scan_vhost_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
             .is_some_and(|name| !name.to_string_lossy().starts_with('.'))
             && path
                 .extension()
-                .is_some_and(|extension| extension == "toml")
+                .is_some_and(|extension| extension == "yaml" || extension == "yml")
             && path.is_file()
         {
             files.push(path);
@@ -1178,6 +1178,14 @@ fn scan_vhost_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
     }
     files.sort();
     Ok(files)
+}
+
+fn parse_file_config(content: &str) -> Result<FileConfig, serde_yaml_ng::Error> {
+    if content.trim().is_empty() {
+        Ok(FileConfig::default())
+    } else {
+        serde_yaml_ng::from_str(content)
+    }
 }
 
 fn resolve_identity(
@@ -1321,8 +1329,8 @@ mod tests {
     use super::{
         FileConfig, Router, TlsSni, Vhost, VhostFile, VhostTable, Worker, WorkerArgs,
         build_worker_args, ensure_trusted_config, match_score, normalize_host,
-        normalize_server_name, request_host, resolve_identity, scan_vhost_files, select_route,
-        validate_index, validate_vhost_declarations, validate_vhost_waf_declarations,
+        normalize_server_name, parse_file_config, request_host, resolve_identity, scan_vhost_files,
+        select_route, validate_index, validate_vhost_declarations, validate_vhost_waf_declarations,
         worker_app_env, worker_request,
     };
     use crate::{
@@ -1391,14 +1399,14 @@ mod tests {
     }
 
     #[test]
-    fn validates_toml_vhost_names_and_defaults() {
-        let parsed: FileConfig = toml::from_str(
+    fn validates_yaml_vhost_names_and_defaults() {
+        let parsed: FileConfig = serde_yaml_ng::from_str(
             r#"
-                [[vhost]]
-                server_names = ["Example.com", "www.example.com"]
-                root = "/tmp/site"
-                user = "example"
-                default = true
+                vhost:
+                  - server_names: [Example.com, www.example.com]
+                    root: /tmp/site
+                    user: example
+                    default: true
             "#,
         )
         .unwrap();
@@ -1432,13 +1440,13 @@ mod tests {
 
     #[test]
     fn parses_and_validates_vhost_try_files() {
-        let parsed: FileConfig = toml::from_str(
+        let parsed: FileConfig = serde_yaml_ng::from_str(
             r#"
-                [[vhost]]
-                server_names = ["try-files.example"]
-                root = "/srv/site"
-                user = "site"
-                try_files = ["$uri", "$uri/", "/index.html", "=404"]
+                vhost:
+                  - server_names: [try-files.example]
+                    root: /srv/site
+                    user: site
+                    try_files: ["$uri", "$uri/", /index.html, "=404"]
             "#,
         )
         .unwrap();
@@ -1455,13 +1463,13 @@ mod tests {
 
     #[test]
     fn parses_and_validates_modsecurity_rule_exclusions() {
-        let parsed: FileConfig = toml::from_str(
+        let parsed: FileConfig = serde_yaml_ng::from_str(
             r#"
-                [[vhost]]
-                server_names = ["example.test"]
-                root = "/tmp/site"
-                user = "example"
-                modsecurity_disable_rules = [100001, "2000-2099"]
+                vhost:
+                  - server_names: [example.test]
+                    root: /tmp/site
+                    user: example
+                    modsecurity_disable_rules: [100001, "2000-2099"]
             "#,
         )
         .unwrap();
@@ -1471,9 +1479,9 @@ mod tests {
 
         for rule in ["0", "2099-2000", "1001;SecRuleEngine Off", "1-2-3"] {
             let config = format!(
-                "[[vhost]]\nserver_names = [\"example.test\"]\nroot = \"/tmp/site\"\nuser = \"example\"\nmodsecurity_disable_rules = [\"{rule}\"]\n"
+                "vhost:\n  - server_names: [example.test]\n    root: /tmp/site\n    user: example\n    modsecurity_disable_rules: [\"{rule}\"]\n"
             );
-            let parsed: FileConfig = toml::from_str(&config).unwrap();
+            let parsed: FileConfig = serde_yaml_ng::from_str(&config).unwrap();
             assert!(
                 validate_vhost_declarations(&parsed.vhost).is_err(),
                 "{rule}"
@@ -1483,13 +1491,13 @@ mod tests {
 
     #[test]
     fn parses_and_validates_modsecurity_block_status() {
-        let parsed: FileConfig = toml::from_str(
+        let parsed: FileConfig = serde_yaml_ng::from_str(
             r#"
-                [[vhost]]
-                server_names = ["example.test"]
-                root = "/tmp/site"
-                user = "example"
-                modsecurity_block_status = 451
+                vhost:
+                  - server_names: [example.test]
+                    root: /tmp/site
+                    user: example
+                    modsecurity_block_status: 451
             "#,
         )
         .unwrap();
@@ -1507,19 +1515,18 @@ mod tests {
 
     #[test]
     fn parses_vhost_fastcgi_app_command_and_environment() {
-        let parsed: FileConfig = toml::from_str(
+        let parsed: FileConfig = serde_yaml_ng::from_str(
             r#"
-                [[vhost]]
-                server_names = ["php.example"]
-                root = "/srv/php"
-                user = "php"
-
-                [[vhost.fastcgi_app]]
-                extension = "php"
-                command = ["php8.4-cgi", "--foreground"]
-                env = { APP_MODE = "test" }
-                max_workers = 4
-                idle_timeout = 12
+                vhost:
+                  - server_names: [php.example]
+                    root: /srv/php
+                    user: php
+                    fastcgi_app:
+                      - extension: php
+                        command: [php8.4-cgi, --foreground]
+                        env: { APP_MODE: test }
+                        max_workers: 4
+                        idle_timeout: 12
             "#,
         )
         .unwrap();
@@ -1546,17 +1553,16 @@ mod tests {
         invalid.fastcgi_app[0].idle_timeout = Some(0);
         assert!(validate_vhost_declarations(&[invalid]).is_err());
 
-        let legacy: FileConfig = toml::from_str(
+        let legacy: FileConfig = serde_yaml_ng::from_str(
             r#"
-                [[vhost]]
-                server_names = ["legacy.example"]
-                root = "/srv/legacy"
-                user = "legacy"
-
-                [[vhost.fastcgi_app]]
-                extension = "php"
-                command = ["php-cgi"]
-                workers = 3
+                vhost:
+                  - server_names: [legacy.example]
+                    root: /srv/legacy
+                    user: legacy
+                    fastcgi_app:
+                      - extension: php
+                        command: [php-cgi]
+                        workers: 3
             "#,
         )
         .unwrap();
@@ -1565,10 +1571,11 @@ mod tests {
 
     #[test]
     fn example_config_parses_and_validates() {
-        let parsed: FileConfig = toml::from_str(include_str!("../examples/charlotte.toml"))
-            .expect("example configuration should parse");
+        let parsed: FileConfig =
+            serde_yaml_ng::from_str(include_str!("../examples/charlotte.yaml"))
+                .expect("example configuration should parse");
         let directory_entry: FileConfig =
-            toml::from_str(include_str!("../examples/vhosts.d/example.toml"))
+            serde_yaml_ng::from_str(include_str!("../examples/vhosts.d/example.yaml"))
                 .expect("example per-vhost file should parse");
         let mut entries = parsed.vhost;
         entries.extend(directory_entry.vhost);
@@ -1579,22 +1586,39 @@ mod tests {
     }
 
     #[test]
-    fn scans_only_visible_toml_files_in_sorted_order() {
+    fn parses_empty_config_as_no_vhosts() {
+        assert!(parse_file_config(" \n\t").unwrap().vhost.is_empty());
+    }
+
+    #[test]
+    fn scans_visible_yaml_files_in_sorted_order() {
         let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
         let directory = std::env::temp_dir().join(format!(
             "project-charlotte-vhost-scan-{}-{sequence}",
             std::process::id()
         ));
         std::fs::create_dir_all(&directory).unwrap();
-        for name in ["b.toml", "a.toml", ".hidden.toml", "swap.toml~", "temp.tmp"] {
+        for name in [
+            "b.yaml",
+            "a.yml",
+            "c.yaml",
+            "legacy.toml",
+            ".hidden.yaml",
+            "swap.yaml~",
+            "temp.tmp",
+        ] {
             std::fs::write(directory.join(name), "").unwrap();
         }
-        std::fs::create_dir(directory.join("directory.toml")).unwrap();
+        std::fs::create_dir(directory.join("directory.yaml")).unwrap();
 
         let files = scan_vhost_files(&directory).unwrap();
         assert_eq!(
             files,
-            vec![directory.join("a.toml"), directory.join("b.toml")]
+            vec![
+                directory.join("a.yml"),
+                directory.join("b.yaml"),
+                directory.join("c.yaml")
+            ]
         );
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -1731,19 +1755,19 @@ mod tests {
     }
 
     #[test_fuzz::test_fuzz]
-    fn vhost_toml(input: String) {
-        if let Ok(file) = toml::from_str::<FileConfig>(&input) {
+    fn vhost_yaml(input: String) {
+        if let Ok(file) = serde_yaml_ng::from_str::<FileConfig>(&input) {
             let _ = validate_vhost_declarations(&file.vhost);
         }
     }
 
     #[test]
-    fn fuzz_seed_vhost_toml() {
-        vhost_toml(
-            "[[vhost]]\nserver_names = [\"example.test\"]\nroot = \"/tmp/site\"\nuser = \"user\"\n"
+    fn fuzz_seed_vhost_yaml() {
+        vhost_yaml(
+            "vhost:\n  - server_names: [example.test]\n    root: /tmp/site\n    user: user\n"
                 .to_owned(),
         );
-        vhost_toml("[[vhost]]\nserver_names = [\"*..\"]\n".to_owned());
+        vhost_yaml("vhost:\n  - server_names: [\"*..\"]\n".to_owned());
     }
 
     #[test_fuzz::test_fuzz]
@@ -1931,7 +1955,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let path = std::env::temp_dir().join(format!(
-            "project-charlotte-trust-{}-{}.toml",
+            "project-charlotte-trust-{}-{}.yaml",
             std::process::id(),
             NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
         ));

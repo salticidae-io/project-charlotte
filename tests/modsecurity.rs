@@ -110,19 +110,19 @@ impl Fixture {
             std::fs::create_dir_all(&vhost_root).unwrap();
             std::fs::write(vhost_root.join("clean.txt"), "vhost response").unwrap();
             let user = User::from_uid(geteuid()).unwrap().unwrap();
-            let config_path = root.join("vhosts.toml");
+            let config_path = root.join("vhosts.yaml");
             let disable_rules = if disable_vhost_rule {
-                "modsecurity_disable_rules = [\"100001-100001\"]\n"
+                "    modsecurity_disable_rules: [\"100001-100001\"]\n"
             } else {
                 ""
             };
             let block_status = vhost_block_status
-                .map(|status| format!("modsecurity_block_status = {status}\n"))
+                .map(|status| format!("    modsecurity_block_status: {status}\n"))
                 .unwrap_or_default();
             std::fs::write(
                 &config_path,
                 format!(
-                    "[[vhost]]\nserver_names = [\"waf.example.test\"]\nroot = {:?}\nuser = {:?}\n{disable_rules}{block_status}",
+                    "vhost:\n  - server_names: [waf.example.test]\n    root: {:?}\n    user: {:?}\n{disable_rules}{block_status}",
                     vhost_root.to_string_lossy(),
                     user.name
                 ),
@@ -450,11 +450,11 @@ fn rejects_block_status_configuration_without_global_rules() {
     let vhost_root = root.join("vhost-root");
     std::fs::create_dir_all(&vhost_root).unwrap();
     let user = User::from_uid(geteuid()).unwrap().unwrap();
-    let config_path = root.join("vhosts.toml");
+    let config_path = root.join("vhosts.yaml");
     std::fs::write(
         &config_path,
         format!(
-            "[[vhost]]\nserver_names = [\"waf.example.test\"]\nroot = {:?}\nuser = {:?}\nmodsecurity_block_status = 452\n",
+            "vhost:\n  - server_names: [waf.example.test]\n    root: {:?}\n    user: {:?}\n    modsecurity_block_status: 452\n",
             vhost_root.to_string_lossy(),
             user.name
         ),
