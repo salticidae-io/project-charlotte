@@ -989,6 +989,7 @@ dependencies = [
 [[package]]
 name = "modsecurity-rs"
 version = "0.1.0"
+source = "git+https://github.com/fzylogic/modsecurity-rs#b445b2b8de9ea7680b304d36e4c5f60e0a038a7b"
 
 [[package]]
 name = "nix"
