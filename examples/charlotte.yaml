@@ -26,8 +26,8 @@
 # process from the `--root` directory, unless a virtual host is marked
 # `default: true`.
 #
-# Relative paths (root, tls_cert, tls_key, unix: FastCGI sockets) are resolved
-# against the directory containing this file, not the working directory.
+# Relative paths (root, tls_cert, tls_key, interpreter, unix: FastCGI sockets)
+# are resolved against the directory containing this file, not the working directory.
 # `vhost_dir` is also relative to this file; visible `*.yaml` and `*.yml` files
 # in that directory are watched for additions, changes, deletions and renames.
 # Invalid updates are rejected and the last valid configuration remains active.
@@ -111,6 +111,11 @@ vhost:
 # virtual host. The address is either "unix:/path/to/socket" or "HOST:PORT"
 # (bracket IPv6 literals, e.g. "[::1]:9000").
     fastcgi: ["php=unix:/run/php/php8.4-fpm.sock"]
+
+# Classic CGI uses the same extension list. With no interpreter, the script
+# must be executable; otherwise the configured interpreter receives its path.
+# The script itself must resolve to a file inside this vhost's document root.
+# Example: cgi: [cgi, "py=/usr/bin/python3"]
 
 # Optional. Seconds to wait for the FastCGI backend before giving up.
 # Falls back to --fastcgi-timeout (default 60). Must be greater than zero.

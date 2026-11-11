@@ -17,6 +17,7 @@ For a deeper description of the runtime and request flow, see
   and isolated worker processes that can drop to configured user/group IDs.
 - FastCGI over TCP or Unix sockets, with optional server-managed FastCGI
   application processes.
+- Classic CGI scripts, run directly or through a configured interpreter.
 - Optional ModSecurity request and response inspection.
 - Optional TLS with SNI-based certificate selection, ACME HTTP-01 certificate
   provisioning and renewal, and HTTP/3 over QUIC.
@@ -74,6 +75,7 @@ see all command-line options. Common options include:
 | `--tls-bind ADDRESS` | Listen for HTTPS; configure a certificate with `--tls-cert` and `--tls-key`, or use eligible ACME virtual hosts. |
 | `--http3-bind ADDRESS` | Enable the HTTP/3 listener; TLS configuration is required. |
 | `--fastcgi EXT=ADDR` | Route a file extension to a FastCGI TCP or Unix-socket backend. |
+| `--cgi EXT[=INTERPRETER]` | Execute matching scripts directly or with an interpreter; repeatable. |
 | `--fastcgi-app EXT=PROGRAM` | Start and supervise a FastCGI application for an extension. |
 | `--fastcgi-app-max-workers EXT=N` | Set the on-demand FastCGI app pool limit (1–256); defaults to one. |
 | `--fastcgi-app-idle-timeout EXT=SECS` | Reap surplus idle app workers after 1–86,400 seconds; defaults to 60 seconds. |
@@ -111,6 +113,20 @@ worker stays ready. The old `--fastcgi-app-workers` option remains as a
 deprecated alias for `--fastcgi-app-max-workers`. Workers restart immediately
 after a clean exit if they ran for at least 50 ms; failed or very short-lived
 processes are delayed to avoid a rapid restart loop.
+
+Classic CGI entries can be configured from the command line or in each virtual
+host's YAML `cgi` list. Without an interpreter, the script must be executable;
+with one, the interpreter receives the script path as its argument:
+
+```sh
+project-charlotte --root public --cgi cgi --cgi py=/usr/bin/python3
+```
+
+The equivalent vhost setting is `cgi: [cgi, "py=/usr/bin/python3"]`. CGI
+scripts are resolved under the document root, run as the server or vhost
+worker's user, and receive CGI request variables plus the request body on
+standard input. Their response headers are parsed as CGI headers and stdout is
+streamed to the client.
 
 The master normally keeps the identity of the account that starts it. To start
 as root and run the master as an unprivileged account, use `--user` and
