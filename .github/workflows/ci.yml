@@ -105,7 +105,9 @@ jobs:
       - name: Install AFL and test-fuzz
         run: |
           cargo install cargo-afl --locked
-          cargo afl config --build
+          # The AFL runtime can be restored from the Rust cache; rebuild it so
+          # it always matches the current toolchain.
+          cargo afl config --build --force
           cargo install cargo-test-fuzz --version 8.1.1 --locked
           sudo cargo afl system-config
 
