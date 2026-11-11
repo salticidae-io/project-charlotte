@@ -109,7 +109,7 @@ jobs:
           # it always matches the current toolchain.
           cargo afl config --build --force
           cargo install cargo-test-fuzz --version 8.1.1 --locked
-          sudo cargo afl system-config
+          cargo afl system-config
 
       - name: Fuzz every target
         working-directory: project-charlotte
