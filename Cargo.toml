@@ -18,7 +18,7 @@ http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1", "http2", "server"] }
 hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
 instant-acme = { version = "0.8.5", default-features = false, features = ["ring", "hyper-rustls", "rcgen"] }
-modsecurity-rs = { path = "../modsecurity-rs" }
+modsecurity-rs = { git = "https://github.com/fzylogic/modsecurity-rs" }
 nix = { version = "0.31.3", features = ["process", "signal", "user"] }
 notify = { version = "8", default-features = false }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
