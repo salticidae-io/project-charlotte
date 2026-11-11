@@ -34,14 +34,18 @@ For each target it records the seeds, adds the saved corpus, fuzzes for the
 given time, and then:
 
 - copies the inputs that reached new coverage to `fuzz/corpus/<target>/`.
-  Commit these: they are the starting point of the next run, so coverage
-  accumulates instead of being rediscovered, and they survive `cargo clean`.
+  The stored target name uses dots instead of Rust's `::` separators so the
+  corpus can be uploaded as a GitHub Actions artifact; the script restores the
+  original name under `target/corpus/` before running `test-fuzz`. Commit these
+  inputs: they are the starting point of the next run, so coverage accumulates
+  instead of being rediscovered, and they survive `cargo clean`.
 - copies crashes and hangs to `fuzz/findings/<target>/` and exits non-zero.
   Replay a finding with `cargo test-fuzz --exact <target> --replay crashes`,
   turn it into an ordinary regression test, and delete it once fixed.
 
 When a target's parameters change, its saved inputs no longer deserialize;
-delete `fuzz/corpus/<crate>::<target>/` and let the next run rebuild it.
+delete its dotted directory under `fuzz/corpus/` and let the next run rebuild
+it.
 
 To fuzz a single target by hand:
 

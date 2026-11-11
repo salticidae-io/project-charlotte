@@ -19,9 +19,36 @@ crate=project_charlotte
 # The seed tests record each target's starting corpus under target/corpus.
 cargo test --bin project-charlotte --quiet
 
-# Add the inputs saved by earlier runs.
+# Rust target names use `::`, which is not supported in artifact paths on all
+# platforms. The corpus store uses dots; test-fuzz still needs the original
+# names under target/corpus.
+safe() { printf '%s\n' "${1//::/.}"; }
+restore() { printf '%s\n' "${1//./::}"; }
+
 mkdir -p "$store" "$target_dir/corpus"
-cp -R "$store"/. "$target_dir/corpus"/
+
+# Migrate corpora saved by older versions of this script, merging any existing
+# entries before removing the legacy directory.
+for legacy in "$store"/*; do
+    [[ -d $legacy ]] || continue
+    name=${legacy##*/}
+    safe_name=$(safe "$name")
+    [[ $safe_name != "$name" ]] || continue
+    destination="$store/$safe_name"
+    mkdir -p "$destination"
+    cp -R "$legacy"/. "$destination"/
+    rm -r -- "$legacy"
+done
+
+# Restore test-fuzz's expected `::` directory names when seeding its corpus.
+for corpus in "$store"/*; do
+    [[ -d $corpus ]] || continue
+    name=${corpus##*/}
+    target_name=$(restore "$name")
+    target_corpus="$target_dir/corpus/$target_name"
+    mkdir -p "$target_corpus"
+    cp -R "$corpus"/. "$target_corpus"/
+done
 
 mapfile -t targets < <(
     cargo test-fuzz --list 2>&1 | grep -o '"[a-z0-9_:]*::tests::[a-z0-9_]*"' | tr -d '"'
@@ -37,11 +64,12 @@ for target in "${targets[@]}"; do
         continue
     fi
     echo "==> $target (${seconds}s)"
+    safe_target=$(safe "$target")
     # Start from the corpus rather than a previous session's AFL state.
     cargo test-fuzz --exact "$target" --reset >/dev/null 2>&1 || true
     if ! cargo test-fuzz --exact "$target" --max-total-time "$seconds" --no-ui --exit-code \
-        >"$target_dir/fuzz-$target.log" 2>&1; then
-        echo "    fuzzer failed; see $target_dir/fuzz-$target.log" >&2
+        >"$target_dir/fuzz-$safe_target.log" 2>&1; then
+        echo "    fuzzer failed; see $target_dir/fuzz-$safe_target.log" >&2
         failed+=("$target (fuzzer error)")
         continue
     fi
@@ -49,8 +77,8 @@ for target in "${targets[@]}"; do
     output="$target_dir/afl/output/${crate}::$target/default"
     for kind in crashes hangs; do
         if compgen -G "$output/$kind/id*" >/dev/null; then
-            mkdir -p "$findings/$target/$kind"
-            cp "$output/$kind"/id* "$findings/$target/$kind"/
+            mkdir -p "$findings/$safe_target/$kind"
+            cp "$output/$kind"/id* "$findings/$safe_target/$kind"/
             failed+=("$target ($kind)")
         fi
     done
@@ -58,12 +86,13 @@ for target in "${targets[@]}"; do
     # Keep the inputs that reached new coverage. They are named by content so
     # that repeated runs do not accumulate duplicates.
     saved=0
-    mkdir -p "$store/${crate}::$target"
+    safe_corpus=$(safe "$crate::$target")
+    mkdir -p "$store/$safe_corpus"
     for input in "$output"/queue/id*; do
         [[ -f $input ]] || continue
         name=$(sha256sum "$input" | cut -c1-40)
-        if [[ ! -e "$store/${crate}::$target/$name" ]]; then
-            cp "$input" "$store/${crate}::$target/$name"
+        if [[ ! -e "$store/$safe_corpus/$name" ]]; then
+            cp "$input" "$store/$safe_corpus/$name"
             saved=$((saved + 1))
         fi
     done
