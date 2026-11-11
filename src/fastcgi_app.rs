@@ -47,7 +47,7 @@ pub(crate) struct AppPool {
 
 struct WorkerSlot {
     id: u64,
-    socket_path: PathBuf,
+    socket_path: Arc<Path>,
     busy: bool,
     last_used: Instant,
     supervisor: JoinHandle<()>,
@@ -57,7 +57,7 @@ struct WorkerSlot {
 pub(crate) struct WorkerLease {
     pool: Arc<AppPool>,
     slot_id: u64,
-    socket_path: PathBuf,
+    socket_path: Arc<Path>,
     _permit: OwnedSemaphorePermit,
 }
 
@@ -110,7 +110,7 @@ impl AppPool {
             return Ok(WorkerLease {
                 pool: Arc::clone(self),
                 slot_id: slot.id,
-                socket_path: slot.socket_path.clone(),
+                socket_path: Arc::clone(&slot.socket_path),
                 _permit: permit,
             });
         }
@@ -123,7 +123,7 @@ impl AppPool {
         let lease = WorkerLease {
             pool: Arc::clone(self),
             slot_id: slot.id,
-            socket_path: slot.socket_path.clone(),
+            socket_path: Arc::clone(&slot.socket_path),
             _permit: permit,
         };
         slots.push(slot);
@@ -145,7 +145,7 @@ impl AppPool {
         ));
         Ok(WorkerSlot {
             id,
-            socket_path,
+            socket_path: socket_path.into(),
             busy: false,
             last_used: Instant::now(),
             supervisor,
@@ -253,11 +253,10 @@ pub(crate) async fn start_apps(config: &mut Config) -> Result<(), Box<dyn Error 
         let FastCgiAddress::Spawn(app) = &backend.address else {
             continue;
         };
-        let extension = backend.extension.clone();
-        let app = app.clone();
         let pool = AppPool::new(app.clone(), root.clone())?;
         eprintln!(
-            "Started FastCGI app pool .{extension}: {} (maximum {} workers)",
+            "Started FastCGI app pool .{}: {} (maximum {} workers)",
+            backend.extension,
             app.program.display(),
             app.max_workers,
         );

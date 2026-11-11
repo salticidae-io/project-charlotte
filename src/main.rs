@@ -285,7 +285,7 @@ async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> 
                     let _permit = permit;
                     match timeout(Duration::from_secs(10), acceptor.accept(stream)).await {
                         Ok(Ok(stream)) => {
-                            let sni = stream.get_ref().1.server_name().map(str::to_owned);
+                            let sni = stream.get_ref().1.server_name().map(Arc::<str>::from);
                             if let Err(error) = serve_connection(
                                 stream,
                                 peer,
@@ -338,7 +338,7 @@ async fn serve_connection<I>(
     router: Arc<Router>,
     mut shutdown: watch::Receiver<bool>,
     alt_svc_port: Option<u16>,
-    sni: Option<Option<String>>,
+    sni: Option<Option<Arc<str>>>,
 ) -> Result<(), Box<dyn Error + Send + Sync>>
 where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
