@@ -2,10 +2,10 @@
 
 `project-charlotte` is an asynchronous Rust web server. It serves static files
 and directory listings, can route configured virtual hosts to separate worker
-processes, and optionally integrates FastCGI, ModSecurity, TLS, ACME certificate
-provisioning, and HTTP/3. `src/main.rs` is the composition root: it parses
-configuration, initializes shared services, starts listeners, and coordinates
-shutdown.
+processes or HTTP/HTTPS upstreams, and optionally integrates FastCGI, CGI,
+ModSecurity, TLS, ACME certificate provisioning, and HTTP/3. `src/main.rs` is
+the composition root: it parses configuration, initializes shared services,
+starts listeners, and coordinates shutdown.
 
 ## Configuration and startup
 
@@ -43,9 +43,9 @@ The request path is:
    global WAF, before normal routing.
 4. Routing checks that a TLS request's SNI and HTTP authority select the same
    virtual host. A mismatch is rejected with `421 Misdirected Request`.
-   Requests for a configured virtual host are forwarded to its worker; if no
-   virtual host matches and no default is configured, the master uses the
-   fallback `Config` directly.
+   Proxy virtual hosts forward directly from the master. Worker-backed hosts
+   are forwarded to their worker; if no virtual host matches and no default is
+   configured, the master uses the fallback `Config` directly.
 5. `handler::handle_request` applies `try_files` rules, resolves FastCGI or CGI
    scripts, or serves a static file or directory listing. Static responses
    include MIME types, validators, conditional-request handling, and byte
@@ -56,7 +56,7 @@ The request path is:
 
 ## Virtual-host workers
 
-Each configured virtual host has a worker that runs the same executable in
+Each worker-backed virtual host has a worker that runs the same executable in
 `--worker` mode. The process is started on the first request and reused while
 its connection remains healthy. The router connects to it through a Unix
 socket pair; the private connection uses HTTP/2 and is not a public listener.
@@ -69,6 +69,20 @@ then calls the same request handler used by the fallback path.
 Workers can run under configured UID/GID credentials. The master asks workers
 to terminate cleanly and uses a bounded wait before forcibly stopping one, so
 worker-managed FastCGI applications can clean up as well.
+
+## Reverse proxies
+
+A vhost with `proxy_pass` is handled directly in the master and does not need
+a document root or worker process. Its upstream URL may use HTTP or HTTPS and
+include a path prefix; the incoming path and query are appended. A pooled
+Hyper client negotiates HTTP/1.1 or HTTP/2 with HTTPS upstreams using ALPN.
+TCP HTTP/1.1, HTTP/2, and QUIC HTTP/3 clients all use this same routing path.
+Request and response bodies are streamed, hop-by-hop headers (including
+headers named by `Connection`) are removed, and the proxy sets
+`X-Forwarded-For`, `X-Forwarded-Proto`, and `X-Forwarded-Host`. HTTPS upstreams
+use system roots by default or a configured PEM CA bundle. Header acquisition
+has a configurable timeout; WebSocket/Upgrade and CONNECT tunnelling are not
+implemented.
 
 ## FastCGI application pools
 
@@ -127,11 +141,12 @@ cleanup is handled when their router-owned handles are dropped.
 | --- | --- |
 | `main` | Startup, listeners, connection tasks, protocol dispatch, and shutdown. |
 | `config` | CLI parsing and shared server, virtual-host, and backend settings. |
-| `vhost` | Virtual-host loading and matching, routing, worker management, and request dispatch. |
+| `vhost` | Virtual-host loading and matching, routing, worker management, proxy dispatch, and request dispatch. |
 | `worker` | Private HTTP/2 worker service, metadata validation, and privilege dropping. |
 | `handler` | Request handling, static files, listings, ranges, validators, and response helpers. |
 | `fastcgi` | FastCGI and CGI script resolution, request parameters, and backend exchange. |
 | `fastcgi_app` | Lifecycle management for FastCGI applications started by the server. |
+| `proxy` | Pooled HTTP/HTTPS upstream clients and reverse-proxy header/body handling. |
 | `waf` | ModSecurity rule loading and request/response inspection. |
 | `tls` | Rustls configuration, static certificates, and SNI certificate selection. |
 | `acme` | ACME account, HTTP-01 challenges, certificate cache, and renewal. |
@@ -172,10 +187,10 @@ connection that has not produced a complete request head within 30 seconds,
 and bounds the time a client may take to deliver a request body. A failed
 `accept` is logged rather than fatal. The master itself keeps the privileges
 it was started with; it terminates TLS, parses requests, serves the fallback
-site, and runs ModSecurity in that one process.
+site, runs ModSecurity, and forwards reverse-proxy traffic in that one process.
 
 Unit and integration tests cover routing, handlers, TLS, ACME, FastCGI, CGI,
-and ModSecurity. Fuzz targets exercise parsed inputs and request-handling paths;
-see [FUZZING.md](FUZZING.md) for target names, setup, and commands. HTTP wire
-parsing itself is delegated to Hyper and `h3` and is outside those fuzz
-targets.
+reverse proxying, and ModSecurity. Fuzz targets exercise parsed inputs and
+request-handling paths; see [FUZZING.md](FUZZING.md) for target names, setup,
+and commands. HTTP wire parsing itself is delegated to Hyper and `h3` and is
+outside those fuzz targets.

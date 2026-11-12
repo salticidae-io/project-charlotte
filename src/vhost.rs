@@ -32,6 +32,7 @@ use crate::{
     acme::AcmeManager,
     config::{Config, FastCgiAddress, FastCgiApp, FastCgiBackend, TlsFiles},
     handler::{self, ResponseBody},
+    proxy::ReverseProxy,
     waf::{RuleIdSpec, Waf},
 };
 
@@ -60,8 +61,8 @@ struct FileConfig {
 #[serde(deny_unknown_fields)]
 struct VhostFile {
     server_names: Vec<String>,
-    root: PathBuf,
-    user: String,
+    root: Option<PathBuf>,
+    user: Option<String>,
     group: Option<String>,
     index: Option<String>,
     listing: Option<bool>,
@@ -82,6 +83,10 @@ struct VhostFile {
     modsecurity_disable_rules: Vec<RuleIdFile>,
     modsecurity_block_status: Option<u16>,
     acme: Option<bool>,
+    proxy_pass: Option<String>,
+    proxy_preserve_host: Option<bool>,
+    proxy_timeout: Option<u64>,
+    proxy_ca_root: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -118,7 +123,8 @@ struct Vhost {
     acme: bool,
     default: bool,
     waf: Option<Waf>,
-    worker: Arc<Worker>,
+    worker: Option<Arc<Worker>>,
+    proxy: Option<Arc<ReverseProxy>>,
 }
 
 struct Worker {
@@ -382,7 +388,7 @@ impl Router {
         let mut vhosts = Vec::with_capacity(file.vhost.len());
         let default = file.vhost.iter().position(|entry| entry.default);
 
-        for entry in file.vhost {
+        for mut entry in file.vhost {
             let block_status = entry
                 .modsecurity_block_status
                 .or(fallback.modsecurity_block_status)
@@ -411,11 +417,47 @@ impl Router {
                 normalized_names.push(normalized);
             }
 
-            let (uid, gid) = resolve_identity(&entry.user, entry.group.as_deref())?;
+            let tls = match (entry.tls_cert.take(), entry.tls_key.take()) {
+                (Some(cert), Some(key)) => Some(TlsFiles {
+                    cert: resolve_config_path(cert, config_dir),
+                    key: resolve_config_path(key, config_dir),
+                }),
+                (None, None) => None,
+                _ => return Err("vhost tls_cert and tls_key must be supplied together".into()),
+            };
+
+            if let Some(upstream) = entry.proxy_pass.take() {
+                let ca_root = entry
+                    .proxy_ca_root
+                    .take()
+                    .map(|path| resolve_config_path(path, config_dir));
+                let proxy = Arc::new(ReverseProxy::new(
+                    &upstream,
+                    entry.proxy_preserve_host.unwrap_or(true),
+                    Duration::from_secs(entry.proxy_timeout.unwrap_or(60)),
+                    ca_root.as_deref(),
+                )?);
+                vhosts.push(Vhost {
+                    names: normalized_names,
+                    tls,
+                    acme: entry.acme.unwrap_or(true),
+                    default: entry.default,
+                    waf: vhost_waf,
+                    worker: None,
+                    proxy: Some(proxy),
+                });
+                continue;
+            }
+
+            let user = entry
+                .user
+                .as_deref()
+                .ok_or("vhost user is required unless proxy_pass is configured")?;
+            let (uid, gid) = resolve_identity(user, entry.group.as_deref())?;
             if uid == 0 {
                 // A worker exists to confine a site to an unprivileged
                 // account; one running as root confines nothing.
-                return Err(format!("virtual host user must not be root: {}", entry.user).into());
+                return Err(format!("virtual host user must not be root: {user}").into());
             }
             let index_name = entry.index.unwrap_or_else(|| fallback.index.clone());
             validate_index(&index_name)?;
@@ -523,18 +565,14 @@ impl Router {
                     .map_err(|error| format!("vhost worker_threads: {error}"))?,
                 None => fallback.worker_threads,
             };
-            let tls = match (entry.tls_cert, entry.tls_key) {
-                (Some(cert), Some(key)) => Some(TlsFiles {
-                    cert: resolve_config_path(cert, config_dir),
-                    key: resolve_config_path(key, config_dir),
-                }),
-                (None, None) => None,
-                _ => return Err("vhost tls_cert and tls_key must be supplied together".into()),
-            };
-            let root = if entry.root.is_absolute() {
-                entry.root
+            let root = entry
+                .root
+                .take()
+                .ok_or("vhost root is required unless proxy_pass is configured")?;
+            let root = if root.is_absolute() {
+                root
             } else {
-                config_dir.join(entry.root)
+                config_dir.join(root)
             };
             let worker = Arc::new(Worker {
                 uid,
@@ -556,7 +594,8 @@ impl Router {
                 acme: entry.acme.unwrap_or(true),
                 default: entry.default,
                 waf: vhost_waf,
-                worker,
+                worker: Some(worker),
+                proxy: None,
             });
         }
 
@@ -592,7 +631,12 @@ impl Router {
     pub(crate) fn document_roots(&self) -> Vec<PathBuf> {
         let table = self.snapshot();
         std::iter::once(self.fallback.root.clone())
-            .chain(table.vhosts.iter().map(|vhost| vhost.worker.root.clone()))
+            .chain(
+                table
+                    .vhosts
+                    .iter()
+                    .filter_map(|vhost| vhost.worker.as_ref().map(|worker| worker.root.clone())),
+            )
             .collect()
     }
 
@@ -701,6 +745,12 @@ impl Router {
             }
             Err((status, message)) => return handler::error_response(status, message),
         };
+        if let Some(proxy) = &table.vhosts[index].proxy {
+            let tls = request.extensions().get::<TlsSni>().is_some();
+            let response = proxy.forward(request, peer, tls).await;
+            let (parts, body) = response.into_parts();
+            return Response::from_parts(parts, handler::coalesce_ready_body(body));
+        }
         let request = match worker_request(request, host, peer, local) {
             Ok(request) => request,
             Err((status, message)) => return handler::error_response(status, message),
@@ -710,7 +760,13 @@ impl Router {
             body.map_err(|error| io::Error::other(error.into()))
                 .boxed_unsync()
         });
-        match table.vhosts[index].worker.dispatch(request).await {
+        match table.vhosts[index]
+            .worker
+            .as_ref()
+            .expect("non-proxy vhost has a worker")
+            .dispatch(request)
+            .await
+        {
             Ok(response) => {
                 let (parts, body) = response.into_parts();
                 let body =
@@ -1039,6 +1095,49 @@ fn validate_vhost_declarations<'a>(
     let mut names = std::collections::HashSet::new();
     let mut has_default = false;
     for (index, entry) in entries.into_iter().enumerate() {
+        if entry.proxy_pass.is_some() {
+            ReverseProxy::validate_upstream_url(entry.proxy_pass.as_deref().unwrap())
+                .map_err(|error| format!("vhost {} proxy_pass: {error}", index + 1))?;
+            if !entry.fastcgi.is_empty()
+                || !entry.cgi.is_empty()
+                || !entry.fastcgi_app.is_empty()
+                || entry.try_files.is_some()
+            {
+                return Err(format!(
+                    "vhost {} proxy_pass cannot be combined with FastCGI, CGI, fastcgi_app, or try_files",
+                    index + 1
+                )
+                .into());
+            }
+        } else {
+            if entry.root.is_none() {
+                return Err(format!(
+                    "vhost {} root is required unless proxy_pass is configured",
+                    index + 1
+                )
+                .into());
+            }
+            if entry.user.is_none() {
+                return Err(format!(
+                    "vhost {} user is required unless proxy_pass is configured",
+                    index + 1
+                )
+                .into());
+            }
+            if entry.proxy_preserve_host.is_some()
+                || entry.proxy_timeout.is_some()
+                || entry.proxy_ca_root.is_some()
+            {
+                return Err(format!("vhost {} proxy options require proxy_pass", index + 1).into());
+            }
+        }
+        if entry.proxy_timeout == Some(0) {
+            return Err(format!(
+                "vhost {} proxy_timeout must be greater than zero",
+                index + 1
+            )
+            .into());
+        }
         if entry.tls_cert.is_some() != entry.tls_key.is_some() {
             return Err(
                 format!("vhost {} must provide both tls_cert and tls_key", index + 1).into(),
@@ -1156,7 +1255,8 @@ fn ensure_acme_cache_is_private(cache: &Path, vhosts: &[Arc<Vhost>]) -> io::Resu
         return Ok(());
     };
     for vhost in vhosts {
-        if let Ok(root) = std::fs::canonicalize(&vhost.worker.root)
+        if let Some(worker) = &vhost.worker
+            && let Ok(root) = std::fs::canonicalize(&worker.root)
             && cache.starts_with(&root)
         {
             return Err(io::Error::new(
@@ -1411,8 +1511,8 @@ mod tests {
     fn declaration(names: &[&str], is_default: bool) -> VhostFile {
         VhostFile {
             server_names: names.iter().map(|name| (*name).to_owned()).collect(),
-            root: "/tmp/site".into(),
-            user: "user".to_owned(),
+            root: Some("/tmp/site".into()),
+            user: Some("user".to_owned()),
             group: None,
             index: None,
             listing: None,
@@ -1428,6 +1528,10 @@ mod tests {
             modsecurity_disable_rules: Vec::new(),
             modsecurity_block_status: None,
             acme: None,
+            proxy_pass: None,
+            proxy_preserve_host: None,
+            proxy_timeout: None,
+            proxy_ca_root: None,
         }
     }
 
@@ -1458,6 +1562,41 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn validates_proxy_vhost_configuration() {
+        let parsed: FileConfig = serde_yaml_ng::from_str(
+            r#"
+                vhost:
+                  - server_names: [proxy.example.test]
+                    proxy_pass: https://127.0.0.1:9443/base
+                    proxy_preserve_host: false
+                    proxy_timeout: 15
+                    proxy_ca_root: certs/upstream.pem
+            "#,
+        )
+        .unwrap();
+        assert!(validate_vhost_declarations(&parsed.vhost).is_ok());
+        assert_eq!(parsed.vhost[0].root, None);
+        assert_eq!(parsed.vhost[0].user, None);
+        assert_eq!(parsed.vhost[0].proxy_timeout, Some(15));
+
+        let mut invalid_scheme = parsed.vhost[0].clone();
+        invalid_scheme.proxy_pass = Some("ftp://upstream.example.test".to_owned());
+        assert!(validate_vhost_declarations(&[invalid_scheme]).is_err());
+
+        let mut mixed_backend = parsed.vhost[0].clone();
+        mixed_backend.fastcgi.push("php=127.0.0.1:9000".to_owned());
+        assert!(validate_vhost_declarations(&[mixed_backend]).is_err());
+
+        let mut missing_root = declaration(&["static.example.test"], false);
+        missing_root.root = None;
+        assert!(validate_vhost_declarations(&[missing_root]).is_err());
+
+        let mut zero_timeout = parsed.vhost[0].clone();
+        zero_timeout.proxy_timeout = Some(0);
+        assert!(validate_vhost_declarations(&[zero_timeout]).is_err());
     }
 
     #[test]
@@ -1878,7 +2017,7 @@ mod tests {
                 acme: false,
                 default,
                 waf: None,
-                worker: Arc::new(Worker {
+                worker: Some(Arc::new(Worker {
                     uid: 0,
                     gid: 0,
                     root: PathBuf::from("/"),
@@ -1889,7 +2028,8 @@ mod tests {
                     fastcgi_timeout: Duration::from_secs(1),
                     threads: 1,
                     process: tokio::sync::Mutex::new(None),
-                }),
+                })),
+                proxy: None,
             })
         };
         VhostTable {

@@ -9,6 +9,7 @@ mod http3;
 mod httpdate;
 mod mime;
 mod privileges;
+mod proxy;
 mod reload;
 mod tls;
 mod vhost;

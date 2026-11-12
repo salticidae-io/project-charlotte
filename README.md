@@ -14,7 +14,8 @@ For a deeper description of the runtime and request flow, see
 - Static file serving with MIME types, index files, optional directory
   listings, `try_files`, byte ranges, and conditional requests.
 - YAML virtual hosts with exact and wildcard names, per-host document roots,
-  and isolated worker processes that can drop to configured user/group IDs.
+  isolated worker processes that can drop to configured user/group IDs, or
+  transparent reverse proxies.
 - FastCGI over TCP or Unix sockets, with optional server-managed FastCGI
   application processes.
 - Classic CGI scripts, run directly or through a configured interpreter.
@@ -159,8 +160,32 @@ vhost:
     listing: false
 ```
 
-The root and worker user are required for each host. Each configured host is
-served by a worker process. See
+Worker-backed hosts require a document root and worker user. A host configured
+with `proxy_pass` is served directly by the master and does not need `root` or
+`user`. A proxy vhost can forward requests arriving over
+HTTP/1.1, HTTP/2, or HTTP/3 to an HTTP or HTTPS upstream:
+
+```yaml
+vhost:
+  - server_names: [api.example.com]
+    proxy_pass: https://backend.internal:8443/api
+    proxy_preserve_host: true
+    proxy_timeout: 60
+    proxy_ca_root: trust/backend-ca.pem
+```
+
+`proxy_pass` may include a path prefix but not a query. The original request
+path and query are appended to that prefix. `proxy_preserve_host` defaults to
+`true`; set it to `false` to send the upstream authority as `Host` instead.
+`proxy_timeout` is the response-header timeout in seconds and defaults to 60.
+HTTPS upstreams use the system trust roots unless `proxy_ca_root` points to a
+PEM CA bundle; that path is relative to the YAML file. Request bodies and
+upstream response bodies are streamed. Charlotte removes hop-by-hop headers and
+sets `X-Forwarded-For`, `X-Forwarded-Proto`, and `X-Forwarded-Host`. Connection
+upgrades, WebSockets, and CONNECT tunnelling are not supported; upstream
+connection failures return 502 and response-header timeouts return 504.
+
+See
 [`examples/charlotte.yaml`](examples/charlotte.yaml) for FastCGI, TLS,
 catch-all, ACME, and additional settings, and
 [`examples/vhosts.d/example.yaml`](examples/vhosts.d/example.yaml) for a
