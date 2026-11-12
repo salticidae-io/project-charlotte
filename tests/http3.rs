@@ -1,11 +1,12 @@
 #![forbid(unsafe_code)]
+#![cfg(all(feature = "hosting", feature = "http3"))]
 
 mod common;
 
 use std::{
     collections::HashMap,
     io,
-    net::{SocketAddr, UdpSocket},
+    net::SocketAddr,
     path::PathBuf,
     process::{Child, Command, Stdio},
     sync::Arc,
@@ -62,14 +63,11 @@ impl Fixture {
             }
         });
 
-        let tcp_reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let tcp_address = tcp_reservation.local_addr().unwrap();
-        drop(tcp_reservation);
-        let udp_reservation = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let http3_address = udp_reservation.local_addr().unwrap();
-        drop(udp_reservation);
+        let tcp_address = common::reserve_tcp_address();
+        let http3_address = common::reserve_udp_address();
 
-        let server = Command::new(env!("CARGO_BIN_EXE_project-charlotte"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_project-charlotte"));
+        command
             .arg("--bind")
             .arg(tcp_address.to_string())
             .arg("--http3-bind")
@@ -83,9 +81,8 @@ impl Fixture {
             .arg("--fastcgi")
             .arg(format!("php={backend_address}"))
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::null());
+        let server = common::spawn(&mut command).unwrap();
 
         let mut fixture = Self {
             root,

@@ -1,4 +1,7 @@
 #![forbid(unsafe_code)]
+#![cfg(feature = "hosting")]
+
+mod common;
 
 use std::{
     collections::HashMap,
@@ -130,11 +133,10 @@ async fn start_server(
     backend_address: &str,
     timeout_seconds: u64,
 ) -> (Child, std::net::SocketAddr) {
-    let reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let server_address = reservation.local_addr().unwrap();
-    drop(reservation);
+    let server_address = common::reserve_tcp_address();
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_project-charlotte"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_project-charlotte"));
+    command
         .arg("--bind")
         .arg(server_address.to_string())
         .arg("--root")
@@ -146,9 +148,8 @@ async fn start_server(
         .arg("--fastcgi-timeout")
         .arg(timeout_seconds.to_string())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+        .stderr(Stdio::null());
+    let mut child = common::spawn(&mut command).unwrap();
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {

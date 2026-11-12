@@ -62,6 +62,68 @@ jobs:
         working-directory: project-charlotte
         run: cargo test --locked
 
+  features:
+    name: Feature combinations
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential \
+            pkg-config \
+            libmodsecurity-dev
+
+      - name: Check out project-charlotte
+        uses: actions/checkout@v4
+        with:
+          path: project-charlotte
+
+      - name: Check out modsecurity-rs
+        uses: actions/checkout@v4
+        with:
+          repository: fzylogic/modsecurity-rs
+          token: ${{ secrets.MODSECURITY_RS_TOKEN || github.token }}
+          path: modsecurity-rs
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: project-charlotte -> target
+
+      - name: Check every feature combination
+        working-directory: project-charlotte
+        run: scripts/check-features.sh --locked
+
+      # The feature set of the project-charlotte-proxy package.
+      - name: Test the proxy-only build
+        working-directory: project-charlotte
+        run: cargo test --locked --no-default-features --features acme,http3,proxy
+
+  # The one status check to mark as required in the branch protection rule for
+  # main. It always runs, and passes only when both test jobs succeeded, so a
+  # failed, cancelled or skipped test job blocks the pull request.
+  required:
+    name: Required checks
+    if: always()
+    needs:
+      - test
+      - features
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require the test jobs to succeed
+        env:
+          TEST_RESULT: ${{ needs.test.result }}
+          FEATURES_RESULT: ${{ needs.features.result }}
+        run: |
+          echo "Tests: $TEST_RESULT"
+          echo "Feature combinations: $FEATURES_RESULT"
+          test "$TEST_RESULT" = success
+          test "$FEATURES_RESULT" = success
+
   fuzz:
     name: Fuzz targets
     needs: test

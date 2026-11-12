@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![cfg(feature = "hosting")]
 
 mod common;
 
@@ -13,7 +14,7 @@ use std::{
 use nix::unistd::{User, geteuid};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    net::TcpStream,
     time::sleep,
 };
 
@@ -53,9 +54,7 @@ impl Fixture {
             .unwrap();
         }
 
-        let reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = reservation.local_addr().unwrap();
-        drop(reservation);
+        let address = common::reserve_tcp_address();
         let mut command = Command::new(env!("CARGO_BIN_EXE_project-charlotte"));
         command
             .arg("--bind")
@@ -69,7 +68,7 @@ impl Fixture {
         if has_main_config {
             command.arg("--config").arg(path.join("main.yaml"));
         }
-        let mut server = command.spawn().unwrap();
+        let mut server = common::spawn(&mut command).unwrap();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
         loop {
             if let Ok(Ok(mut stream)) =

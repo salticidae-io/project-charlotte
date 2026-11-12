@@ -3,14 +3,13 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 use notify::{RecursiveMode, Watcher};
 use tokio::{sync::watch, task::JoinHandle};
 
-use crate::{acme::AcmeManager, config::Config, tls::SniHandle, vhost::Router};
+use crate::{config::Config, tls::SniHandle, vhost::Router};
 
 pub(crate) fn spawn_watcher(
     router: Arc<Router>,
     dir: PathBuf,
     config: Config,
     sni: Option<SniHandle>,
-    acme: Option<AcmeManager>,
     mut shutdown: watch::Receiver<bool>,
 ) -> notify::Result<JoinHandle<()>> {
     let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -65,7 +64,8 @@ pub(crate) fn spawn_watcher(
                     {
                         eprintln!("failed to reload virtual-host TLS certificates: {error}");
                     }
-                    if let Some(acme) = &acme
+                    #[cfg(feature = "acme")]
+                    if let Some(acme) = router.acme_manager()
                         && let Err(error) = acme.set_eligible(router.acme_names()).await
                     {
                         eprintln!("failed to update ACME virtual-host names: {error}");

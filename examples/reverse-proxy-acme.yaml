@@ -11,12 +11,19 @@
 #     --acme-directory letsencrypt \
 #     --acme-cache /var/lib/charlotte/acme \
 #     --acme-contact mailto:admin@example.com \
-#     --root /var/empty --user charlotte
+#     --user charlotte
 #
-# Create the charlotte account and empty fallback root first, and put the CA
-# bundle trusted by the HTTPS upstream at
-# /etc/charlotte/certs/internal-ca.pem. Keep the ACME cache outside the fallback
-# root and every other served document root. The proxy hosts have no root.
+# This is the whole command for a proxy-only build (the project-charlotte-proxy
+# package, or `--no-default-features --features proxy,acme,http3`), which
+# answers 404 to requests for any other host. A full build also serves a
+# fallback site from the current directory by default, so add
+# `--root /var/empty` to it; a proxy-only build has no fallback site and
+# refuses `--root`.
+#
+# Create the charlotte account (and, for a full build, the empty fallback root)
+# first, and put the CA bundle trusted by the HTTPS upstream at
+# /etc/charlotte/certs/internal-ca.pem. Keep the ACME cache outside every
+# served document root. The proxy hosts have no root.
 #
 # ACME uses HTTP-01: an ordinary plaintext HTTP request for an eligible host
 # triggers issuance or renewal (renewal starts within 30 days of expiry). The

@@ -7,6 +7,26 @@ ModSecurity, TLS, ACME certificate provisioning, and HTTP/3. `src/main.rs` is
 the composition root: it parses configuration, initializes shared services,
 starts listeners, and coordinates shutdown.
 
+## Build features
+
+Four Cargo features, all enabled by default, select the major parts of the
+server:
+
+| Feature | Modules and dependencies it compiles |
+| --- | --- |
+| `hosting` | `handler`, `fastcgi`, `fastcgi_app`, `worker`, `mime`, `vhost::hosted`; `fastcgi-client`. |
+| `proxy` | `proxy`; `hyper-rustls` and the Hyper client. |
+| `acme` | `acme`; `instant-acme`, `x509-parser`. |
+| `http3` | `http3`; `quinn`, `h3`, `h3-quinn`. |
+
+`main`, `config`, `vhost`, `response`, `waf`, `tls`, `reload`, `privileges`,
+and `httpdate` are in every build. `Config` and the virtual-host declarations
+keep the same shape whichever features are enabled: `Config::parse` and
+virtual-host validation refuse what belongs to a feature that was left out and
+name that feature. Without `hosting` there are no worker processes and no
+fallback site, so a request that matches no virtual host is answered `404`,
+and a master that drops to `--user` retains no capability to change user IDs.
+
 ## Configuration and startup
 
 `config::Config::parse` reads command-line options for listener addresses,
@@ -141,9 +161,11 @@ cleanup is handled when their router-owned handles are dropped.
 | --- | --- |
 | `main` | Startup, listeners, connection tasks, protocol dispatch, and shutdown. |
 | `config` | CLI parsing and shared server, virtual-host, and backend settings. |
-| `vhost` | Virtual-host loading and matching, routing, worker management, proxy dispatch, and request dispatch. |
+| `vhost` | Virtual-host loading and matching, routing, proxy dispatch, and request dispatch. |
+| `vhost::hosted` | Master-side worker processes for hosted virtual hosts: spawning, request forwarding, and restart. |
 | `worker` | Private HTTP/2 worker service, metadata validation, and privilege dropping. |
-| `handler` | Request handling, static files, listings, ranges, validators, and response helpers. |
+| `handler` | Request handling, static files, listings, ranges, and validators. |
+| `response` | Response construction shared by every build: status and error responses, the `Date` header, and body coalescing. |
 | `fastcgi` | FastCGI and CGI script resolution, request parameters, and backend exchange. |
 | `fastcgi_app` | Lifecycle management for FastCGI applications started by the server. |
 | `proxy` | Pooled HTTP/HTTPS upstream clients and reverse-proxy header/body handling. |
@@ -154,6 +176,7 @@ cleanup is handled when their router-owned handles are dropped.
 | `reload` | Virtual-host directory watcher and coordinated routing/TLS/ACME refresh. |
 | `httpdate` | HTTP-date formatting and parsing for protocol headers and validators. |
 | `mime` | File-extension to content-type mapping. |
+| `privileges` | Dropping the master to `--user`/`--group` and narrowing its capabilities. |
 | `fuzz_support` | Shared request fixtures and helpers used by fuzz-oriented unit tests. |
 
 ## Security and testing boundaries
