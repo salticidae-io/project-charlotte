@@ -3,7 +3,9 @@
 `project-charlotte` is an asynchronous Rust web server for static sites and
 virtual-hosted applications. It serves files and directory listings, and can
 optionally connect to or supervise FastCGI applications, inspect traffic with
-ModSecurity, serve TLS and HTTP/3, and provision certificates with ACME.
+ModSecurity, serve TLS and HTTP/3, and provision certificates with ACME. Its
+main target is mass hosting/general hosting platforms, rather than smaller one-off
+websites. 
 
 For a deeper description of the runtime and request flow, see
 [ARCHITECTURE.md](ARCHITECTURE.md). Configuration examples are in

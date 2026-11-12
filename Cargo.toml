@@ -8,6 +8,7 @@ description = "Asynchronous web server for static sites and fastcgi dynamic cont
 bytes = "1"
 caps = "0.5"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { version = "4", features = ["derive"] }
 fastcgi-client = { version = "0.12", features = ["tokio"] }
 futures-util = "0.3"
 h3 = "0.0.8"

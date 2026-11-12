@@ -99,7 +99,7 @@ async fn accepted_stream(
 fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let config = match Config::parse(std::env::args().skip(1))? {
         ParseResult::Help => {
-            println!("{}", Config::usage());
+            print!("{}", Config::usage());
             return Ok(());
         }
         ParseResult::Config(config) => *config,

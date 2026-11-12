@@ -1,3 +1,4 @@
+use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, error::ErrorKind};
 use std::{collections::BTreeMap, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 #[derive(Clone, Debug)]
@@ -71,257 +72,276 @@ pub enum ParseResult {
     Config(Box<Config>),
 }
 
+#[derive(Debug, Parser)]
+#[command(
+    name = "project-charlotte",
+    args_override_self = true,
+    disable_version_flag = true
+)]
+struct Cli {
+    #[arg(long, default_value = "127.0.0.1:8080", allow_hyphen_values = true)]
+    bind: String,
+    #[arg(long, allow_hyphen_values = true)]
+    tls_bind: Option<String>,
+    #[arg(long, allow_hyphen_values = true)]
+    http3_bind: Option<String>,
+    #[arg(long, default_value = ".", allow_hyphen_values = true)]
+    root: PathBuf,
+    #[arg(long, allow_hyphen_values = true)]
+    config: Option<PathBuf>,
+    #[arg(long, allow_hyphen_values = true)]
+    vhost_dir: Option<PathBuf>,
+    #[arg(long, default_value = "index.html", allow_hyphen_values = true)]
+    index: String,
+    #[arg(long = "no-listing")]
+    no_listing: bool,
+    #[arg(long, allow_hyphen_values = true)]
+    try_files: Vec<String>,
+    #[arg(long, allow_hyphen_values = true)]
+    fastcgi: Vec<String>,
+    #[arg(long, allow_hyphen_values = true)]
+    cgi: Vec<String>,
+    #[arg(long, allow_hyphen_values = true)]
+    fastcgi_app: Vec<String>,
+    #[arg(long, allow_hyphen_values = true)]
+    fastcgi_app_arg: Vec<String>,
+    #[arg(
+        long = "fastcgi-app-max-workers",
+        alias = "fastcgi-app-workers",
+        allow_hyphen_values = true
+    )]
+    fastcgi_app_max_workers: Vec<String>,
+    #[arg(long, allow_hyphen_values = true)]
+    fastcgi_app_idle_timeout: Vec<String>,
+    #[arg(long, allow_hyphen_values = true)]
+    fastcgi_app_env: Vec<String>,
+    #[arg(long, default_value = "60", value_parser = parse_cli_fastcgi_timeout, allow_hyphen_values = true)]
+    fastcgi_timeout: u64,
+    #[arg(long, value_parser = parse_cli_thread_count, allow_hyphen_values = true)]
+    threads: Option<usize>,
+    #[arg(
+        long,
+        default_value_t = DEFAULT_WORKER_THREADS,
+        value_parser = parse_cli_thread_count,
+        allow_hyphen_values = true
+    )]
+    worker_threads: usize,
+    #[arg(long, allow_hyphen_values = true)]
+    modsecurity_rules: Vec<PathBuf>,
+    #[arg(long, value_parser = parse_cli_modsecurity_block_status, allow_hyphen_values = true)]
+    modsecurity_block_status: Option<u16>,
+    #[arg(long, value_parser = parse_cli_positive_usize, allow_hyphen_values = true)]
+    modsecurity_body_limit: Option<usize>,
+    #[arg(long, allow_hyphen_values = true)]
+    tls_cert: Option<PathBuf>,
+    #[arg(long, allow_hyphen_values = true)]
+    tls_key: Option<PathBuf>,
+    #[arg(long, allow_hyphen_values = true)]
+    acme_directory: Option<String>,
+    #[arg(long, allow_hyphen_values = true)]
+    acme_cache: Option<PathBuf>,
+    #[arg(long, allow_hyphen_values = true)]
+    acme_contact: Vec<String>,
+    #[arg(long, allow_hyphen_values = true)]
+    acme_ca_root: Option<PathBuf>,
+    #[arg(long)]
+    worker: bool,
+    #[arg(long, allow_hyphen_values = true)]
+    worker_uid: Option<String>,
+    #[arg(long, allow_hyphen_values = true)]
+    worker_gid: Option<String>,
+    #[arg(long, allow_hyphen_values = true)]
+    user: Option<String>,
+    #[arg(long, allow_hyphen_values = true)]
+    group: Option<String>,
+}
+
 impl Config {
     pub fn parse(args: impl IntoIterator<Item = String>) -> Result<ParseResult, String> {
-        let mut bind = "127.0.0.1:8080"
+        let matches = match Cli::command()
+            .try_get_matches_from(std::iter::once("project-charlotte".to_owned()).chain(args))
+        {
+            Ok(matches) => matches,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+                ) =>
+            {
+                return Ok(ParseResult::Help);
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        let cli = Cli::from_arg_matches(&matches).map_err(|error| error.to_string())?;
+
+        let bind = cli
+            .bind
             .parse()
-            .expect("valid default socket address");
-        let mut tls_bind = None;
-        let mut http3_bind = None;
-        let mut root = PathBuf::from(".");
-        let mut index = String::from("index.html");
-        let mut listing = true;
-        let mut try_files = Vec::new();
-        let mut fastcgi = Vec::new();
-        let mut fastcgi_app_args = Vec::new();
-        let mut fastcgi_app_max_workers = Vec::new();
-        let mut fastcgi_app_idle_timeouts = Vec::new();
-        let mut fastcgi_app_env = Vec::new();
-        let mut fastcgi_timeout = Duration::from_secs(60);
-        let mut threads = None;
-        let mut worker_threads = DEFAULT_WORKER_THREADS;
-        let mut modsecurity_rules = Vec::new();
-        let mut modsecurity_block_status = None;
+            .map_err(|_| format!("invalid socket address: {}", cli.bind))?;
+        let tls_bind = cli
+            .tls_bind
+            .map(|value| {
+                value
+                    .parse()
+                    .map_err(|_| format!("invalid TLS socket address: {value}"))
+            })
+            .transpose()?;
+        let http3_bind = cli
+            .http3_bind
+            .map(|value| {
+                value
+                    .parse()
+                    .map_err(|_| format!("invalid HTTP/3 socket address: {value}"))
+            })
+            .transpose()?;
         let mut modsecurity_body_limit = 16 * 1024 * 1024;
         let mut modsecurity_response_body_limit = 1024 * 1024;
-        let mut tls_cert = None;
-        let mut tls_key = None;
-        let mut acme_directory = None;
-        let mut acme_cache = None;
-        let mut acme_contacts = Vec::new();
-        let mut acme_ca_root = None;
-        let mut config_file = None;
-        let mut vhost_dir = None;
-        let mut worker = false;
-        let mut worker_uid = None;
-        let mut worker_gid = None;
-        let mut master_user = None;
-        let mut master_group = None;
-        let mut args = args.into_iter();
+        if let Some(limit) = cli.modsecurity_body_limit {
+            modsecurity_body_limit = limit;
+            modsecurity_response_body_limit = limit;
+        }
 
-        while let Some(arg) = args.next() {
-            match arg.as_str() {
-                "--help" | "-h" => return Ok(ParseResult::Help),
-                "--worker" => worker = true,
-                "--user" => {
-                    let value = next_value(&mut args, "--user")?;
-                    if value.is_empty() {
-                        return Err("--user requires a non-empty user name".to_owned());
-                    }
-                    master_user = Some(value);
-                }
-                "--group" => {
-                    let value = next_value(&mut args, "--group")?;
-                    if value.is_empty() {
-                        return Err("--group requires a non-empty group name".to_owned());
-                    }
-                    master_group = Some(value);
-                }
-                "--no-listing" => listing = false,
-                "--try-files" => try_files.push(next_value(&mut args, "--try-files")?),
-                "--fastcgi" => {
-                    let value = next_value(&mut args, "--fastcgi")?;
-                    let backend = parse_fastcgi_backend(&value)?;
-                    add_backend(&mut fastcgi, backend)?;
-                }
-                "--cgi" => {
-                    let value = next_value(&mut args, "--cgi")?;
-                    let backend = parse_cgi_backend(&value)?;
-                    add_backend(&mut fastcgi, backend)?;
-                }
-                "--fastcgi-app" => {
-                    let value = next_value(&mut args, "--fastcgi-app")?;
-                    let backend = parse_fastcgi_app(&value)?;
-                    add_backend(&mut fastcgi, backend)?;
-                }
-                "--fastcgi-app-arg" => {
-                    let value = next_value(&mut args, "--fastcgi-app-arg")?;
-                    let (extension, arg) = value.split_once('=').ok_or_else(|| {
-                        format!("invalid FastCGI app argument: {value}; expected EXT=ARG")
-                    })?;
-                    if arg.contains('\0') {
-                        return Err("FastCGI app argument cannot contain NUL".to_owned());
-                    }
-                    fastcgi_app_args.push((normalize_extension(extension)?, arg.to_owned()));
-                }
-                "--fastcgi-app-max-workers" | "--fastcgi-app-workers" => {
-                    let value = next_value(&mut args, "--fastcgi-app-max-workers")?;
-                    let (extension, max_workers) = value.split_once('=').ok_or_else(|| {
-                        format!("invalid FastCGI app max worker count: {value}; expected EXT=N")
-                    })?;
-                    let extension = normalize_extension(extension)?;
-                    let max_workers = parse_fastcgi_app_max_workers(max_workers)?;
-                    if fastcgi_app_max_workers
-                        .iter()
-                        .any(|(existing, _): &(String, usize)| existing == &extension)
-                    {
-                        return Err(format!(
-                            "duplicate FastCGI app max worker count for extension: {extension}"
-                        ));
-                    }
-                    fastcgi_app_max_workers.push((extension, max_workers));
-                }
-                "--fastcgi-app-idle-timeout" => {
-                    let value = next_value(&mut args, "--fastcgi-app-idle-timeout")?;
-                    let (extension, timeout) = value.split_once('=').ok_or_else(|| {
-                        format!("invalid FastCGI app idle timeout: {value}; expected EXT=SECS")
-                    })?;
-                    let extension = normalize_extension(extension)?;
-                    let timeout = parse_fastcgi_app_idle_timeout(timeout)?;
-                    if fastcgi_app_idle_timeouts
-                        .iter()
-                        .any(|(existing, _): &(String, Duration)| existing == &extension)
-                    {
-                        return Err(format!(
-                            "duplicate FastCGI app idle timeout for extension: {extension}"
-                        ));
-                    }
-                    fastcgi_app_idle_timeouts.push((extension, timeout));
-                }
-                "--fastcgi-app-env" => {
-                    let value = next_value(&mut args, "--fastcgi-app-env")?;
-                    let (extension, assignment) = value.split_once('=').ok_or_else(|| {
-                        format!("invalid FastCGI app environment: {value}; expected EXT=KEY=VALUE")
-                    })?;
-                    let (key, env_value) = assignment.split_once('=').ok_or_else(|| {
-                        format!("invalid FastCGI app environment: {value}; expected EXT=KEY=VALUE")
-                    })?;
-                    validate_env_key(key)?;
-                    if env_value.contains('\0') {
-                        return Err("FastCGI app environment value cannot contain NUL".to_owned());
-                    }
-                    fastcgi_app_env.push((
-                        normalize_extension(extension)?,
-                        key.to_owned(),
-                        env_value.to_owned(),
-                    ));
-                }
-                "--fastcgi-timeout" => {
-                    let value = next_value(&mut args, "--fastcgi-timeout")?;
-                    let seconds = value
-                        .parse::<u64>()
-                        .ok()
-                        .filter(|seconds| *seconds > 0)
-                        .ok_or_else(|| format!("invalid FastCGI timeout: {value}"))?;
-                    fastcgi_timeout = Duration::from_secs(seconds);
-                }
-                "--threads" => {
-                    threads = Some(parse_thread_count(&next_value(&mut args, "--threads")?)?)
-                }
-                "--worker-threads" => {
-                    worker_threads =
-                        parse_thread_count(&next_value(&mut args, "--worker-threads")?)?
-                }
-                "--modsecurity-rules" => {
-                    modsecurity_rules
-                        .push(PathBuf::from(next_value(&mut args, "--modsecurity-rules")?));
-                }
-                "--modsecurity-block-status" => {
-                    modsecurity_block_status = Some(parse_modsecurity_block_status(&next_value(
-                        &mut args,
-                        "--modsecurity-block-status",
-                    )?)?);
-                }
-                "--modsecurity-body-limit" => {
-                    let value = next_value(&mut args, "--modsecurity-body-limit")?;
-                    let limit = value
-                        .parse::<usize>()
-                        .ok()
-                        .filter(|limit| *limit > 0)
-                        .ok_or_else(|| format!("invalid ModSecurity body limit: {value}"))?;
-                    modsecurity_body_limit = limit;
-                    modsecurity_response_body_limit = limit;
-                }
-                "--tls-cert" => {
-                    tls_cert = Some(PathBuf::from(next_value(&mut args, "--tls-cert")?))
-                }
-                "--tls-key" => tls_key = Some(PathBuf::from(next_value(&mut args, "--tls-key")?)),
-                "--acme-directory" => {
-                    let value = next_value(&mut args, "--acme-directory")?;
-                    let directory = match value.as_str() {
-                        "letsencrypt" => "https://acme-v02.api.letsencrypt.org/directory",
-                        "letsencrypt-staging" => {
-                            "https://acme-staging-v02.api.letsencrypt.org/directory"
-                        }
-                        _ => value.as_str(),
-                    };
-                    if !(directory.starts_with("https://") || directory.starts_with("http://")) {
-                        return Err(
-                            "--acme-directory must be an HTTP(S) URL or a known alias".to_owned()
-                        );
-                    }
-                    acme_directory = Some(directory.to_owned());
-                }
-                "--acme-cache" => {
-                    acme_cache = Some(PathBuf::from(next_value(&mut args, "--acme-cache")?))
-                }
-                "--acme-contact" => {
-                    let value = next_value(&mut args, "--acme-contact")?;
-                    if value.is_empty() || !value.contains(':') || value.contains('\0') {
-                        return Err(format!("invalid ACME contact URI: {value}"));
-                    }
-                    acme_contacts.push(value);
-                }
-                "--acme-ca-root" => {
-                    acme_ca_root = Some(PathBuf::from(next_value(&mut args, "--acme-ca-root")?))
-                }
-                "--http3-bind" => {
-                    let value = next_value(&mut args, "--http3-bind")?;
-                    http3_bind = Some(
-                        value
-                            .parse()
-                            .map_err(|_| format!("invalid HTTP/3 socket address: {value}"))?,
-                    );
-                }
-                "--tls-bind" => {
-                    let value = next_value(&mut args, "--tls-bind")?;
-                    tls_bind = Some(
-                        value
-                            .parse()
-                            .map_err(|_| format!("invalid TLS socket address: {value}"))?,
-                    );
-                }
-                "--bind" => {
-                    let value = next_value(&mut args, "--bind")?;
-                    bind = value
-                        .parse()
-                        .map_err(|_| format!("invalid socket address: {value}"))?;
-                }
-                "--root" => root = PathBuf::from(next_value(&mut args, "--root")?),
-                "--index" => index = next_value(&mut args, "--index")?,
-                "--config" => config_file = Some(PathBuf::from(next_value(&mut args, "--config")?)),
-                "--vhost-dir" => {
-                    vhost_dir = Some(PathBuf::from(next_value(&mut args, "--vhost-dir")?))
-                }
-                "--worker-uid" => {
-                    let value = next_value(&mut args, "--worker-uid")?;
-                    worker_uid = Some(
-                        value
-                            .parse::<u32>()
-                            .map_err(|_| format!("invalid worker uid: {value}"))?,
-                    );
-                }
-                "--worker-gid" => {
-                    let value = next_value(&mut args, "--worker-gid")?;
-                    worker_gid = Some(
-                        value
-                            .parse::<u32>()
-                            .map_err(|_| format!("invalid worker gid: {value}"))?,
-                    );
-                }
-                _ => return Err(format!("unknown argument: {arg}\n{}", Self::usage())),
+        let mut backend_values = indexed_values(&matches, "fastcgi", cli.fastcgi);
+        backend_values.extend(indexed_values(&matches, "cgi", cli.cgi));
+        backend_values.extend(indexed_values(&matches, "fastcgi_app", cli.fastcgi_app));
+        backend_values.sort_by_key(|(index, _, _)| *index);
+        let mut fastcgi = Vec::new();
+        for (_, kind, value) in backend_values {
+            let backend = match kind.as_str() {
+                "fastcgi" => parse_fastcgi_backend(&value)?,
+                "cgi" => parse_cgi_backend(&value)?,
+                "fastcgi_app" => parse_fastcgi_app(&value)?,
+                _ => unreachable!("indexed backend kind is known"),
+            };
+            add_backend(&mut fastcgi, backend)?;
+        }
+
+        let mut fastcgi_app_args = Vec::new();
+        for value in cli.fastcgi_app_arg {
+            let (extension, arg) = value.split_once('=').ok_or_else(|| {
+                format!("invalid FastCGI app argument: {value}; expected EXT=ARG")
+            })?;
+            if arg.contains('\0') {
+                return Err("FastCGI app argument cannot contain NUL".to_owned());
+            }
+            fastcgi_app_args.push((normalize_extension(extension)?, arg.to_owned()));
+        }
+
+        let mut fastcgi_app_max_workers = Vec::new();
+        for value in cli.fastcgi_app_max_workers {
+            let (extension, max_workers) = value.split_once('=').ok_or_else(|| {
+                format!("invalid FastCGI app max worker count: {value}; expected EXT=N")
+            })?;
+            let extension = normalize_extension(extension)?;
+            let max_workers = parse_fastcgi_app_max_workers(max_workers)?;
+            if fastcgi_app_max_workers
+                .iter()
+                .any(|(existing, _): &(String, usize)| existing == &extension)
+            {
+                return Err(format!(
+                    "duplicate FastCGI app max worker count for extension: {extension}"
+                ));
+            }
+            fastcgi_app_max_workers.push((extension, max_workers));
+        }
+
+        let mut fastcgi_app_idle_timeouts = Vec::new();
+        for value in cli.fastcgi_app_idle_timeout {
+            let (extension, timeout) = value.split_once('=').ok_or_else(|| {
+                format!("invalid FastCGI app idle timeout: {value}; expected EXT=SECS")
+            })?;
+            let extension = normalize_extension(extension)?;
+            let timeout = parse_fastcgi_app_idle_timeout(timeout)?;
+            if fastcgi_app_idle_timeouts
+                .iter()
+                .any(|(existing, _): &(String, Duration)| existing == &extension)
+            {
+                return Err(format!(
+                    "duplicate FastCGI app idle timeout for extension: {extension}"
+                ));
+            }
+            fastcgi_app_idle_timeouts.push((extension, timeout));
+        }
+
+        let mut fastcgi_app_env = Vec::new();
+        for value in cli.fastcgi_app_env {
+            let (extension, assignment) = value.split_once('=').ok_or_else(|| {
+                format!("invalid FastCGI app environment: {value}; expected EXT=KEY=VALUE")
+            })?;
+            let (key, env_value) = assignment.split_once('=').ok_or_else(|| {
+                format!("invalid FastCGI app environment: {value}; expected EXT=KEY=VALUE")
+            })?;
+            validate_env_key(key)?;
+            if env_value.contains('\0') {
+                return Err("FastCGI app environment value cannot contain NUL".to_owned());
+            }
+            fastcgi_app_env.push((
+                normalize_extension(extension)?,
+                key.to_owned(),
+                env_value.to_owned(),
+            ));
+        }
+
+        let acme_contacts = cli.acme_contact;
+        for value in &acme_contacts {
+            if value.is_empty() || !value.contains(':') || value.contains('\0') {
+                return Err(format!("invalid ACME contact URI: {value}"));
             }
         }
+        let acme_directory = cli.acme_directory.map(|value| {
+            match value.as_str() {
+                "letsencrypt" => "https://acme-v02.api.letsencrypt.org/directory",
+                "letsencrypt-staging" => "https://acme-staging-v02.api.letsencrypt.org/directory",
+                _ => value.as_str(),
+            }
+            .to_owned()
+        });
+        if let Some(directory) = &acme_directory
+            && !(directory.starts_with("https://") || directory.starts_with("http://"))
+        {
+            return Err("--acme-directory must be an HTTP(S) URL or a known alias".to_owned());
+        }
+
+        let worker_uid = cli
+            .worker_uid
+            .map(|value| {
+                value
+                    .parse::<u32>()
+                    .map_err(|_| format!("invalid worker uid: {value}"))
+            })
+            .transpose()?;
+        let worker_gid = cli
+            .worker_gid
+            .map(|value| {
+                value
+                    .parse::<u32>()
+                    .map_err(|_| format!("invalid worker gid: {value}"))
+            })
+            .transpose()?;
+        if cli.user.as_deref() == Some("") {
+            return Err("--user requires a non-empty user name".to_owned());
+        }
+        if cli.group.as_deref() == Some("") {
+            return Err("--group requires a non-empty group name".to_owned());
+        }
+        let fastcgi_timeout = Duration::from_secs(cli.fastcgi_timeout);
+        let threads = cli.threads;
+        let worker_threads = cli.worker_threads;
+        let modsecurity_rules = cli.modsecurity_rules;
+        let modsecurity_block_status = cli.modsecurity_block_status;
+        let tls_cert = cli.tls_cert;
+        let tls_key = cli.tls_key;
+        let acme_cache = cli.acme_cache;
+        let acme_ca_root = cli.acme_ca_root;
+        let config_file = cli.config;
+        let vhost_dir = cli.vhost_dir;
+        let worker = cli.worker;
+        let master_user = cli.user;
+        let master_group = cli.group;
+        let root = cli.root;
+        let index = cli.index;
+        let listing = !cli.no_listing;
+        let try_files = cli.try_files;
 
         if index.is_empty()
             || index.contains('/')
@@ -460,8 +480,8 @@ impl Config {
         Ok(())
     }
 
-    pub fn usage() -> &'static str {
-        "Usage: project-charlotte [--user USER [--group GROUP]] [--bind ADDRESS] [--tls-bind ADDRESS] [--root DIRECTORY] [--index NAME] [--no-listing] [--try-files ENTRY]... [--fastcgi EXT=ADDR]... [--cgi EXT[=INTERPRETER]]... [--fastcgi-app EXT=PROGRAM]... [--fastcgi-app-arg EXT=ARG]... [--fastcgi-app-max-workers EXT=N]... [--fastcgi-app-idle-timeout EXT=SECS]... [--fastcgi-app-env EXT=KEY=VALUE]... [--fastcgi-timeout SECS] [--threads N] [--worker-threads N] [--modsecurity-rules FILE]... [--modsecurity-block-status CODE] [--modsecurity-body-limit BYTES] [--config YAML_FILE] [--vhost-dir DIRECTORY] [--tls-cert PATH --tls-key PATH] [--acme-directory URL|letsencrypt|letsencrypt-staging --acme-cache DIR] [--acme-contact URI]... [--acme-ca-root PEM] [--http3-bind ADDRESS] [--help]"
+    pub fn usage() -> String {
+        Cli::command().render_help().to_string()
     }
 }
 
@@ -697,9 +717,42 @@ pub fn parse_thread_count(value: &str) -> Result<usize, String> {
         .ok_or_else(|| format!("invalid thread count: {value}; expected 1-{MAX_THREADS}"))
 }
 
-fn next_value(args: &mut impl Iterator<Item = String>, option: &str) -> Result<String, String> {
-    args.next()
-        .ok_or_else(|| format!("missing value for {option}"))
+fn indexed_values(
+    matches: &ArgMatches,
+    id: &str,
+    values: Vec<String>,
+) -> Vec<(usize, String, String)> {
+    matches
+        .indices_of(id)
+        .into_iter()
+        .flatten()
+        .zip(values)
+        .map(|(index, value)| (index, id.to_owned(), value))
+        .collect()
+}
+
+fn parse_cli_fastcgi_timeout(value: &str) -> Result<u64, std::io::Error> {
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|seconds| *seconds > 0)
+        .ok_or_else(|| std::io::Error::other(format!("invalid FastCGI timeout: {value}")))
+}
+
+fn parse_cli_thread_count(value: &str) -> Result<usize, std::io::Error> {
+    parse_thread_count(value).map_err(std::io::Error::other)
+}
+
+fn parse_cli_modsecurity_block_status(value: &str) -> Result<u16, std::io::Error> {
+    parse_modsecurity_block_status(value).map_err(std::io::Error::other)
+}
+
+fn parse_cli_positive_usize(value: &str) -> Result<usize, std::io::Error> {
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| std::io::Error::other(format!("invalid ModSecurity body limit: {value}")))
 }
 
 #[cfg(test)]
@@ -732,6 +785,47 @@ mod tests {
         assert_eq!(config.index, "home.htm");
         assert!(!config.listing);
         assert!(config.try_files.is_empty());
+    }
+
+    #[test]
+    fn cli_keeps_last_scalar_value_and_accepts_hyphen_leading_values() {
+        let parsed = Config::parse([
+            "--bind".to_owned(),
+            "127.0.0.1:8080".to_owned(),
+            "--bind".to_owned(),
+            "127.0.0.1:9000".to_owned(),
+            "--index".to_owned(),
+            "-home.html".to_owned(),
+        ])
+        .unwrap();
+        let ParseResult::Config(config) = parsed else {
+            panic!("expected config")
+        };
+        assert_eq!(config.bind.to_string(), "127.0.0.1:9000");
+        assert_eq!(config.index, "-home.html");
+    }
+
+    #[test]
+    fn parses_interleaved_backend_options_in_command_line_order() {
+        let error = match Config::parse([
+            "--fastcgi-app".to_owned(),
+            "invalid".to_owned(),
+            "--fastcgi".to_owned(),
+            "invalid".to_owned(),
+        ]) {
+            Err(error) => error,
+            Ok(_) => panic!("expected invalid backend declaration"),
+        };
+        assert!(error.contains("invalid FastCGI app: invalid"), "{error}");
+    }
+
+    #[test]
+    fn clap_help_is_handled_and_usage_lists_options() {
+        assert!(matches!(
+            Config::parse(["--help".to_owned()]).unwrap(),
+            ParseResult::Help
+        ));
+        assert!(Config::usage().contains("--fastcgi-app-max-workers"));
     }
 
     #[test]
