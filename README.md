@@ -108,6 +108,7 @@ see all command-line options. Common options include:
 | Option | Purpose |
 | --- | --- |
 | `--bind ADDRESS` | Plain HTTP listener; defaults to `127.0.0.1:8080`. |
+| `--no-plain-http` | Disable the plain HTTP listener; incompatible with ACME HTTP-01. |
 | `--root DIRECTORY` | Fallback document root when no virtual host handles a request; defaults to `.`. |
 | `--user USER [--group GROUP]` | Drop the master process to this account before starting; requires root. |
 | `--index NAME` | Fallback index file name; defaults to `index.html`. |
@@ -226,6 +227,26 @@ upstream response bodies are streamed. Charlotte removes hop-by-hop headers and
 sets `X-Forwarded-For`, `X-Forwarded-Proto`, and `X-Forwarded-Host`. Connection
 upgrades, WebSockets, and CONNECT tunnelling are not supported; upstream
 connection failures return 502 and response-header timeouts return 504.
+
+### HTTP/3-only reverse proxy
+
+To run only a QUIC listener in front of an upstream, disable plain HTTP, omit
+`--tls-bind`, and provide a TLS certificate plus an HTTP/3 address:
+
+```sh
+project-charlotte \
+  --no-plain-http \
+  --http3-bind 0.0.0.0:443 \
+  --tls-cert /etc/charlotte/fullchain.pem \
+  --tls-key /etc/charlotte/privkey.pem \
+  --config /etc/charlotte/proxy.yaml
+```
+
+The YAML file should define proxy vhosts as shown above. Charlotte does not bind
+the default plain HTTP address in this mode, and it also does not open a TLS
+TCP listener unless `--tls-bind` is supplied. ACME HTTP-01 provisioning is
+incompatible with `--no-plain-http`; use a certificate obtained by another
+means.
 
 See
 [`examples/charlotte.yaml`](examples/charlotte.yaml) for FastCGI, TLS,

@@ -42,6 +42,7 @@ struct Fixture {
     tls_address: SocketAddr,
     #[cfg(feature = "http3")]
     http3_address: SocketAddr,
+    http3_only: bool,
     certificate: CertificateDer<'static>,
     server: Child,
     backend_tasks: Vec<JoinHandle<()>>,
@@ -50,6 +51,15 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Self {
+        Self::new_with_http3_only(false).await
+    }
+
+    #[cfg(feature = "http3")]
+    async fn new_http3_only() -> Self {
+        Self::new_with_http3_only(true).await
+    }
+
+    async fn new_with_http3_only(http3_only: bool) -> Self {
         let serial_guard = TEST_LOCK.lock().await;
         let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
@@ -108,11 +118,12 @@ impl Fixture {
         let http3_address = common::reserve_udp_address();
 
         let mut command = Command::new(env!("CARGO_BIN_EXE_project-charlotte"));
-        command
-            .arg("--bind")
-            .arg(http_address.to_string())
-            .arg("--tls-bind")
-            .arg(tls_address.to_string());
+        command.arg("--bind").arg(http_address.to_string());
+        if http3_only {
+            command.arg("--no-plain-http");
+        } else {
+            command.arg("--tls-bind").arg(tls_address.to_string());
+        }
         // A build without a feature refuses that feature's options.
         #[cfg(feature = "http3")]
         command.arg("--http3-bind").arg(http3_address.to_string());
@@ -135,6 +146,7 @@ impl Fixture {
             tls_address,
             #[cfg(feature = "http3")]
             http3_address,
+            http3_only,
             certificate,
             server,
             backend_tasks: vec![http_task, tls_task],
@@ -146,11 +158,29 @@ impl Fixture {
 
     async fn wait_until_ready(&mut self) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        #[cfg(feature = "http3")]
+        let endpoint = self
+            .http3_only
+            .then(|| h3_client_endpoint(&self.certificate));
         loop {
             if let Some(status) = self.server.try_wait().unwrap() {
                 panic!("Charlotte exited before becoming ready: {status}");
             }
-            if TcpStream::connect(self.http_address).await.is_ok() {
+            if self.http3_only {
+                #[cfg(feature = "http3")]
+                if let Some(endpoint) = &endpoint
+                    && let Ok(Ok(connection)) = tokio::time::timeout(
+                        Duration::from_millis(200),
+                        endpoint
+                            .connect(self.http3_address, "h3.example.test")
+                            .unwrap(),
+                    )
+                    .await
+                {
+                    connection.close(VarInt::from_u32(0), b"ready");
+                    return;
+                }
+            } else if TcpStream::connect(self.http_address).await.is_ok() {
                 return;
             }
             if tokio::time::Instant::now() >= deadline {
@@ -264,6 +294,34 @@ async fn proxies_http1_http2_http3_and_handles_upstream_failures() {
     )
     .await;
     assert_eq!(response.status, StatusCode::BAD_GATEWAY.as_u16());
+}
+
+#[cfg(feature = "http3")]
+#[tokio::test]
+async fn serves_http3_only_front_end() {
+    let fixture = Fixture::new_http3_only().await;
+
+    let response = h3_request(&fixture, "/only-h3", b"forwarded over QUIC").await;
+    assert_eq!(response.status, 200);
+    let body = String::from_utf8(response.body).unwrap();
+    assert!(body.contains("path=/secure/only-h3"), "{body}");
+    assert!(body.ends_with("body=forwarded over QUIC"), "{body}");
+
+    assert!(TcpStream::connect(fixture.http_address).await.is_err());
+    assert!(TcpStream::connect(fixture.tls_address).await.is_err());
+}
+
+#[tokio::test]
+async fn rejects_startup_without_any_enabled_listener() {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_project-charlotte"));
+    command
+        .arg("--no-plain-http")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let output = common::output(&mut command).unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("no listeners enabled"), "{stderr}");
 }
 
 fn spawn_http_upstream(listener: TcpListener) -> JoinHandle<()> {
