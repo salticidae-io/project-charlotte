@@ -155,7 +155,11 @@ async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> 
     let config = config;
     #[cfg(feature = "hosting")]
     let _fastcgi_apps = fastcgi_app::start_apps(&mut config).await?;
-    let listener = TcpListener::bind(config.bind).await?;
+    let listener = if config.plain_http {
+        Some(TcpListener::bind(config.bind).await?)
+    } else {
+        None
+    };
     let waf = if config.modsecurity_rules.is_empty() {
         None
     } else {
@@ -208,6 +212,18 @@ async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> 
         None
     };
     #[cfg(feature = "http3")]
+    let http3_active = http3_endpoint.is_some();
+    #[cfg(not(feature = "http3"))]
+    let http3_active = false;
+    if !config.plain_http && tls_listener.is_none() && !http3_active {
+        #[cfg(feature = "http3")]
+        let message =
+            "no listeners enabled; HTTP/3 requires a TLS certificate (or enable plain HTTP/TLS)";
+        #[cfg(not(feature = "http3"))]
+        let message = "no listeners enabled; enable plain HTTP or configure a TLS listener";
+        return Err(message.into());
+    }
+    #[cfg(feature = "http3")]
     let alt_svc_port = http3_endpoint.as_ref().map(|(_, address)| address.port());
     #[cfg(not(feature = "http3"))]
     let alt_svc_port = None;
@@ -215,13 +231,17 @@ async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> 
         .as_ref()
         .map(|tls| TlsAcceptor::from(Arc::clone(&tls.tcp)));
     #[cfg(feature = "hosting")]
-    eprintln!(
-        "Listening on http://{} with root {}",
-        config.bind,
-        config.root.display()
-    );
+    if let Some(listener) = &listener {
+        eprintln!(
+            "Listening on http://{} with root {}",
+            listener.local_addr()?,
+            config.root.display()
+        );
+    }
     #[cfg(not(feature = "hosting"))]
-    eprintln!("Listening on http://{}", config.bind);
+    if let Some(listener) = &listener {
+        eprintln!("Listening on http://{}", listener.local_addr()?);
+    }
     if let Some(listener) = &tls_listener {
         eprintln!("Listening on https://{}", listener.local_addr()?);
     }
@@ -293,7 +313,7 @@ async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> 
                     eprintln!("Connection task failed: {error}");
                 }
             }
-            (accepted, permit) = accept(Some(&listener), &limiter) => {
+            (accepted, permit) = accept(listener.as_ref(), &limiter) => {
                 let Some((stream, peer, local)) = accepted_stream(accepted).await else {
                     continue;
                 };

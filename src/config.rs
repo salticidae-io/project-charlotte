@@ -41,6 +41,7 @@ pub struct FastCgiApp {
 
 #[derive(Clone, Debug)]
 pub struct Config {
+    pub plain_http: bool,
     pub bind: SocketAddr,
     pub tls_bind: Option<SocketAddr>,
     pub http3_bind: SocketAddr,
@@ -110,6 +111,9 @@ struct Cli {
     /// Plain HTTP listen address
     #[arg(long, value_name = "ADDRESS", default_value = "127.0.0.1:8080", value_parser = parse_cli_address("socket address"), allow_hyphen_values = true)]
     bind: SocketAddr,
+    /// Disable the plain HTTP listener
+    #[arg(long)]
+    no_plain_http: bool,
     /// TLS (HTTP/1.1 and HTTP/2) listen address
     #[arg(long, value_name = "ADDRESS", value_parser = parse_cli_address("TLS socket address"), allow_hyphen_values = true)]
     tls_bind: Option<SocketAddr>,
@@ -333,6 +337,7 @@ impl Config {
             user: master_user,
             group: master_group,
             bind,
+            no_plain_http,
             tls_bind,
             root,
             index,
@@ -439,6 +444,13 @@ impl Config {
             (None, None) => None,
         };
 
+        if no_plain_http && acme.is_some() {
+            return Err(
+                "--no-plain-http cannot be used with ACME; HTTP-01 requires plaintext HTTP"
+                    .to_owned(),
+            );
+        }
+
         if master_group.is_some() && master_user.is_none() {
             return Err("--group requires --user".to_owned());
         }
@@ -456,6 +468,7 @@ impl Config {
         }
 
         Ok(ParseResult::Config(Box::new(Self {
+            plain_http: !no_plain_http,
             bind,
             tls_bind,
             http3_bind: http3_bind.unwrap_or_else(|| tls_bind.unwrap_or(bind)),
@@ -1555,6 +1568,37 @@ mod tests {
             .err()
             .expect("invalid thread count");
         assert!(error.contains("invalid thread count: 0"), "{error}");
+    }
+
+    #[test]
+    fn can_disable_plain_http_listener() {
+        let Ok(ParseResult::Config(default_config)) = Config::parse(Vec::<String>::new()) else {
+            panic!("expected config")
+        };
+        assert!(default_config.plain_http);
+
+        let Ok(ParseResult::Config(config)) = Config::parse(["--no-plain-http".to_owned()]) else {
+            panic!("expected config")
+        };
+        assert!(!config.plain_http);
+    }
+
+    #[cfg(feature = "acme")]
+    #[test]
+    fn rejects_disabling_plain_http_with_acme() {
+        let error = Config::parse(
+            [
+                "--no-plain-http",
+                "--acme-directory",
+                "letsencrypt-staging",
+                "--acme-cache",
+                "/var/lib/charlotte/acme",
+            ]
+            .map(str::to_owned),
+        )
+        .err()
+        .expect("ACME requires plaintext HTTP");
+        assert!(error.contains("HTTP-01 requires plaintext HTTP"), "{error}");
     }
 
     #[cfg(feature = "hosting")]
