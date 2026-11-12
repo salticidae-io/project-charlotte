@@ -1,0 +1,44 @@
+# Example SSL-terminating reverse proxy with automatic ACME certificates.
+# Replace the example domains, contact address, and upstreams with your own.
+# The DNS A/AAAA records must point here, and the ACME server must be able to
+# reach this machine on public port 80.
+#
+# Example command (start as root so the server can bind ports 80 and 443):
+#
+#   project-charlotte --config /etc/charlotte/reverse-proxy-acme.yaml \
+#     --bind 0.0.0.0:80 --tls-bind 0.0.0.0:443 \
+#     --http3-bind 0.0.0.0:443 \
+#     --acme-directory letsencrypt \
+#     --acme-cache /var/lib/charlotte/acme \
+#     --acme-contact mailto:admin@example.com \
+#     --root /var/empty --user charlotte
+#
+# Create the charlotte account and empty fallback root first, and put the CA
+# bundle trusted by the HTTPS upstream at
+# /etc/charlotte/certs/internal-ca.pem. Keep the ACME cache outside the fallback
+# root and every other served document root. The proxy hosts have no root.
+#
+# ACME uses HTTP-01: an ordinary plaintext HTTP request for an eligible host
+# triggers issuance or renewal (renewal starts within 30 days of expiry). The
+# challenge path is answered by Charlotte before proxy routing. HTTPS is
+# terminated here; upstream TLS is configured independently with proxy_pass.
+# There is intentionally no HTTP-to-HTTPS redirect: plaintext requests are
+# proxied too, and Charlotte sets X-Forwarded-Proto to the client-side scheme.
+#
+# Every ACME-enabled vhost must have an exact DNS name and must not set its own
+# tls_cert/tls_key pair. Wildcard names are not eligible. ACME is enabled by
+# default; use `acme: false` to opt a host out.
+
+vhost:
+  - server_names: [app.example.com, www.example.com]
+    proxy_pass: http://127.0.0.1:8080
+
+  - server_names: [api.example.com]
+    proxy_pass: https://api.internal.example.com:8443/v2
+    proxy_ca_root: certs/internal-ca.pem
+    proxy_timeout: 90
+
+# Example opt-out for a host that should not receive an ACME certificate:
+#  - server_names: [legacy.example.com]
+#    proxy_pass: http://127.0.0.1:8081
+#    acme: false

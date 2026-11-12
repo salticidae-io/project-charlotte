@@ -1600,6 +1600,20 @@ mod tests {
     }
 
     #[test]
+    fn reverse_proxy_acme_example_parses_and_validates() {
+        let parsed =
+            parse_file_config(include_str!("../examples/reverse-proxy-acme.yaml")).unwrap();
+        assert!(validate_vhost_declarations(&parsed.vhost).is_ok());
+        assert!(!parsed.vhost.is_empty());
+        assert!(parsed.vhost.iter().all(|vhost| {
+            vhost.proxy_pass.is_some()
+                && vhost.tls_cert.is_none()
+                && vhost.tls_key.is_none()
+                && vhost.acme != Some(false)
+        }));
+    }
+
+    #[test]
     fn validates_vhost_worker_threads() {
         let mut entry = declaration(&["threads.example"], false);
         entry.worker_threads = Some(8);

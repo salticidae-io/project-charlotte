@@ -194,7 +194,11 @@ configuration file.
 
 For ACME HTTP-01 provisioning, configure eligible virtual hosts and ensure the
 ACME service can reach the server over plaintext HTTP. Keep the ACME cache
-outside all served document roots. See the example configuration for details.
+outside all served document roots. See
+[`examples/reverse-proxy-acme.yaml`](examples/reverse-proxy-acme.yaml) for an
+SSL-terminating reverse proxy configuration with automated certificate
+provisioning, or [`examples/charlotte.yaml`](examples/charlotte.yaml) for the
+general server configuration.
 
 ## Development
 
