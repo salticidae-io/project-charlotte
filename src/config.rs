@@ -1,4 +1,14 @@
-use std::{collections::BTreeMap, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+// Every build parses the same settings into the same structures, and refuses
+// the options of a feature it was built without before they take effect.
+// What a reduced build never reads is therefore not an oversight.
+#![cfg_attr(
+    not(all(feature = "acme", feature = "hosting", feature = "http3")),
+    allow(dead_code)
+)]
+
+#[cfg(feature = "hosting")]
+use std::sync::Arc;
+use std::{collections::BTreeMap, net::SocketAddr, path::PathBuf, time::Duration};
 
 #[derive(Clone, Debug)]
 pub struct FastCgiBackend {
@@ -12,6 +22,7 @@ pub enum FastCgiAddress {
     Unix(PathBuf),
     Cgi(Option<PathBuf>),
     Spawn(FastCgiApp),
+    #[cfg(feature = "hosting")]
     Pool(Arc<crate::fastcgi_app::AppPool>),
 }
 
@@ -110,6 +121,12 @@ impl Config {
         let mut args = args.into_iter();
 
         while let Some(arg) = args.next() {
+            if let Some(feature) = required_feature(&arg) {
+                return Err(format!(
+                    "{arg} requires the `{feature}` feature, which this build does not include (compiled features: {})",
+                    compiled_features()
+                ));
+            }
             match arg.as_str() {
                 "--help" | "-h" => return Ok(ParseResult::Help),
                 "--worker" => worker = true,
@@ -446,6 +463,7 @@ impl Config {
 
     /// Applies spawned-app environment that the master passed to this worker
     /// through `WORKER_APP_ENV`, encoded as `[[extension, key, value], ...]`.
+    #[cfg(feature = "hosting")]
     pub(crate) fn apply_fastcgi_app_env(&mut self, encoded: &str) -> Result<(), String> {
         let entries: Vec<(String, String, String)> = serde_json::from_str(encoded)
             .map_err(|error| format!("invalid {WORKER_APP_ENV}: {error}"))?;
@@ -460,14 +478,116 @@ impl Config {
         Ok(())
     }
 
-    pub fn usage() -> &'static str {
-        "Usage: project-charlotte [--user USER [--group GROUP]] [--bind ADDRESS] [--tls-bind ADDRESS] [--root DIRECTORY] [--index NAME] [--no-listing] [--try-files ENTRY]... [--fastcgi EXT=ADDR]... [--cgi EXT[=INTERPRETER]]... [--fastcgi-app EXT=PROGRAM]... [--fastcgi-app-arg EXT=ARG]... [--fastcgi-app-max-workers EXT=N]... [--fastcgi-app-idle-timeout EXT=SECS]... [--fastcgi-app-env EXT=KEY=VALUE]... [--fastcgi-timeout SECS] [--threads N] [--worker-threads N] [--modsecurity-rules FILE]... [--modsecurity-block-status CODE] [--modsecurity-body-limit BYTES] [--config YAML_FILE] [--vhost-dir DIRECTORY] [--tls-cert PATH --tls-key PATH] [--acme-directory URL|letsencrypt|letsencrypt-staging --acme-cache DIR] [--acme-contact URI]... [--acme-ca-root PEM] [--http3-bind ADDRESS] [--help]"
+    pub fn usage() -> String {
+        let mut options = vec![
+            "[--user USER [--group GROUP]]",
+            "[--bind ADDRESS]",
+            "[--tls-bind ADDRESS]",
+        ];
+        #[cfg(feature = "hosting")]
+        options.extend([
+            "[--root DIRECTORY]",
+            "[--index NAME]",
+            "[--no-listing]",
+            "[--try-files ENTRY]...",
+            "[--fastcgi EXT=ADDR]...",
+            "[--cgi EXT[=INTERPRETER]]...",
+            "[--fastcgi-app EXT=PROGRAM]...",
+            "[--fastcgi-app-arg EXT=ARG]...",
+            "[--fastcgi-app-max-workers EXT=N]...",
+            "[--fastcgi-app-idle-timeout EXT=SECS]...",
+            "[--fastcgi-app-env EXT=KEY=VALUE]...",
+            "[--fastcgi-timeout SECS]",
+        ]);
+        options.push("[--threads N]");
+        #[cfg(feature = "hosting")]
+        options.push("[--worker-threads N]");
+        options.extend([
+            "[--modsecurity-rules FILE]...",
+            "[--modsecurity-block-status CODE]",
+            "[--modsecurity-body-limit BYTES]",
+            "[--config YAML_FILE]",
+            "[--vhost-dir DIRECTORY]",
+            "[--tls-cert PATH --tls-key PATH]",
+        ]);
+        #[cfg(feature = "acme")]
+        options.extend([
+            "[--acme-directory URL|letsencrypt|letsencrypt-staging --acme-cache DIR]",
+            "[--acme-contact URI]...",
+            "[--acme-ca-root PEM]",
+        ]);
+        #[cfg(feature = "http3")]
+        options.push("[--http3-bind ADDRESS]");
+        options.push("[--help]");
+        format!(
+            "Usage: project-charlotte {}\nCompiled features: {}",
+            options.join(" "),
+            compiled_features()
+        )
     }
 }
 
 /// Environment variable through which the master hands a worker the
 /// environment of its spawned FastCGI apps.
+#[cfg(feature = "hosting")]
 pub(crate) const WORKER_APP_ENV: &str = "CHARLOTTE_FASTCGI_APP_ENV";
+
+/// The names of the optional features this binary was built with.
+fn compiled_features() -> String {
+    let features = [
+        ("acme", cfg!(feature = "acme")),
+        ("hosting", cfg!(feature = "hosting")),
+        ("http3", cfg!(feature = "http3")),
+        ("proxy", cfg!(feature = "proxy")),
+    ]
+    .into_iter()
+    .filter_map(|(name, enabled)| enabled.then_some(name))
+    .collect::<Vec<_>>();
+    if features.is_empty() {
+        "none".to_owned()
+    } else {
+        features.join(", ")
+    }
+}
+
+/// Names the Cargo feature that `option` belongs to when this binary was
+/// built without it, so that the option is refused rather than silently
+/// accepted and ignored.
+fn required_feature(option: &str) -> Option<&'static str> {
+    let hosting = matches!(
+        option,
+        "--worker"
+            | "--worker-uid"
+            | "--worker-gid"
+            | "--root"
+            | "--index"
+            | "--no-listing"
+            | "--try-files"
+            | "--fastcgi"
+            | "--cgi"
+            | "--fastcgi-app"
+            | "--fastcgi-app-arg"
+            | "--fastcgi-app-workers"
+            | "--fastcgi-app-max-workers"
+            | "--fastcgi-app-idle-timeout"
+            | "--fastcgi-app-env"
+            | "--fastcgi-timeout"
+            | "--worker-threads"
+    );
+    let acme = matches!(
+        option,
+        "--acme-directory" | "--acme-cache" | "--acme-contact" | "--acme-ca-root"
+    );
+    if hosting && !cfg!(feature = "hosting") {
+        Some("hosting")
+    } else if acme && !cfg!(feature = "acme") {
+        Some("acme")
+    } else if option == "--http3-bind" && !cfg!(feature = "http3") {
+        Some("http3")
+    } else {
+        None
+    }
+}
 
 fn add_fastcgi_app_env(
     fastcgi: &mut [FastCgiBackend],
@@ -704,12 +824,14 @@ fn next_value(args: &mut impl Iterator<Item = String>, option: &str) -> Result<S
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        Config, DEFAULT_FASTCGI_APP_IDLE_TIMEOUT_SECS, FastCgiAddress, ParseResult,
-        parse_modsecurity_block_status, validate_try_files,
-    };
-    use std::{path::PathBuf, time::Duration};
+    use super::{Config, ParseResult, parse_modsecurity_block_status};
+    #[cfg(feature = "hosting")]
+    use super::{DEFAULT_FASTCGI_APP_IDLE_TIMEOUT_SECS, FastCgiAddress, validate_try_files};
+    use std::path::PathBuf;
+    #[cfg(feature = "hosting")]
+    use std::time::Duration;
 
+    #[cfg(feature = "hosting")]
     #[test]
     fn parses_options() {
         let parsed = Config::parse([
@@ -734,6 +856,7 @@ mod tests {
         assert!(config.try_files.is_empty());
     }
 
+    #[cfg(feature = "hosting")]
     #[test]
     fn parses_and_validates_try_files() {
         let parsed = Config::parse([
@@ -770,11 +893,13 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "hosting")]
     #[test]
     fn rejects_invalid_index() {
         assert!(Config::parse(["--index".to_owned(), "../secret".to_owned()]).is_err());
     }
 
+    #[cfg(feature = "hosting")]
     #[test]
     fn parses_fastcgi_tcp_and_unix_backends() {
         let parsed = Config::parse([
@@ -796,6 +921,7 @@ mod tests {
         assert_eq!(config.fastcgi_timeout, std::time::Duration::from_secs(12));
     }
 
+    #[cfg(feature = "hosting")]
     #[test]
     fn parses_classic_cgi_backends_and_rejects_duplicate_extensions() {
         let parsed = Config::parse([
@@ -830,6 +956,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "hosting")]
     #[test]
     fn rejects_invalid_fastcgi_addresses_and_duplicates() {
         assert!(Config::parse(["--fastcgi".to_owned(), "php=localhost".to_owned()]).is_err());
@@ -844,6 +971,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "hosting")]
     #[test]
     fn parses_fastcgi_app_and_preserves_args_pool_options_and_environment() {
         let parsed = Config::parse([
@@ -879,6 +1007,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "hosting")]
     #[test]
     fn fastcgi_app_defaults_to_one_worker() {
         let parsed = Config::parse(["--fastcgi-app".to_owned(), "php=php-cgi".to_owned()]).unwrap();
@@ -895,6 +1024,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "hosting")]
     #[test]
     fn fastcgi_app_workers_flag_remains_an_alias() {
         let parsed = Config::parse([
@@ -913,6 +1043,7 @@ mod tests {
         assert_eq!(app.max_workers, 3);
     }
 
+    #[cfg(feature = "hosting")]
     #[test]
     fn rejects_invalid_fastcgi_app_declarations_and_options() {
         assert!(Config::parse(["--fastcgi-app".to_owned(), "php=".to_owned()]).is_err());
@@ -990,6 +1121,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "http3")]
     #[test]
     fn parses_http3_tls_options_and_bind_override() {
         let parsed = Config::parse([
@@ -1018,6 +1150,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "http3")]
     #[test]
     fn tls_bind_defaults_http3_bind_when_not_overridden() {
         let parsed = Config::parse([
@@ -1046,6 +1179,7 @@ mod tests {
         assert_eq!(config.http3_bind.to_string(), "127.0.0.1:9443");
     }
 
+    #[cfg(feature = "http3")]
     #[test]
     fn rejects_incomplete_tls_options_and_invalid_http3_bind() {
         assert!(Config::parse(["--tls-cert".to_owned(), "server.pem".to_owned()]).is_err());
@@ -1054,6 +1188,7 @@ mod tests {
         assert!(Config::parse(["--tls-bind".to_owned(), "localhost".to_owned()]).is_err());
     }
 
+    #[cfg(feature = "acme")]
     #[test]
     fn parses_acme_options_and_requires_cache() {
         let parsed = Config::parse([
@@ -1088,6 +1223,7 @@ mod tests {
         assert!(Config::parse(["--acme-cache".to_owned(), "/tmp/acme".to_owned()]).is_err());
     }
 
+    #[cfg(feature = "hosting")]
     #[test]
     fn parses_thread_options_and_rejects_invalid_counts() {
         let ParseResult::Config(defaults) = Config::parse(Vec::<String>::new()).unwrap() else {
@@ -1130,6 +1266,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "hosting")]
     #[test]
     fn parses_config_file_and_worker_identity() {
         let parsed = Config::parse([
@@ -1207,6 +1344,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "hosting")]
     #[test]
     fn rejects_worker_identity_without_worker_mode() {
         assert!(
@@ -1253,6 +1391,93 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn refuses_options_of_features_left_out_of_the_build() {
+        for (args, feature, enabled) in [
+            (
+                vec!["--root", "public"],
+                "hosting",
+                cfg!(feature = "hosting"),
+            ),
+            (
+                vec!["--fastcgi", "php=127.0.0.1:9000"],
+                "hosting",
+                cfg!(feature = "hosting"),
+            ),
+            (
+                vec!["--worker-threads", "2"],
+                "hosting",
+                cfg!(feature = "hosting"),
+            ),
+            (
+                vec![
+                    "--acme-directory",
+                    "letsencrypt-staging",
+                    "--acme-cache",
+                    "cache",
+                ],
+                "acme",
+                cfg!(feature = "acme"),
+            ),
+            (
+                vec!["--http3-bind", "127.0.0.1:8443"],
+                "http3",
+                cfg!(feature = "http3"),
+            ),
+        ] {
+            match Config::parse(args.iter().map(|arg| (*arg).to_owned())) {
+                Ok(_) => assert!(enabled, "{args:?} accepted without `{feature}`"),
+                Err(error) => {
+                    assert!(!enabled, "{args:?} refused: {error}");
+                    assert!(
+                        error.contains(&format!("requires the `{feature}` feature")),
+                        "{error}"
+                    );
+                }
+            }
+        }
+
+        // Options that belong to no feature are accepted by every build.
+        assert!(
+            Config::parse(
+                [
+                    "--bind",
+                    "127.0.0.1:8080",
+                    "--tls-bind",
+                    "127.0.0.1:8443",
+                    "--user",
+                    "nobody",
+                    "--config",
+                    "sites.yaml",
+                    "--threads",
+                    "4",
+                ]
+                .map(str::to_owned)
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn usage_lists_the_options_of_compiled_features_only() {
+        let usage = Config::usage();
+        assert_eq!(usage.contains("--root"), cfg!(feature = "hosting"));
+        assert_eq!(usage.contains("--fastcgi-app"), cfg!(feature = "hosting"));
+        assert_eq!(usage.contains("--acme-directory"), cfg!(feature = "acme"));
+        assert_eq!(usage.contains("--http3-bind"), cfg!(feature = "http3"));
+        assert!(usage.contains("--user") && usage.contains("--tls-bind"));
+
+        let features = usage.rsplit("Compiled features: ").next().unwrap();
+        for (name, enabled) in [
+            ("acme", cfg!(feature = "acme")),
+            ("hosting", cfg!(feature = "hosting")),
+            ("http3", cfg!(feature = "http3")),
+            ("proxy", cfg!(feature = "proxy")),
+        ] {
+            assert_eq!(features.split(", ").any(|feature| feature == name), enabled);
+        }
     }
 
     #[test_fuzz::test_fuzz]

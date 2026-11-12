@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![cfg(all(feature = "acme", any(feature = "hosting", feature = "proxy")))]
 
 mod common;
 
@@ -15,6 +16,7 @@ use std::{
     time::Duration,
 };
 
+#[cfg(feature = "hosting")]
 use nix::unistd::{User, geteuid};
 use rcgen::{
     BasicConstraints, CertificateParams, CertificateSigningRequestParams, IsCa, Issuer, KeyPair,
@@ -34,6 +36,17 @@ use tokio_rustls::{TlsAcceptor, TlsConnector, server::TlsStream as ServerTlsStre
 static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
 static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// Moves the HTTP/3 listener to a free port. A build without HTTP/3 has no
+/// such listener and refuses the option.
+fn http3_bind_args() -> &'static [&'static str] {
+    if cfg!(feature = "http3") {
+        &["--http3-bind", "127.0.0.1:0"]
+    } else {
+        &[]
+    }
+}
+
+#[cfg(feature = "hosting")]
 struct Fixture {
     root: PathBuf,
     cache: PathBuf,
@@ -44,6 +57,7 @@ struct Fixture {
     _guard: tokio::sync::MutexGuard<'static, ()>,
 }
 
+#[cfg(feature = "hosting")]
 impl Fixture {
     async fn start() -> Self {
         let guard = TEST_LOCK.lock().await;
@@ -134,15 +148,13 @@ impl Fixture {
             ),
         )
         .unwrap();
-        let reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = reservation.local_addr().unwrap();
-        drop(reservation);
+        let address = common::reserve_tcp_address();
         let cache = root.with_extension("acme-cache");
-        let server = Command::new(env!("CARGO_BIN_EXE_project-charlotte"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_project-charlotte"));
+        command
             .arg("--bind")
             .arg(address.to_string())
-            .arg("--http3-bind")
-            .arg("127.0.0.1:0")
+            .args(http3_bind_args())
             .arg("--root")
             .arg(&root)
             .arg("--config")
@@ -154,9 +166,8 @@ impl Fixture {
             .arg("--acme-ca-root")
             .arg(&directory_cert_path)
             .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::inherit());
+        let server = common::spawn(&mut command).unwrap();
         let mut fixture = Self {
             root,
             cache,
@@ -184,6 +195,7 @@ impl Fixture {
     }
 }
 
+#[cfg(feature = "hosting")]
 fn make_directory_certificate() -> (rcgen::Certificate, KeyPair) {
     let mut params = CertificateParams::new(Vec::new()).unwrap();
     params
@@ -194,6 +206,7 @@ fn make_directory_certificate() -> (rcgen::Certificate, KeyPair) {
     (certificate, key)
 }
 
+#[cfg(feature = "hosting")]
 impl Drop for Fixture {
     fn drop(&mut self) {
         self.mock.abort();
@@ -208,6 +221,7 @@ struct HttpResponse {
     body: Vec<u8>,
 }
 
+#[cfg(feature = "hosting")]
 async fn request(fixture: &Fixture, host: &str, path: &str) -> io::Result<HttpResponse> {
     request_at(fixture.address, host, path).await
 }
@@ -280,6 +294,8 @@ struct IssuanceFixture {
     ca_certificate: CertificateDer<'static>,
     server: Child,
     mock: JoinHandle<()>,
+    #[cfg(not(feature = "hosting"))]
+    upstream: JoinHandle<()>,
     order_count: Arc<AtomicUsize>,
     challenge_valid: Arc<std::sync::atomic::AtomicBool>,
     _guard: tokio::sync::MutexGuard<'static, ()>,
@@ -318,8 +334,8 @@ impl IssuanceFixture {
         let directory_key = KeyPair::generate().unwrap();
         let directory_certificate = directory_params.signed_by(&directory_key, &issuer).unwrap();
 
-        let address = reserve_tcp_address();
-        let tls_address = reserve_tcp_address();
+        let address = common::reserve_tcp_address();
+        let tls_address = common::reserve_tcp_address();
         let acme_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let acme_address = acme_listener.local_addr().unwrap();
         let mut server_config = rustls::ServerConfig::builder()
@@ -373,14 +389,25 @@ impl IssuanceFixture {
         });
 
         let config_path = root.join("vhosts.yaml");
-        let user = User::from_uid(geteuid()).unwrap().unwrap().name;
+        // A build that hosts sites serves the page itself. A proxy-only build
+        // forwards the request to an upstream that stands in for the site.
+        #[cfg(feature = "hosting")]
+        let site_declaration = format!(
+            "    root: {:?}\n    user: {:?}\n",
+            site.to_string_lossy(),
+            User::from_uid(geteuid()).unwrap().unwrap().name,
+        );
+        #[cfg(not(feature = "hosting"))]
+        let (site_declaration, upstream) = {
+            let (upstream_address, upstream) = spawn_site_upstream().await;
+            (
+                format!("    proxy_pass: \"http://{upstream_address}\"\n"),
+                upstream,
+            )
+        };
         std::fs::write(
             &config_path,
-            format!(
-                "vhost:\n  - server_names: [{ISSUANCE_HOST:?}]\n    root: {:?}\n    user: {:?}\n",
-                site.to_string_lossy(),
-                user,
-            ),
+            format!("vhost:\n  - server_names: [{ISSUANCE_HOST:?}]\n{site_declaration}"),
         )
         .unwrap();
         let cache = root.with_extension("issuance-cache");
@@ -402,6 +429,8 @@ impl IssuanceFixture {
             ca_certificate: ca_der,
             server,
             mock,
+            #[cfg(not(feature = "hosting"))]
+            upstream,
             order_count,
             challenge_valid,
             _guard: guard,
@@ -428,17 +457,47 @@ impl IssuanceFixture {
 impl Drop for IssuanceFixture {
     fn drop(&mut self) {
         self.mock.abort();
+        #[cfg(not(feature = "hosting"))]
+        self.upstream.abort();
         common::shutdown(&mut self.server);
         let _ = std::fs::remove_dir_all(&self.root);
         let _ = std::fs::remove_dir_all(&self.cache);
     }
 }
 
-fn reserve_tcp_address() -> SocketAddr {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap()
+/// Serves the test page over plain HTTP, as the site behind a proxy-only
+/// build would.
+#[cfg(not(feature = "hosting"))]
+async fn spawn_site_upstream() -> (SocketAddr, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut buffer = [0; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    match stream.read(&mut buffer).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(count) => request.extend_from_slice(&buffer[..count]),
+                    }
+                }
+                let body = "issued certificate site";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    (address, task)
 }
 
+#[cfg_attr(not(feature = "hosting"), allow(unused_variables))]
 fn start_issuance_server(
     address: SocketAddr,
     tls_address: SocketAddr,
@@ -448,15 +507,17 @@ fn start_issuance_server(
     ca_path: &std::path::Path,
     acme_address: SocketAddr,
 ) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_project-charlotte"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_project-charlotte"));
+    command
         .arg("--bind")
         .arg(address.to_string())
         .arg("--tls-bind")
         .arg(tls_address.to_string())
-        .arg("--http3-bind")
-        .arg("127.0.0.1:0")
-        .arg("--root")
-        .arg(fallback)
+        .args(http3_bind_args());
+    // Only a build that hosts sites has a fallback site, and so a `--root`.
+    #[cfg(feature = "hosting")]
+    command.arg("--root").arg(fallback);
+    command
         .arg("--config")
         .arg(config)
         .arg("--acme-directory")
@@ -466,9 +527,8 @@ fn start_issuance_server(
         .arg("--acme-ca-root")
         .arg(ca_path)
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .unwrap()
+        .stderr(Stdio::inherit());
+    common::spawn(&mut command).unwrap()
 }
 
 async fn wait_for_server(server: &mut Child, addresses: &[SocketAddr]) {
@@ -849,6 +909,7 @@ async fn issues_caches_and_serves_certificate_from_local_acme_directory() {
     assert_eq!(fixture.order_count.load(Ordering::Relaxed), 1);
 }
 
+#[cfg(feature = "hosting")]
 #[tokio::test]
 async fn plaintext_requests_trigger_acme_without_blocking_and_unknown_tokens_fall_through() {
     let fixture = Fixture::start().await;
@@ -886,6 +947,7 @@ async fn plaintext_requests_trigger_acme_without_blocking_and_unknown_tokens_fal
     assert_eq!(unknown_challenge.status, 404);
 }
 
+#[cfg(feature = "hosting")]
 #[test]
 fn rejects_acme_cache_inside_a_served_document_root() {
     let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
@@ -894,7 +956,8 @@ fn rejects_acme_cache_inside_a_served_document_root() {
         std::process::id()
     ));
     std::fs::create_dir_all(&root).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_project-charlotte"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_project-charlotte"));
+    command
         .arg("--bind")
         .arg("127.0.0.1:0")
         .arg("--root")
@@ -902,9 +965,8 @@ fn rejects_acme_cache_inside_a_served_document_root() {
         .arg("--acme-directory")
         .arg("https://ca.example.test/directory")
         .arg("--acme-cache")
-        .arg(root.join("acme-cache"))
-        .output()
-        .unwrap();
+        .arg(root.join("acme-cache"));
+    let output = common::output(&mut command).unwrap();
     assert!(!output.status.success());
     assert!(
         String::from_utf8_lossy(&output.stderr)

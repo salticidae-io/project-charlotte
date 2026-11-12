@@ -9,14 +9,16 @@ use rustls::{
     sign::CertifiedKey,
 };
 
+#[cfg(feature = "acme")]
+use crate::acme::{AcmeCertificateStore, AcmeManager};
 use crate::{
-    acme::AcmeCertificateStore,
     config::{Config, TlsFiles},
     vhost::{Router, match_score, normalize_host},
 };
 
 pub(crate) struct TlsSetup {
     pub(crate) tcp: Arc<rustls::ServerConfig>,
+    #[cfg(feature = "http3")]
     pub(crate) http3: Arc<rustls::ServerConfig>,
     pub(crate) sni: SniHandle,
 }
@@ -24,6 +26,7 @@ pub(crate) struct TlsSetup {
 #[derive(Debug)]
 struct SniResolver {
     static_entries: std::sync::RwLock<StaticCertificates>,
+    #[cfg(feature = "acme")]
     acme: Option<AcmeCertificateStore>,
 }
 
@@ -42,13 +45,18 @@ impl TlsSetup {
     pub(crate) fn load(
         config: &Config,
         router: &Router,
-        acme: Option<AcmeCertificateStore>,
     ) -> Result<Option<Self>, Box<dyn Error + Send + Sync>> {
         let (certificate_entries, default_certificate) = router.sni_certificates();
         let fallback_files = config.tls.as_ref().or(default_certificate.as_ref());
+        #[cfg(feature = "acme")]
+        let acme = router.acme_manager().map(AcmeManager::certificate_store);
+        #[cfg(feature = "acme")]
+        let has_acme = acme.is_some();
+        #[cfg(not(feature = "acme"))]
+        let has_acme = false;
         if certificate_entries.is_empty()
             && fallback_files.is_none()
-            && acme.is_none()
+            && !has_acme
             && !(config.tls_bind.is_some() && router.vhost_dir().is_some())
         {
             return Ok(None);
@@ -57,6 +65,7 @@ impl TlsSetup {
         let static_certificates = load_static_certificates(certificate_entries, fallback_files)?;
         let resolver = Arc::new(SniResolver {
             static_entries: std::sync::RwLock::new(static_certificates),
+            #[cfg(feature = "acme")]
             acme,
         });
         let tcp = server_config(
@@ -64,6 +73,7 @@ impl TlsSetup {
             &[b"h2".to_vec(), b"http/1.1".to_vec()],
             &[&rustls::version::TLS13, &rustls::version::TLS12],
         )?;
+        #[cfg(feature = "http3")]
         let http3 = server_config(
             resolver.clone(),
             &[b"h3".to_vec()],
@@ -71,6 +81,7 @@ impl TlsSetup {
         )?;
         Ok(Some(Self {
             tcp,
+            #[cfg(feature = "http3")]
             http3,
             sni: SniHandle { resolver },
         }))
@@ -85,6 +96,7 @@ impl ResolvesServerCert for SniResolver {
 
 impl SniResolver {
     fn resolve_name(&self, server_name: Option<&str>) -> Option<Arc<CertifiedKey>> {
+        #[cfg(feature = "acme")]
         if let Some(key) = server_name
             .and_then(normalize_host)
             .and_then(|host| self.acme.as_ref().and_then(|store| store.get(&host)))
@@ -205,9 +217,12 @@ mod tests {
         sync::atomic::{AtomicUsize, Ordering},
     };
 
-    use super::{SniResolver, StaticCertificates, load_certified_key, select_index, select_key};
+    #[cfg(feature = "acme")]
+    use super::{SniResolver, StaticCertificates};
+    use super::{load_certified_key, select_index, select_key};
+    #[cfg(feature = "acme")]
+    use crate::acme::AcmeCertificateStore;
     use crate::{
-        acme::AcmeCertificateStore,
         config::TlsFiles,
         vhost::{match_score, normalize_host},
     };
@@ -297,6 +312,7 @@ mod tests {
         assert_eq!(select_key(&entries, None, None), None);
     }
 
+    #[cfg(feature = "acme")]
     #[test]
     fn acme_certificate_takes_precedence_over_static_and_fallback_certificates() {
         let (dynamic_dir, dynamic_files, dynamic_der) = certificate_files("alpha.test");

@@ -14,7 +14,7 @@ use hyper_util::{
 };
 use rustls::pki_types::{CertificateDer, pem::PemObject};
 
-use crate::handler::{self, ResponseBody};
+use crate::response::{self, ResponseBody};
 
 type ProxyRequestBody = UnsyncBoxBody<Bytes, io::Error>;
 type ProxyClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, ProxyRequestBody>;
@@ -128,7 +128,7 @@ impl ReverseProxy {
         B::Error: Into<Box<dyn Error + Send + Sync>>,
     {
         if request.method() == Method::CONNECT || request.headers().contains_key(header::UPGRADE) {
-            return handler::error_response(
+            return response::error_response(
                 StatusCode::NOT_IMPLEMENTED,
                 "Proxying CONNECT and protocol upgrades is not supported\n",
             );
@@ -150,13 +150,16 @@ impl ReverseProxy {
             path_and_query
         };
         if !path_and_query.starts_with('/') {
-            return handler::error_response(StatusCode::BAD_REQUEST, "Invalid proxy request URI\n");
+            return response::error_response(
+                StatusCode::BAD_REQUEST,
+                "Invalid proxy request URI\n",
+            );
         }
         let target = format!("{}{}", self.prefix, path_and_query);
         let uri = match format!("{}://{}{}", self.scheme, self.authority, target).parse::<Uri>() {
             Ok(uri) => uri,
             Err(_) => {
-                return handler::error_response(
+                return response::error_response(
                     StatusCode::BAD_REQUEST,
                     "Invalid proxy request URI\n",
                 );
@@ -196,10 +199,10 @@ impl ReverseProxy {
                 .boxed_unsync()
         });
         match tokio::time::timeout(self.timeout, self.client.request(request)).await {
-            Err(_) => handler::error_response(StatusCode::GATEWAY_TIMEOUT, "Upstream timed out\n"),
+            Err(_) => response::error_response(StatusCode::GATEWAY_TIMEOUT, "Upstream timed out\n"),
             Ok(Err(error)) => {
                 eprintln!("reverse proxy request failed: {error}");
-                handler::error_response(StatusCode::BAD_GATEWAY, "Upstream request failed\n")
+                response::error_response(StatusCode::BAD_GATEWAY, "Upstream request failed\n")
             }
             Ok(Ok(mut response)) => {
                 strip_hop_by_hop(response.headers_mut());

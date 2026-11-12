@@ -158,6 +158,7 @@ impl AcmeManager {
         })
     }
 
+    #[cfg(feature = "hosting")]
     pub(crate) fn cache_dir(&self) -> &Path {
         &self.inner.settings.cache
     }

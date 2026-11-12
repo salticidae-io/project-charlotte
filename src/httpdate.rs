@@ -10,6 +10,10 @@
 //! All times are interpreted as UTC (GMT), with calendar conversions handled
 //! by the `chrono` crate.
 
+// Only static file serving parses dates (for conditional requests); every
+// build formats them.
+#![cfg_attr(not(feature = "hosting"), allow(dead_code))]
+
 use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, TimeDelta, Utc};
 
 /// Abbreviated weekday names, indexed from Sunday (`0`) to Saturday (`6`).

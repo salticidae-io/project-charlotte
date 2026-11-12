@@ -1,9 +1,10 @@
 #![forbid(unsafe_code)]
+#![cfg(all(feature = "hosting", feature = "http3"))]
 
 mod common;
 
 use std::{
-    net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener as StdTcpListener, UdpSocket},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
@@ -122,9 +123,9 @@ impl Fixture {
         )
         .unwrap();
 
-        let tcp_address = reserve_tcp();
-        let tls_address = reserve_tcp();
-        let http3_address = reserve_udp();
+        let tcp_address = common::reserve_tcp_address();
+        let tls_address = common::reserve_tcp_address();
+        let http3_address = common::reserve_udp_address();
         let mut command = Command::new(env!("CARGO_BIN_EXE_project-charlotte"));
         command
             .arg("--bind")
@@ -144,11 +145,8 @@ impl Fixture {
                 .arg("--tls-key")
                 .arg(fallback_key_path);
         }
-        let server = command
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+        command.stdout(Stdio::null()).stderr(Stdio::null());
+        let server = common::spawn(&mut command).unwrap();
 
         let mut fixture = Self {
             root,
@@ -442,16 +440,6 @@ fn write_certificate(
     (generated.cert.der().clone(), cert_path, key_path)
 }
 
-fn reserve_tcp() -> SocketAddr {
-    let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap()
-}
-
-fn reserve_udp() -> SocketAddr {
-    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-    socket.local_addr().unwrap()
-}
-
 fn current_name(name: &str) -> ServerName<'static> {
     ServerName::try_from(name.to_owned()).unwrap()
 }
@@ -680,18 +668,18 @@ async fn plain_http_routes_hosts_without_tls_sni_checks() {
 async fn tls_listener_requires_a_configured_certificate() {
     let _guard = TEST_LOCK.lock().await;
     let root = create_root();
-    let address = reserve_tcp();
-    let mut server = Command::new(env!("CARGO_BIN_EXE_project-charlotte"))
+    let address = common::reserve_tcp_address();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_project-charlotte"));
+    command
         .arg("--bind")
-        .arg(reserve_tcp().to_string())
+        .arg(common::reserve_tcp_address().to_string())
         .arg("--tls-bind")
         .arg(address.to_string())
         .arg("--root")
         .arg(&root)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+        .stderr(Stdio::null());
+    let mut server = common::spawn(&mut command).unwrap();
     let result = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             if let Some(status) = server.try_wait().unwrap() {

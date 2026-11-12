@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![cfg(feature = "hosting")]
 
 mod common;
 
@@ -36,10 +37,9 @@ impl Fixture {
         let guard = TEST_LOCK.lock().await;
         let config_path = root.join("vhosts.yaml");
         std::fs::write(&config_path, config).unwrap();
-        let reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = reservation.local_addr().unwrap();
-        drop(reservation);
-        let mut server = Command::new(env!("CARGO_BIN_EXE_project-charlotte"))
+        let address = common::reserve_tcp_address();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_project-charlotte"));
+        command
             .arg("--bind")
             .arg(address.to_string())
             .arg("--root")
@@ -47,9 +47,8 @@ impl Fixture {
             .arg("--config")
             .arg(config_path)
             .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::inherit());
+        let mut server = common::spawn(&mut command).unwrap();
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
         loop {
@@ -494,15 +493,15 @@ async fn refuses_privilege_change_when_server_is_non_root() {
     );
     let config_path = root.join("vhosts.yaml");
     std::fs::write(&config_path, config).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_project-charlotte"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_project-charlotte"));
+    command
         .arg("--bind")
         .arg("127.0.0.1:0")
         .arg("--root")
         .arg(&root)
         .arg("--config")
-        .arg(config_path)
-        .output()
-        .unwrap();
+        .arg(config_path);
+    let output = common::output(&mut command).unwrap();
     assert!(!output.status.success());
     assert!(
         String::from_utf8_lossy(&output.stderr)

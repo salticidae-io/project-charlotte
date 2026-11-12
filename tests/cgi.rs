@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![cfg(feature = "hosting")]
 
 #[path = "common/mod.rs"]
 mod common;
@@ -14,7 +15,7 @@ use std::{
 
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    net::TcpStream,
     time::sleep,
 };
 
@@ -135,10 +136,9 @@ cat
     }
 
     async fn launch(root: PathBuf, args: &[&str], env: &[(&str, &str)]) -> Self {
-        let reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = reservation.local_addr().unwrap();
-        drop(reservation);
-        let mut server = Command::new(env!("CARGO_BIN_EXE_project-charlotte"))
+        let address = common::reserve_tcp_address();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_project-charlotte"));
+        command
             .arg("--bind")
             .arg(address.to_string())
             .arg("--root")
@@ -152,9 +152,8 @@ cat
             .args(args)
             .envs(env.iter().copied())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::null());
+        let mut server = common::spawn(&mut command).unwrap();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             if let Some(status) = server.try_wait().unwrap() {

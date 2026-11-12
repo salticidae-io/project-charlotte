@@ -1,52 +1,39 @@
+#[cfg(any(feature = "hosting", feature = "proxy"))]
+use std::time::Duration;
 use std::{
     collections::BTreeMap,
     error::Error,
-    ffi::OsString,
     io,
     net::SocketAddr,
-    os::{
-        fd::OwnedFd,
-        unix::{net::UnixStream as StdUnixStream, process::CommandExt},
-    },
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
     sync::{Arc, RwLock},
-    thread,
-    time::{Duration, Instant},
 };
 
 use bytes::Bytes;
-use http::{HeaderName, HeaderValue, Request, Response, StatusCode, Uri, Version, header::HOST};
+use http::{HeaderValue, Request, Response, StatusCode, header::HOST};
 use http_body::Body;
-use http_body_util::{BodyExt, combinators::UnsyncBoxBody};
-use hyper::{body::Incoming, client::conn::http2::SendRequest};
-use hyper_util::rt::{TokioExecutor, TokioIo};
-use nix::{
-    sys::signal::{Signal, kill},
-    unistd::{Group, Pid, User},
-};
 use serde::Deserialize;
-use tokio::{io::AsyncReadExt, net::UnixStream, sync::Mutex, time::timeout};
+use tokio::sync::Mutex;
 
+#[cfg(feature = "acme")]
+use crate::acme::AcmeManager;
+#[cfg(feature = "hosting")]
+use crate::config::FastCgiAddress;
+#[cfg(feature = "hosting")]
+use crate::handler;
+#[cfg(feature = "proxy")]
+use crate::proxy::ReverseProxy;
 use crate::{
-    acme::AcmeManager,
-    config::{Config, FastCgiAddress, FastCgiApp, FastCgiBackend, TlsFiles},
-    handler::{self, ResponseBody},
-    proxy::ReverseProxy,
+    config::{Config, TlsFiles},
+    response::{self, ResponseBody},
     waf::{RuleIdSpec, Waf},
 };
 
-const META_PEER: HeaderName = HeaderName::from_static("x-charlotte-peer");
-const META_LOCAL: HeaderName = HeaderName::from_static("x-charlotte-local");
-const META_VERSION: HeaderName = HeaderName::from_static("x-charlotte-version");
-const META_TLS: HeaderName = HeaderName::from_static("x-charlotte-tls");
-const WORKER_READY_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long a worker is given to shut down on its own before it is killed.
-const WORKER_SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
-const WORKER_SHUTDOWN_POLL: Duration = Duration::from_millis(5);
-
-type WorkerRequestBody = UnsyncBoxBody<Bytes, io::Error>;
-type WorkerSender = SendRequest<WorkerRequestBody>;
+/// Master-side management of the worker processes that serve hosted sites.
+#[cfg(feature = "hosting")]
+mod hosted;
+#[cfg(feature = "hosting")]
+use hosted::*;
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -57,6 +44,9 @@ struct FileConfig {
     vhost_dir: Option<PathBuf>,
 }
 
+// Every build accepts the same declarations, so that one built without a
+// feature can say which feature a setting needs instead of calling it unknown.
+#[cfg_attr(not(feature = "hosting"), allow(dead_code))]
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct VhostFile {
@@ -105,6 +95,7 @@ impl RuleIdFile {
     }
 }
 
+#[cfg_attr(not(feature = "hosting"), allow(dead_code))]
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FastCgiAppFile {
@@ -120,58 +111,14 @@ struct FastCgiAppFile {
 struct Vhost {
     names: Vec<String>,
     tls: Option<TlsFiles>,
+    #[cfg(feature = "acme")]
     acme: bool,
     default: bool,
     waf: Option<Waf>,
+    #[cfg(feature = "hosting")]
     worker: Option<Arc<Worker>>,
+    #[cfg(feature = "proxy")]
     proxy: Option<Arc<ReverseProxy>>,
-}
-
-struct Worker {
-    uid: u32,
-    gid: u32,
-    root: PathBuf,
-    index: String,
-    listing: bool,
-    try_files: Vec<String>,
-    fastcgi: Vec<FastCgiBackend>,
-    fastcgi_timeout: Duration,
-    threads: usize,
-    process: Mutex<Option<WorkerProcess>>,
-}
-
-struct WorkerProcess {
-    sender: WorkerSender,
-    child: Child,
-}
-
-impl Drop for WorkerProcess {
-    fn drop(&mut self) {
-        // SIGKILL alone would stop the worker before it could drop the handles
-        // that stop its FastCGI apps, orphaning those apps along with every
-        // descriptor they inherited. Ask for an orderly exit first, and fall
-        // back to SIGKILL only if the worker does not take it. The wait is
-        // bounded and short because this runs on whichever thread drops the
-        // worker, which may be a runtime thread.
-        if let Ok(pid) = i32::try_from(self.child.id())
-            && kill(Pid::from_raw(pid), Signal::SIGTERM).is_ok()
-        {
-            let deadline = Instant::now() + WORKER_SHUTDOWN_GRACE;
-            loop {
-                match self.child.try_wait() {
-                    Ok(Some(_)) => return,
-                    Ok(None) => {}
-                    Err(_) => break,
-                }
-                if Instant::now() >= deadline {
-                    break;
-                }
-                thread::sleep(WORKER_SHUTDOWN_POLL);
-            }
-        }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
 }
 
 pub(crate) struct Router {
@@ -180,6 +127,7 @@ pub(crate) struct Router {
     sources: Mutex<SourceState>,
     dir: Option<PathBuf>,
     waf: Option<Waf>,
+    #[cfg(feature = "acme")]
     acme: Option<AcmeManager>,
 }
 
@@ -348,6 +296,7 @@ impl Router {
         for source in loaded.values() {
             vhosts.extend(source.vhosts.iter().cloned());
         }
+        #[cfg(all(feature = "acme", feature = "hosting"))]
         if let Some(acme) = &self.acme {
             ensure_acme_cache_is_private(acme.cache_dir(), &vhosts)?;
         }
@@ -376,6 +325,12 @@ impl Router {
         )
     }
 
+    // A build with neither hosting nor proxying refuses every declaration
+    // before it reaches the loop below, which then has nothing to construct.
+    #[cfg_attr(
+        not(any(feature = "hosting", feature = "proxy")),
+        allow(unused_mut, unused_variables)
+    )]
     async fn from_file(
         fallback: Arc<Config>,
         file: FileConfig,
@@ -426,6 +381,7 @@ impl Router {
                 _ => return Err("vhost tls_cert and tls_key must be supplied together".into()),
             };
 
+            #[cfg(feature = "proxy")]
             if let Some(upstream) = entry.proxy_pass.take() {
                 let ca_root = entry
                     .proxy_ca_root
@@ -440,163 +396,176 @@ impl Router {
                 vhosts.push(Vhost {
                     names: normalized_names,
                     tls,
+                    #[cfg(feature = "acme")]
                     acme: entry.acme.unwrap_or(true),
                     default: entry.default,
                     waf: vhost_waf,
+                    #[cfg(feature = "hosting")]
                     worker: None,
+                    #[cfg(feature = "proxy")]
                     proxy: Some(proxy),
                 });
                 continue;
             }
 
-            let user = entry
-                .user
-                .as_deref()
-                .ok_or("vhost user is required unless proxy_pass is configured")?;
-            let (uid, gid) = resolve_identity(user, entry.group.as_deref())?;
-            if uid == 0 {
-                // A worker exists to confine a site to an unprivileged
-                // account; one running as root confines nothing.
-                return Err(format!("virtual host user must not be root: {user}").into());
-            }
-            let index_name = entry.index.unwrap_or_else(|| fallback.index.clone());
-            validate_index(&index_name)?;
-            let listing = entry.listing.unwrap_or(fallback.listing);
-            let try_files = entry
-                .try_files
-                .unwrap_or_else(|| fallback.try_files.clone());
-            crate::config::validate_try_files(&try_files)
-                .map_err(|error| format!("vhost try_files: {error}"))?;
-            let mut fastcgi = entry
-                .fastcgi
-                .iter()
-                .map(|value| crate::config::parse_fastcgi_backend(value))
-                .collect::<Result<Vec<_>, _>>()?;
-            let mut extensions = std::collections::HashSet::new();
-            for backend in &fastcgi {
-                if !extensions.insert(backend.extension.clone()) {
-                    return Err(format!(
-                        "duplicate backend extension in vhost: {}",
-                        backend.extension
-                    )
-                    .into());
+            #[cfg(feature = "hosting")]
+            {
+                let user = entry
+                    .user
+                    .as_deref()
+                    .ok_or("vhost user is required unless proxy_pass is configured")?;
+                let (uid, gid) = resolve_identity(user, entry.group.as_deref())?;
+                if uid == 0 {
+                    // A worker exists to confine a site to an unprivileged
+                    // account; one running as root confines nothing.
+                    return Err(format!("virtual host user must not be root: {user}").into());
                 }
-            }
-            for value in &entry.cgi {
-                let backend = crate::config::parse_cgi_backend(value)?;
-                if !extensions.insert(backend.extension.clone()) {
-                    return Err(format!(
-                        "duplicate backend extension in vhost: {}",
-                        backend.extension
-                    )
-                    .into());
+                let index_name = entry.index.unwrap_or_else(|| fallback.index.clone());
+                validate_index(&index_name)?;
+                let listing = entry.listing.unwrap_or(fallback.listing);
+                let try_files = entry
+                    .try_files
+                    .unwrap_or_else(|| fallback.try_files.clone());
+                crate::config::validate_try_files(&try_files)
+                    .map_err(|error| format!("vhost try_files: {error}"))?;
+                let mut fastcgi = entry
+                    .fastcgi
+                    .iter()
+                    .map(|value| crate::config::parse_fastcgi_backend(value))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut extensions = std::collections::HashSet::new();
+                for backend in &fastcgi {
+                    if !extensions.insert(backend.extension.clone()) {
+                        return Err(format!(
+                            "duplicate backend extension in vhost: {}",
+                            backend.extension
+                        )
+                        .into());
+                    }
                 }
-                fastcgi.push(backend);
-            }
-            for app_file in entry.fastcgi_app {
-                let Some(program) = app_file.command.first() else {
-                    return Err(format!(
-                        "vhost FastCGI app .{} command must not be empty",
-                        app_file.extension
-                    )
-                    .into());
+                for value in &entry.cgi {
+                    let backend = crate::config::parse_cgi_backend(value)?;
+                    if !extensions.insert(backend.extension.clone()) {
+                        return Err(format!(
+                            "duplicate backend extension in vhost: {}",
+                            backend.extension
+                        )
+                        .into());
+                    }
+                    fastcgi.push(backend);
+                }
+                for app_file in entry.fastcgi_app {
+                    let Some(program) = app_file.command.first() else {
+                        return Err(format!(
+                            "vhost FastCGI app .{} command must not be empty",
+                            app_file.extension
+                        )
+                        .into());
+                    };
+                    let extension = crate::config::normalize_extension(&app_file.extension)?;
+                    if !extensions.insert(extension.clone()) {
+                        return Err(
+                            format!("duplicate backend extension in vhost: {extension}").into()
+                        );
+                    }
+                    if app_file.command.iter().any(|part| part.contains('\0')) {
+                        return Err("vhost FastCGI app command cannot contain NUL".into());
+                    }
+                    let max_workers = app_file.max_workers.unwrap_or(1);
+                    crate::config::parse_fastcgi_app_max_workers(&max_workers.to_string())
+                        .map_err(|error| format!("vhost FastCGI app .{extension}: {error}"))?;
+                    let idle_timeout = app_file
+                        .idle_timeout
+                        .map_or(
+                            Ok(Duration::from_secs(
+                                crate::config::DEFAULT_FASTCGI_APP_IDLE_TIMEOUT_SECS,
+                            )),
+                            |seconds| {
+                                crate::config::parse_fastcgi_app_idle_timeout(&seconds.to_string())
+                            },
+                        )
+                        .map_err(|error| format!("vhost FastCGI app .{extension}: {error}"))?;
+                    for (key, value) in &app_file.env {
+                        crate::config::validate_env_key(key)?;
+                        if value.contains('\0') {
+                            return Err(
+                                "vhost FastCGI app environment value cannot contain NUL".into()
+                            );
+                        }
+                    }
+                    let mut backend =
+                        crate::config::parse_fastcgi_app(&format!("{extension}={program}"))?;
+                    if let FastCgiAddress::Spawn(app) = &mut backend.address {
+                        app.args = app_file.command.into_iter().skip(1).collect();
+                        app.env = app_file.env;
+                        app.max_workers = max_workers;
+                        app.idle_timeout = idle_timeout;
+                    }
+                    fastcgi.push(backend);
+                }
+                let fastcgi = fastcgi
+                    .into_iter()
+                    .map(|mut backend| {
+                        if let FastCgiAddress::Unix(path) = &mut backend.address
+                            && path.is_relative()
+                        {
+                            *path = config_dir.join(&*path);
+                        }
+                        if let FastCgiAddress::Cgi(Some(interpreter)) = &mut backend.address
+                            && interpreter.is_relative()
+                        {
+                            *interpreter = config_dir.join(&*interpreter);
+                        }
+                        backend
+                    })
+                    .collect();
+                let timeout_seconds = entry
+                    .fastcgi_timeout
+                    .unwrap_or(fallback.fastcgi_timeout.as_secs());
+                if timeout_seconds == 0 {
+                    return Err("vhost FastCGI timeout must be greater than zero".into());
+                }
+                let threads = match entry.worker_threads {
+                    Some(threads) => crate::config::parse_thread_count(&threads.to_string())
+                        .map_err(|error| format!("vhost worker_threads: {error}"))?,
+                    None => fallback.worker_threads,
                 };
-                let extension = crate::config::normalize_extension(&app_file.extension)?;
-                if !extensions.insert(extension.clone()) {
-                    return Err(format!("duplicate backend extension in vhost: {extension}").into());
-                }
-                if app_file.command.iter().any(|part| part.contains('\0')) {
-                    return Err("vhost FastCGI app command cannot contain NUL".into());
-                }
-                let max_workers = app_file.max_workers.unwrap_or(1);
-                crate::config::parse_fastcgi_app_max_workers(&max_workers.to_string())
-                    .map_err(|error| format!("vhost FastCGI app .{extension}: {error}"))?;
-                let idle_timeout = app_file
-                    .idle_timeout
-                    .map_or(
-                        Ok(Duration::from_secs(
-                            crate::config::DEFAULT_FASTCGI_APP_IDLE_TIMEOUT_SECS,
-                        )),
-                        |seconds| {
-                            crate::config::parse_fastcgi_app_idle_timeout(&seconds.to_string())
-                        },
-                    )
-                    .map_err(|error| format!("vhost FastCGI app .{extension}: {error}"))?;
-                for (key, value) in &app_file.env {
-                    crate::config::validate_env_key(key)?;
-                    if value.contains('\0') {
-                        return Err("vhost FastCGI app environment value cannot contain NUL".into());
-                    }
-                }
-                let mut backend =
-                    crate::config::parse_fastcgi_app(&format!("{extension}={program}"))?;
-                if let FastCgiAddress::Spawn(app) = &mut backend.address {
-                    app.args = app_file.command.into_iter().skip(1).collect();
-                    app.env = app_file.env;
-                    app.max_workers = max_workers;
-                    app.idle_timeout = idle_timeout;
-                }
-                fastcgi.push(backend);
+                let root = entry
+                    .root
+                    .take()
+                    .ok_or("vhost root is required unless proxy_pass is configured")?;
+                let root = if root.is_absolute() {
+                    root
+                } else {
+                    config_dir.join(root)
+                };
+                let worker = Arc::new(Worker {
+                    uid,
+                    gid,
+                    root,
+                    index: index_name,
+                    listing,
+                    try_files,
+                    fastcgi,
+                    fastcgi_timeout: Duration::from_secs(timeout_seconds),
+                    threads,
+                    process: Mutex::new(None),
+                });
+                let process = worker.spawn_process().await?;
+                *worker.process.lock().await = Some(process);
+                vhosts.push(Vhost {
+                    names: normalized_names,
+                    tls,
+                    #[cfg(feature = "acme")]
+                    acme: entry.acme.unwrap_or(true),
+                    default: entry.default,
+                    waf: vhost_waf,
+                    #[cfg(feature = "hosting")]
+                    worker: Some(worker),
+                    #[cfg(feature = "proxy")]
+                    proxy: None,
+                });
             }
-            let fastcgi = fastcgi
-                .into_iter()
-                .map(|mut backend| {
-                    if let FastCgiAddress::Unix(path) = &mut backend.address
-                        && path.is_relative()
-                    {
-                        *path = config_dir.join(&*path);
-                    }
-                    if let FastCgiAddress::Cgi(Some(interpreter)) = &mut backend.address
-                        && interpreter.is_relative()
-                    {
-                        *interpreter = config_dir.join(&*interpreter);
-                    }
-                    backend
-                })
-                .collect();
-            let timeout_seconds = entry
-                .fastcgi_timeout
-                .unwrap_or(fallback.fastcgi_timeout.as_secs());
-            if timeout_seconds == 0 {
-                return Err("vhost FastCGI timeout must be greater than zero".into());
-            }
-            let threads = match entry.worker_threads {
-                Some(threads) => crate::config::parse_thread_count(&threads.to_string())
-                    .map_err(|error| format!("vhost worker_threads: {error}"))?,
-                None => fallback.worker_threads,
-            };
-            let root = entry
-                .root
-                .take()
-                .ok_or("vhost root is required unless proxy_pass is configured")?;
-            let root = if root.is_absolute() {
-                root
-            } else {
-                config_dir.join(root)
-            };
-            let worker = Arc::new(Worker {
-                uid,
-                gid,
-                root,
-                index: index_name,
-                listing,
-                try_files,
-                fastcgi,
-                fastcgi_timeout: Duration::from_secs(timeout_seconds),
-                threads,
-                process: Mutex::new(None),
-            });
-            let process = worker.spawn_process().await?;
-            *worker.process.lock().await = Some(process);
-            vhosts.push(Vhost {
-                names: normalized_names,
-                tls,
-                acme: entry.acme.unwrap_or(true),
-                default: entry.default,
-                waf: vhost_waf,
-                worker: Some(worker),
-                proxy: None,
-            });
         }
 
         let vhosts = vhosts.into_iter().map(Arc::new).collect::<Vec<_>>();
@@ -613,10 +582,12 @@ impl Router {
             }),
             dir: None,
             waf,
+            #[cfg(feature = "acme")]
             acme: None,
         })
     }
 
+    #[cfg(feature = "acme")]
     pub(crate) fn acme_names(&self) -> Vec<String> {
         self.snapshot()
             .vhosts
@@ -628,20 +599,34 @@ impl Router {
             .collect()
     }
 
+    #[cfg(feature = "acme")]
     pub(crate) fn document_roots(&self) -> Vec<PathBuf> {
         let table = self.snapshot();
-        std::iter::once(self.fallback.root.clone())
-            .chain(
-                table
-                    .vhosts
-                    .iter()
-                    .filter_map(|vhost| vhost.worker.as_ref().map(|worker| worker.root.clone())),
-            )
-            .collect()
+        #[cfg(feature = "hosting")]
+        {
+            std::iter::once(self.fallback.root.clone())
+                .chain(
+                    table.vhosts.iter().filter_map(|vhost| {
+                        vhost.worker.as_ref().map(|worker| worker.root.clone())
+                    }),
+                )
+                .collect()
+        }
+        #[cfg(not(feature = "hosting"))]
+        {
+            let _ = table;
+            Vec::new()
+        }
     }
 
+    #[cfg(feature = "acme")]
     pub(crate) fn set_acme_manager(&mut self, acme: Option<AcmeManager>) {
         self.acme = acme;
+    }
+
+    #[cfg(feature = "acme")]
+    pub(crate) fn acme_manager(&self) -> Option<&AcmeManager> {
+        self.acme.as_ref()
     }
 
     pub(crate) fn vhost_dir(&self) -> Option<PathBuf> {
@@ -673,12 +658,13 @@ impl Router {
         // worked out once and shared by every step that routes on it.
         let host = request_host(&request);
         let host = host.as_deref();
+        #[cfg(feature = "acme")]
         if let Some(acme) = &self.acme {
             if request.method() == http::Method::GET
                 && let Some(host) = host
                 && let Some(body) = acme.challenge_response(host, request.uri().path()).await
             {
-                return handler::text_response(StatusCode::OK, body);
+                return response::text_response(StatusCode::OK, body);
             }
             if request.extensions().get::<TlsSni>().is_none()
                 && let Some(host) = host
@@ -725,6 +711,7 @@ impl Router {
         (entries, fallback)
     }
 
+    #[cfg_attr(not(feature = "hosting"), allow(unused_variables))]
     async fn route<B>(
         &self,
         request: Request<B>,
@@ -740,44 +727,29 @@ impl Router {
         let index = match select_route(table, &request, host) {
             Ok(Some(index)) => index,
             Ok(None) => {
+                #[cfg(feature = "hosting")]
                 return handler::handle_request(request, Arc::clone(&self.fallback), peer, local)
                     .await;
+                // Without hosting there is no fallback site to serve.
+                #[cfg(not(feature = "hosting"))]
+                return response::error_response(StatusCode::NOT_FOUND, "Not found\n");
             }
-            Err((status, message)) => return handler::error_response(status, message),
+            Err((status, message)) => return response::error_response(status, message),
         };
-        if let Some(proxy) = &table.vhosts[index].proxy {
+        let vhost = &table.vhosts[index];
+        #[cfg(feature = "proxy")]
+        if let Some(proxy) = &vhost.proxy {
             let tls = request.extensions().get::<TlsSni>().is_some();
             let response = proxy.forward(request, peer, tls).await;
             let (parts, body) = response.into_parts();
-            return Response::from_parts(parts, handler::coalesce_ready_body(body));
+            return Response::from_parts(parts, response::coalesce_ready_body(body));
         }
-        let request = match worker_request(request, host, peer, local) {
-            Ok(request) => request,
-            Err((status, message)) => return handler::error_response(status, message),
-        };
-
-        let request = request.map(|body| {
-            body.map_err(|error| io::Error::other(error.into()))
-                .boxed_unsync()
-        });
-        match table.vhosts[index]
-            .worker
-            .as_ref()
-            .expect("non-proxy vhost has a worker")
-            .dispatch(request)
-            .await
-        {
-            Ok(response) => {
-                let (parts, body) = response.into_parts();
-                let body =
-                    handler::coalesce_ready_body(body.map_err(io::Error::other).boxed_unsync());
-                Response::from_parts(parts, body)
-            }
-            Err(error) => {
-                eprintln!("virtual host worker failed: {error}");
-                handler::error_response(StatusCode::BAD_GATEWAY, "Virtual host worker failed\n")
-            }
+        #[cfg(feature = "hosting")]
+        if let Some(worker) = &vhost.worker {
+            return worker.forward(request, host, peer, local).await;
         }
+        // Loading refuses a virtual host that this build cannot serve.
+        response::error_response(StatusCode::NOT_FOUND, "Not found\n")
     }
 
     fn select_vhost(table: &VhostTable, host: &str) -> Option<usize> {
@@ -795,124 +767,6 @@ impl Router {
             })
             .max_by_key(|(_, score)| *score)
             .map(|(index, _)| index)
-    }
-}
-
-impl Worker {
-    async fn spawn_process(&self) -> Result<WorkerProcess, Box<dyn Error + Send + Sync>> {
-        let (parent, child_socket) = StdUnixStream::pair()?;
-        parent.set_nonblocking(true)?;
-        let mut command = Command::new(std::env::current_exe()?);
-        if crate::privileges::can_set_ids()? {
-            command.uid(self.uid).gid(self.gid);
-        }
-        command
-            .args(build_worker_args(WorkerArgs {
-                uid: self.uid,
-                gid: self.gid,
-                root: &self.root,
-                index: &self.index,
-                listing: self.listing,
-                try_files: &self.try_files,
-                fastcgi: &self.fastcgi,
-                timeout: self.fastcgi_timeout,
-            }))
-            .arg("--worker-threads")
-            .arg(self.threads.to_string())
-            .env_clear()
-            .envs(
-                WORKER_INHERITED_ENV
-                    .iter()
-                    .filter_map(|name| std::env::var_os(name).map(|value| (name, value))),
-            )
-            .stdin(Stdio::from(OwnedFd::from(child_socket)))
-            .current_dir("/");
-        if let Some(app_env) = worker_app_env(&self.fastcgi) {
-            command.env(crate::config::WORKER_APP_ENV, app_env);
-        }
-
-        let mut child = command.spawn()?;
-        drop(command);
-        let mut stream = UnixStream::from_std(parent)?;
-        let ready_result = timeout(WORKER_READY_TIMEOUT, async {
-            let mut byte = [0; 1];
-            stream.read_exact(&mut byte).await?;
-            Ok::<_, io::Error>(byte[0])
-        })
-        .await;
-        match ready_result {
-            Ok(Ok(1)) => {}
-            Ok(Ok(_)) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err("virtual host worker sent an invalid ready signal".into());
-            }
-            Ok(Err(error)) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(error.into());
-            }
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err("virtual host worker did not become ready".into());
-            }
-        }
-        let handshake =
-            hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(stream)).await;
-        let (sender, connection) = match handshake {
-            Ok(handshake) => handshake,
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(error.into());
-            }
-        };
-        tokio::spawn(async move {
-            if let Err(error) = connection.await {
-                eprintln!("virtual host worker connection closed: {error}");
-            }
-        });
-        Ok(WorkerProcess { sender, child })
-    }
-
-    async fn dispatch(
-        &self,
-        request: Request<WorkerRequestBody>,
-    ) -> Result<Response<Incoming>, Box<dyn Error + Send + Sync>> {
-        // The lock covers only starting the worker and taking a handle to its
-        // connection. Holding it while a request is in flight would let one
-        // slow request stall every other request for the virtual host.
-        let mut sender = {
-            let mut process_guard = self.process.lock().await;
-            if process_guard
-                .as_ref()
-                .is_none_or(|process| process.sender.is_closed())
-            {
-                *process_guard = None;
-                *process_guard = Some(self.spawn_process().await?);
-            }
-            process_guard
-                .as_ref()
-                .expect("worker was started")
-                .sender
-                .clone()
-        };
-        match sender.send_request(request).await {
-            Ok(response) => Ok(response),
-            Err(error) => {
-                // Only a broken connection condemns the worker; a failure of
-                // this one request leaves it serving the others.
-                let mut process_guard = self.process.lock().await;
-                if process_guard
-                    .as_ref()
-                    .is_some_and(|process| process.sender.is_closed())
-                {
-                    *process_guard = None;
-                }
-                Err(error.into())
-            }
-        }
     }
 }
 
@@ -947,64 +801,7 @@ fn select_route<B>(
         .or(table.default))
 }
 
-/// Rewrites a request into the form a virtual host worker expects: an
-/// absolute HTTP/2 request carrying the client's addresses and original
-/// protocol version as private metadata headers.
-///
-/// `worker::prepare_request` reverses this, and must recover exactly the
-/// path and query that were inspected before routing.
-fn worker_request<B>(
-    mut request: Request<B>,
-    host: Option<&str>,
-    peer: SocketAddr,
-    local: SocketAddr,
-) -> Result<Request<B>, Rejection> {
-    let authority = request_authority(&request)
-        .or_else(|| host.map(str::to_owned))
-        .unwrap_or_else(|| "localhost".to_owned());
-    // The authority is spliced into the worker's request URI below. A `Host`
-    // header is free-form text, so one such as `x/admin.php?` would otherwise
-    // replace the path that was inspected before routing.
-    if authority.parse::<http::uri::Authority>().is_err() {
-        return Err((StatusCode::BAD_REQUEST, "Invalid Host\n"));
-    }
-    if let Ok(value) = HeaderValue::from_str(&authority) {
-        request.headers_mut().insert(HOST, value);
-    }
-    let original_version = version_name(request.version());
-    request.headers_mut().insert(
-        META_PEER,
-        HeaderValue::from_str(&peer.to_string()).expect("socket address is a valid header"),
-    );
-    request.headers_mut().insert(
-        META_LOCAL,
-        HeaderValue::from_str(&local.to_string()).expect("socket address is a valid header"),
-    );
-    request
-        .headers_mut()
-        .insert(META_VERSION, HeaderValue::from_static(original_version));
-    let tls = request.extensions().get::<TlsSni>().is_some();
-    request.headers_mut().insert(
-        META_TLS,
-        HeaderValue::from_static(if tls { "1" } else { "0" }),
-    );
-    let path_and_query = request
-        .uri()
-        .path_and_query()
-        .map_or("/", |value| value.as_str());
-    let path_and_query = if path_and_query == "*" {
-        "/"
-    } else {
-        path_and_query
-    };
-    let uri = format!("http://{authority}{path_and_query}")
-        .parse::<Uri>()
-        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid URI\n"))?;
-    *request.uri_mut() = uri;
-    *request.version_mut() = Version::HTTP_2;
-    Ok(request)
-}
-
+#[cfg(feature = "hosting")]
 fn request_authority<B>(request: &Request<B>) -> Option<String> {
     request
         .uri()
@@ -1077,6 +874,7 @@ pub(crate) fn match_score(pattern: &str, host: &str) -> Option<usize> {
     .then_some(suffix.len())
 }
 
+#[cfg(feature = "hosting")]
 fn validate_index(index: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
     if index.is_empty()
         || index.contains('/')
@@ -1095,7 +893,15 @@ fn validate_vhost_declarations<'a>(
     let mut names = std::collections::HashSet::new();
     let mut has_default = false;
     for (index, entry) in entries.into_iter().enumerate() {
+        if let Some(feature) = missing_feature(entry) {
+            return Err(format!(
+                "vhost {} requires the `{feature}` feature, which this build does not include",
+                index + 1
+            )
+            .into());
+        }
         if entry.proxy_pass.is_some() {
+            #[cfg(feature = "proxy")]
             ReverseProxy::validate_upstream_url(entry.proxy_pass.as_deref().unwrap())
                 .map_err(|error| format!("vhost {} proxy_pass: {error}", index + 1))?;
             if !entry.fastcgi.is_empty()
@@ -1203,6 +1009,23 @@ fn validate_vhost_declarations<'a>(
     Ok(())
 }
 
+/// Names the Cargo feature that a declaration depends on when this binary was
+/// built without it: proxying for `proxy_pass`, hosting for a document root,
+/// and ACME for an explicit `acme: true`.
+fn missing_feature(entry: &VhostFile) -> Option<&'static str> {
+    if entry.proxy_pass.is_some() {
+        if !cfg!(feature = "proxy") {
+            return Some("proxy");
+        }
+    } else if !cfg!(feature = "hosting") {
+        return Some("hosting");
+    }
+    if entry.acme == Some(true) && !cfg!(feature = "acme") {
+        return Some("acme");
+    }
+    None
+}
+
 fn validate_vhost_waf_declarations<'a>(
     entries: impl IntoIterator<Item = &'a VhostFile, IntoIter: Clone>,
     has_global_waf: bool,
@@ -1250,6 +1073,7 @@ fn ensure_trusted_config(path: &Path) -> io::Result<()> {
 
 /// Refuses a set of virtual hosts in which a document root would expose the
 /// ACME cache, which holds private keys.
+#[cfg(all(feature = "acme", feature = "hosting"))]
 fn ensure_acme_cache_is_private(cache: &Path, vhosts: &[Arc<Vhost>]) -> io::Result<()> {
     let Ok(cache) = std::fs::canonicalize(cache) else {
         return Ok(());
@@ -1306,157 +1130,7 @@ fn parse_file_config(content: &str) -> Result<FileConfig, serde_yaml_ng::Error> 
     }
 }
 
-fn resolve_identity(
-    user_name: &str,
-    group_name: Option<&str>,
-) -> Result<(u32, u32), Box<dyn Error + Send + Sync>> {
-    let user = User::from_name(user_name)?
-        .ok_or_else(|| format!("unknown virtual host user: {user_name}"))?;
-    let gid = if let Some(group_name) = group_name {
-        Group::from_name(group_name)?
-            .ok_or_else(|| format!("unknown virtual host group: {group_name}"))?
-            .gid
-    } else {
-        user.gid
-    };
-    Ok((user.uid.as_raw(), gid.as_raw()))
-}
-
-struct WorkerArgs<'a> {
-    uid: u32,
-    gid: u32,
-    root: &'a Path,
-    index: &'a str,
-    listing: bool,
-    try_files: &'a [String],
-    fastcgi: &'a [FastCgiBackend],
-    timeout: Duration,
-}
-
-fn build_worker_args(worker: WorkerArgs<'_>) -> Vec<OsString> {
-    let WorkerArgs {
-        uid,
-        gid,
-        root,
-        index,
-        listing,
-        try_files,
-        fastcgi,
-        timeout,
-    } = worker;
-    let mut args = vec![
-        "--worker".into(),
-        "--worker-uid".into(),
-        uid.to_string().into(),
-        "--worker-gid".into(),
-        gid.to_string().into(),
-        "--root".into(),
-        root.as_os_str().to_owned(),
-        "--index".into(),
-        index.into(),
-        "--fastcgi-timeout".into(),
-        timeout.as_secs().to_string().into(),
-    ];
-    if !listing {
-        args.push("--no-listing".into());
-    }
-    for entry in try_files {
-        args.push("--try-files".into());
-        args.push(entry.clone().into());
-    }
-    for backend in fastcgi {
-        if let Some(app) = spawned_app(backend) {
-            args.push("--fastcgi-app".into());
-            args.push(format!("{}={}", backend.extension, app.program.display()).into());
-            for arg in &app.args {
-                args.push("--fastcgi-app-arg".into());
-                args.push(format!("{}={arg}", backend.extension).into());
-            }
-            if app.max_workers != 1 {
-                args.push("--fastcgi-app-max-workers".into());
-                args.push(format!("{}={}", backend.extension, app.max_workers).into());
-            }
-            if app.idle_timeout.as_secs() != crate::config::DEFAULT_FASTCGI_APP_IDLE_TIMEOUT_SECS {
-                args.push("--fastcgi-app-idle-timeout".into());
-                args.push(format!("{}={}", backend.extension, app.idle_timeout.as_secs()).into());
-            }
-        } else if let FastCgiAddress::Cgi(interpreter) = &backend.address {
-            args.push("--cgi".into());
-            args.push(match interpreter {
-                Some(interpreter) => {
-                    format!("{}={}", backend.extension, interpreter.display()).into()
-                }
-                None => backend.extension.clone().into(),
-            });
-        } else {
-            args.push("--fastcgi".into());
-            args.push(format_backend(backend).into());
-        }
-    }
-    args
-}
-
-/// Encodes the environment of a worker's spawned FastCGI apps for
-/// `WORKER_APP_ENV`. It travels in the worker's environment rather than its
-/// arguments because a command line is readable by every local user, and
-/// these values are where applications keep their credentials.
-fn worker_app_env(fastcgi: &[FastCgiBackend]) -> Option<String> {
-    let entries = fastcgi
-        .iter()
-        .filter_map(|backend| spawned_app(backend).map(|app| (&backend.extension, app)))
-        .flat_map(|(extension, app)| {
-            app.env
-                .iter()
-                .map(move |(key, value)| (extension, key, value))
-        })
-        .collect::<Vec<_>>();
-    if entries.is_empty() {
-        return None;
-    }
-    Some(serde_json::to_string(&entries).expect("strings serialize to JSON"))
-}
-
-fn spawned_app(backend: &FastCgiBackend) -> Option<&FastCgiApp> {
-    match &backend.address {
-        FastCgiAddress::Spawn(app) => Some(app),
-        FastCgiAddress::Pool(pool) => Some(pool.app()),
-        FastCgiAddress::Tcp(_) | FastCgiAddress::Unix(_) | FastCgiAddress::Cgi(_) => None,
-    }
-}
-
-/// Variables a worker keeps from the server's environment. Everything else,
-/// including whatever credentials the server was started with, is withheld.
-const WORKER_INHERITED_ENV: [&str; 5] = ["PATH", "TMPDIR", "LD_LIBRARY_PATH", "LANG", "TZ"];
-
-fn format_backend(backend: &FastCgiBackend) -> String {
-    match &backend.address {
-        FastCgiAddress::Tcp(address) => format!("{}={address}", backend.extension),
-        FastCgiAddress::Unix(path) => format!("{}=unix:{}", backend.extension, path.display()),
-        FastCgiAddress::Cgi(interpreter) => match interpreter {
-            Some(interpreter) => {
-                format!("{}={}", backend.extension, interpreter.display())
-            }
-            None => backend.extension.clone(),
-        },
-        FastCgiAddress::Spawn(app) => format!("{}={}", backend.extension, app.program.display()),
-        FastCgiAddress::Pool(pool) => {
-            format!("{}={}", backend.extension, pool.app().program.display())
-        }
-    }
-}
-
-fn version_name(version: Version) -> &'static str {
-    match version {
-        Version::HTTP_09 => "HTTP/0.9",
-        Version::HTTP_10 => "HTTP/1.0",
-        Version::HTTP_11 => "HTTP/1.1",
-        Version::HTTP_2 => "HTTP/2.0",
-        Version::HTTP_3 => "HTTP/3.0",
-        _ => "HTTP/1.1",
-    }
-}
-
-#[cfg(test)]
+#[cfg(all(test, feature = "hosting"))]
 mod tests {
     use super::{
         FileConfig, Router, TlsSni, Vhost, VhostFile, VhostTable, Worker, WorkerArgs,
@@ -1564,6 +1238,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "proxy")]
     #[test]
     fn validates_proxy_vhost_configuration() {
         let parsed: FileConfig = serde_yaml_ng::from_str(
@@ -1597,20 +1272,6 @@ mod tests {
         let mut zero_timeout = parsed.vhost[0].clone();
         zero_timeout.proxy_timeout = Some(0);
         assert!(validate_vhost_declarations(&[zero_timeout]).is_err());
-    }
-
-    #[test]
-    fn reverse_proxy_acme_example_parses_and_validates() {
-        let parsed =
-            parse_file_config(include_str!("../examples/reverse-proxy-acme.yaml")).unwrap();
-        assert!(validate_vhost_declarations(&parsed.vhost).is_ok());
-        assert!(!parsed.vhost.is_empty());
-        assert!(parsed.vhost.iter().all(|vhost| {
-            vhost.proxy_pass.is_some()
-                && vhost.tls_cert.is_none()
-                && vhost.tls_key.is_none()
-                && vhost.acme != Some(false)
-        }));
     }
 
     #[test]
@@ -2028,6 +1689,7 @@ mod tests {
             Arc::new(Vhost {
                 names: names.iter().map(|name| (*name).to_owned()).collect(),
                 tls: None,
+                #[cfg(feature = "acme")]
                 acme: false,
                 default,
                 waf: None,
@@ -2043,6 +1705,7 @@ mod tests {
                     threads: 1,
                     process: tokio::sync::Mutex::new(None),
                 })),
+                #[cfg(feature = "proxy")]
                 proxy: None,
             })
         };
@@ -2333,5 +1996,96 @@ mod tests {
             1,
             "--help".to_owned(),
         );
+    }
+}
+
+/// Tests that hold in every combination of features, unlike those above,
+/// which need a hosted site to route to.
+#[cfg(test)]
+mod feature_tests {
+    use super::{missing_feature, parse_file_config, validate_vhost_declarations};
+
+    fn declaration(yaml: &str) -> super::VhostFile {
+        parse_file_config(yaml).unwrap().vhost.remove(0)
+    }
+
+    #[test]
+    fn names_the_feature_a_declaration_needs() {
+        let proxied =
+            declaration("vhost:\n  - server_names: [a.test]\n    proxy_pass: http://127.0.0.1:1\n");
+        assert_eq!(
+            missing_feature(&proxied),
+            (!cfg!(feature = "proxy")).then_some("proxy")
+        );
+
+        let hosted =
+            declaration("vhost:\n  - server_names: [b.test]\n    root: /srv/b\n    user: nobody\n");
+        assert_eq!(
+            missing_feature(&hosted),
+            (!cfg!(feature = "hosting")).then_some("hosting")
+        );
+
+        // Opting out of ACME asks nothing of the build; opting in does.
+        let mut entry = declaration(
+            "vhost:\n  - server_names: [c.test]\n    proxy_pass: http://127.0.0.1:1\n    acme: false\n",
+        );
+        assert_eq!(missing_feature(&entry), missing_feature(&proxied));
+        entry.acme = Some(true);
+        let expected = if !cfg!(feature = "proxy") {
+            Some("proxy")
+        } else if !cfg!(feature = "acme") {
+            Some("acme")
+        } else {
+            None
+        };
+        assert_eq!(missing_feature(&entry), expected);
+    }
+
+    #[test]
+    fn refuses_declarations_of_features_left_out_of_the_build() {
+        for (yaml, feature, enabled) in [
+            (
+                "vhost:\n  - server_names: [a.test]\n    proxy_pass: http://127.0.0.1:1\n",
+                "proxy",
+                cfg!(feature = "proxy"),
+            ),
+            (
+                "vhost:\n  - server_names: [b.test]\n    root: /srv/b\n    user: nobody\n",
+                "hosting",
+                cfg!(feature = "hosting"),
+            ),
+        ] {
+            let parsed = parse_file_config(yaml).unwrap();
+            match validate_vhost_declarations(&parsed.vhost) {
+                Ok(()) => assert!(
+                    enabled,
+                    "{feature} declaration accepted without the feature"
+                ),
+                Err(error) => {
+                    assert!(!enabled, "{feature} declaration refused: {error}");
+                    assert!(
+                        error
+                            .to_string()
+                            .contains(&format!("requires the `{feature}` feature")),
+                        "{error}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "proxy")]
+    #[test]
+    fn reverse_proxy_acme_example_parses_and_validates() {
+        let parsed =
+            parse_file_config(include_str!("../examples/reverse-proxy-acme.yaml")).unwrap();
+        assert!(validate_vhost_declarations(&parsed.vhost).is_ok());
+        assert!(!parsed.vhost.is_empty());
+        assert!(parsed.vhost.iter().all(|vhost| {
+            vhost.proxy_pass.is_some()
+                && vhost.tls_cert.is_none()
+                && vhost.tls_key.is_none()
+                && vhost.acme != Some(false)
+        }));
     }
 }
