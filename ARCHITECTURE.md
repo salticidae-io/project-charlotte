@@ -2,10 +2,10 @@
 
 `project-charlotte` is an asynchronous Rust web server. It serves static files
 and directory listings, can route configured virtual hosts to separate worker
-processes, and optionally integrates FastCGI, ModSecurity, TLS, ACME certificate
-provisioning, and HTTP/3. `src/main.rs` is the composition root: it parses
-configuration, initializes shared services, starts listeners, and coordinates
-shutdown.
+processes or HTTP/HTTPS upstreams, and optionally integrates FastCGI, CGI,
+ModSecurity, TLS, ACME certificate provisioning, and HTTP/3. `src/main.rs` is
+the composition root: it parses configuration, initializes shared services,
+starts listeners, and coordinates shutdown.
 
 ## Configuration and startup
 
@@ -141,7 +141,7 @@ cleanup is handled when their router-owned handles are dropped.
 | --- | --- |
 | `main` | Startup, listeners, connection tasks, protocol dispatch, and shutdown. |
 | `config` | CLI parsing and shared server, virtual-host, and backend settings. |
-| `vhost` | Virtual-host loading and matching, routing, worker management, and request dispatch. |
+| `vhost` | Virtual-host loading and matching, routing, worker management, proxy dispatch, and request dispatch. |
 | `worker` | Private HTTP/2 worker service, metadata validation, and privilege dropping. |
 | `handler` | Request handling, static files, listings, ranges, validators, and response helpers. |
 | `fastcgi` | FastCGI and CGI script resolution, request parameters, and backend exchange. |
@@ -187,10 +187,10 @@ connection that has not produced a complete request head within 30 seconds,
 and bounds the time a client may take to deliver a request body. A failed
 `accept` is logged rather than fatal. The master itself keeps the privileges
 it was started with; it terminates TLS, parses requests, serves the fallback
-site, and runs ModSecurity in that one process.
+site, runs ModSecurity, and forwards reverse-proxy traffic in that one process.
 
 Unit and integration tests cover routing, handlers, TLS, ACME, FastCGI, CGI,
-and ModSecurity. Fuzz targets exercise parsed inputs and request-handling paths;
-see [FUZZING.md](FUZZING.md) for target names, setup, and commands. HTTP wire
-parsing itself is delegated to Hyper and `h3` and is outside those fuzz
-targets.
+reverse proxying, and ModSecurity. Fuzz targets exercise parsed inputs and
+request-handling paths; see [FUZZING.md](FUZZING.md) for target names, setup,
+and commands. HTTP wire parsing itself is delegated to Hyper and `h3` and is
+outside those fuzz targets.

@@ -30,8 +30,6 @@
 # Relative paths (root, tls_cert, tls_key, proxy_ca_root, interpreter, unix:
 # FastCGI sockets) are resolved against the directory containing this file,
 # not the working directory.
-# Relative paths (root, tls_cert, tls_key, interpreter, unix: FastCGI sockets)
-# are resolved against the directory containing this file, not the working directory.
 # `vhost_dir` is also relative to this file; visible `*.yaml` and `*.yml` files
 # in that directory are watched for additions, changes, deletions and renames.
 # Invalid updates are rejected and the last valid configuration remains active.
