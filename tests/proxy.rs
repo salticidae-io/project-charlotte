@@ -1,10 +1,11 @@
 #![forbid(unsafe_code)]
+#![cfg(feature = "proxy")]
 
 mod common;
 
 use std::{
     convert::Infallible,
-    net::{SocketAddr, UdpSocket},
+    net::SocketAddr,
     path::PathBuf,
     process::{Child, Command, Stdio},
     sync::Arc,
@@ -12,7 +13,9 @@ use std::{
     time::Duration,
 };
 
-use bytes::{Buf, Bytes};
+#[cfg(feature = "http3")]
+use bytes::Buf;
+use bytes::Bytes;
 use http::{HeaderMap, Request, Response, StatusCode, Version};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
@@ -20,6 +23,7 @@ use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto,
 };
+#[cfg(feature = "http3")]
 use quinn::{Endpoint, VarInt};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use tokio::{
@@ -36,6 +40,7 @@ struct Fixture {
     root: PathBuf,
     http_address: SocketAddr,
     tls_address: SocketAddr,
+    #[cfg(feature = "http3")]
     http3_address: SocketAddr,
     certificate: CertificateDer<'static>,
     server: Child,
@@ -84,9 +89,7 @@ impl Fixture {
         tls_server_config.alpn_protocols = vec![b"h2".to_vec()];
         let tls_task = spawn_h2_upstream(tls_upstream, Arc::new(tls_server_config));
 
-        let dead_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let dead_address = dead_listener.local_addr().unwrap();
-        drop(dead_listener);
+        let dead_address = common::reserve_tcp_address();
 
         let config_path = root.join("vhosts.yaml");
         std::fs::write(
@@ -99,21 +102,23 @@ impl Fixture {
         )
         .unwrap();
 
-        let http_address = free_tcp_address().await;
-        let tls_address = free_tcp_address().await;
-        let udp_reservation = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let http3_address = udp_reservation.local_addr().unwrap();
-        drop(udp_reservation);
+        let http_address = common::reserve_tcp_address();
+        let tls_address = common::reserve_tcp_address();
+        #[cfg(feature = "http3")]
+        let http3_address = common::reserve_udp_address();
 
-        let server = Command::new(env!("CARGO_BIN_EXE_project-charlotte"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_project-charlotte"));
+        command
             .arg("--bind")
             .arg(http_address.to_string())
             .arg("--tls-bind")
-            .arg(tls_address.to_string())
-            .arg("--http3-bind")
-            .arg(http3_address.to_string())
-            .arg("--root")
-            .arg(&root)
+            .arg(tls_address.to_string());
+        // A build without a feature refuses that feature's options.
+        #[cfg(feature = "http3")]
+        command.arg("--http3-bind").arg(http3_address.to_string());
+        #[cfg(feature = "hosting")]
+        command.arg("--root").arg(&root);
+        command
             .arg("--config")
             .arg(&config_path)
             .arg("--tls-cert")
@@ -121,14 +126,14 @@ impl Fixture {
             .arg("--tls-key")
             .arg(&key_path)
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::null());
+        let server = common::spawn(&mut command).unwrap();
 
         let mut fixture = Self {
             root,
             http_address,
             tls_address,
+            #[cfg(feature = "http3")]
             http3_address,
             certificate,
             server,
@@ -238,13 +243,16 @@ async fn proxies_http1_http2_http3_and_handles_upstream_failures() {
     assert!(body.contains("proto=https"), "{body}");
     assert!(body.ends_with("body=h2 body"), "{body}");
 
-    let response = h3_request(&fixture, "/item?q=three", b"h3 body").await;
-    assert_eq!(response.status, 200);
-    let body = String::from_utf8(response.body).unwrap();
-    assert!(body.contains("path=/secure/item?q=three"), "{body}");
-    assert!(body.contains("host=h3.example.test"), "{body}");
-    assert!(body.contains("proto=https"), "{body}");
-    assert!(body.ends_with("body=h3 body"), "{body}");
+    #[cfg(feature = "http3")]
+    {
+        let response = h3_request(&fixture, "/item?q=three", b"h3 body").await;
+        assert_eq!(response.status, 200);
+        let body = String::from_utf8(response.body).unwrap();
+        assert!(body.contains("path=/secure/item?q=three"), "{body}");
+        assert!(body.contains("host=h3.example.test"), "{body}");
+        assert!(body.contains("proto=https"), "{body}");
+        assert!(body.ends_with("body=h3 body"), "{body}");
+    }
 
     let response = http1_request(
         fixture.http_address,
@@ -256,13 +264,6 @@ async fn proxies_http1_http2_http3_and_handles_upstream_failures() {
     )
     .await;
     assert_eq!(response.status, StatusCode::BAD_GATEWAY.as_u16());
-}
-
-async fn free_tcp_address() -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    drop(listener);
-    address
 }
 
 fn spawn_http_upstream(listener: TcpListener) -> JoinHandle<()> {
@@ -453,6 +454,7 @@ async fn h2_request(fixture: &Fixture, server_name: &str, path: &str, body: &[u8
     }
 }
 
+#[cfg(feature = "http3")]
 async fn h3_request(fixture: &Fixture, path: &str, body: &[u8]) -> HttpResponse {
     let endpoint = h3_client_endpoint(&fixture.certificate);
     let connection = tokio::time::timeout(
@@ -501,6 +503,7 @@ async fn h3_request(fixture: &Fixture, path: &str, body: &[u8]) -> HttpResponse 
     }
 }
 
+#[cfg(feature = "http3")]
 fn h3_client_endpoint(certificate: &CertificateDer<'static>) -> Endpoint {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut roots = rustls::RootCertStore::empty();

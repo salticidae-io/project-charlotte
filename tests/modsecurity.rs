@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![cfg(feature = "hosting")]
 
 mod common;
 
@@ -131,9 +132,7 @@ impl Fixture {
             vhost_config = Some(config_path);
         }
 
-        let reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = reservation.local_addr().unwrap();
-        drop(reservation);
+        let address = common::reserve_tcp_address();
         let mut command = Command::new(env!("CARGO_BIN_EXE_project-charlotte"));
         command
             .arg("--bind")
@@ -156,11 +155,8 @@ impl Fixture {
                 .arg(format!("php={backend_address}"));
         }
         command.args(extra_args);
-        let mut server = command
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .unwrap();
+        command.stdout(Stdio::null()).stderr(Stdio::inherit());
+        let mut server = common::spawn(&mut command).unwrap();
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
         loop {
@@ -461,25 +457,25 @@ fn rejects_block_status_configuration_without_global_rules() {
     )
     .unwrap();
 
-    let missing_rules = Command::new(env!("CARGO_BIN_EXE_project-charlotte"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_project-charlotte"));
+    command
         .args(["--bind", "127.0.0.1:0", "--root"])
         .arg(&root)
         .arg("--config")
-        .arg(&config_path)
-        .output()
-        .unwrap();
+        .arg(&config_path);
+    let missing_rules = common::output(&mut command).unwrap();
     assert!(!missing_rules.status.success());
     assert!(
         String::from_utf8_lossy(&missing_rules.stderr)
             .contains("modsecurity_block_status requires --modsecurity-rules")
     );
 
-    let invalid_global_status = Command::new(env!("CARGO_BIN_EXE_project-charlotte"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_project-charlotte"));
+    command
         .args(["--bind", "127.0.0.1:0", "--root"])
         .arg(&root)
-        .args(["--modsecurity-block-status", "600"])
-        .output()
-        .unwrap();
+        .args(["--modsecurity-block-status", "600"]);
+    let invalid_global_status = common::output(&mut command).unwrap();
     assert!(!invalid_global_status.status.success());
     assert!(
         String::from_utf8_lossy(&invalid_global_status.stderr)

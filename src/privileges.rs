@@ -8,7 +8,9 @@ use nix::{
 
 use crate::config::Config;
 
+#[cfg(feature = "hosting")]
 const SETUID: Capability = Capability::CAP_SETUID;
+#[cfg(feature = "hosting")]
 const SETGID: Capability = Capability::CAP_SETGID;
 const NET_BIND_SERVICE: Capability = Capability::CAP_NET_BIND_SERVICE;
 
@@ -35,7 +37,11 @@ pub(crate) fn drop_master(config: &Config) -> Result<(), Box<dyn Error + Send + 
         setuid(user.uid)?;
         set_keepcaps(false)?;
         retain_master_capabilities(keep_net_bind_service)?;
-    } else if !geteuid().is_root() {
+    }
+    // Only a build that hosts sites starts workers under other accounts, so
+    // only it has a use for the identity-changing capabilities.
+    #[cfg(feature = "hosting")]
+    if config.master_user.is_none() && !geteuid().is_root() {
         let permitted = caps::read(None, CapSet::Permitted)?;
         if permitted.contains(&SETUID) && permitted.contains(&SETGID) {
             let keep_net_bind_service = permitted.contains(&NET_BIND_SERVICE);
@@ -57,8 +63,11 @@ fn retain_master_capabilities(
     keep_net_bind_service: bool,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut retained = CapsHashSet::new();
-    retained.insert(SETUID);
-    retained.insert(SETGID);
+    #[cfg(feature = "hosting")]
+    {
+        retained.insert(SETUID);
+        retained.insert(SETGID);
+    }
     if keep_net_bind_service {
         retained.insert(NET_BIND_SERVICE);
     }
@@ -70,6 +79,7 @@ fn retain_master_capabilities(
     Ok(())
 }
 
+#[cfg(feature = "hosting")]
 pub(crate) fn clear_all() -> Result<(), Box<dyn Error + Send + Sync>> {
     caps::clear(None, CapSet::Ambient)?;
     caps::clear(None, CapSet::Effective)?;
@@ -78,6 +88,7 @@ pub(crate) fn clear_all() -> Result<(), Box<dyn Error + Send + Sync>> {
     Ok(())
 }
 
+#[cfg(feature = "hosting")]
 pub(crate) fn can_set_ids() -> Result<bool, Box<dyn Error + Send + Sync>> {
     if geteuid().is_root() {
         return Ok(true);

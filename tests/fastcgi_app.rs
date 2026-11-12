@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![cfg(feature = "hosting")]
 
 mod common;
 
@@ -17,11 +18,12 @@ use std::{
 use nix::unistd::{User, geteuid};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    net::{TcpListener, TcpStream, UnixListener},
+    net::{TcpStream, UnixListener},
     time::sleep,
 };
 
 static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
+static STARTUP_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 struct Fixture {
     root: PathBuf,
@@ -41,11 +43,10 @@ impl Fixture {
         extra_env: &[&str],
         extra_args: &[&str],
     ) -> Self {
+        let startup_guard = STARTUP_LOCK.lock().await;
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("echo.php"), "not served statically").unwrap();
-        let reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = reservation.local_addr().unwrap();
-        drop(reservation);
+        let address = common::reserve_tcp_address();
 
         let mut command = Command::new(env!("CARGO_BIN_EXE_project-charlotte"));
         command
@@ -84,7 +85,7 @@ impl Fixture {
             }
         }
         command.args(extra_args);
-        let mut server = command.spawn().unwrap();
+        let mut server = common::spawn(&mut command).unwrap();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
         loop {
             if TcpStream::connect(address).await.is_ok() {
@@ -99,6 +100,7 @@ impl Fixture {
             );
             sleep(Duration::from_millis(20)).await;
         }
+        drop(startup_guard);
         Self {
             root,
             address,
@@ -376,7 +378,7 @@ async fn reaps_extra_workers_after_the_pool_becomes_idle() {
             "--fastcgi-app-max-workers",
             "php=3",
             "--fastcgi-app-idle-timeout",
-            "php=1",
+            "php=2",
         ],
     )
     .await;
@@ -415,19 +417,34 @@ async fn reaps_extra_workers_after_the_pool_becomes_idle() {
         })
         .collect::<HashSet<_>>();
     assert_eq!(pids.len(), 3, "the burst should spawn three workers");
+    let process_start_times = pids
+        .iter()
+        .map(|&pid| {
+            (
+                pid,
+                process_start_time(pid).unwrap_or_else(|| {
+                    panic!("FastCGI worker {pid} exited before checking reaping")
+                }),
+            )
+        })
+        .collect::<HashMap<_, _>>();
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let remaining = pids
+        let remaining = process_start_times
             .iter()
-            .filter(|pid| std::path::Path::new("/proc").join(pid.to_string()).exists())
+            .filter(|(pid, start_time)| process_is_running(**pid, **start_time))
             .count();
         if remaining == 1 {
             break;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "expected idle workers to be reaped, but {remaining} of 3 remain"
+            "expected idle workers to be reaped, but {remaining} of 3 remain: {:?}",
+            process_start_times
+                .keys()
+                .map(|&pid| (pid, process_info(pid).map(|(state, _)| state)))
+                .collect::<Vec<_>>()
         );
         sleep(Duration::from_millis(100)).await;
     }
@@ -444,7 +461,7 @@ async fn scales_pool_within_max_workers_and_back_up_after_reaping() {
             "--fastcgi-app-max-workers",
             "php=2",
             "--fastcgi-app-idle-timeout",
-            "php=1",
+            "php=2",
         ],
     )
     .await;
@@ -467,13 +484,23 @@ async fn scales_pool_within_max_workers_and_back_up_after_reaping() {
         started.elapsed() >= Duration::from_millis(800),
         "five delayed requests on two workers should queue in three rounds"
     );
+    let process_start_times = first_pids
+        .iter()
+        .map(|&pid| {
+            (
+                pid,
+                process_start_time(pid).unwrap_or_else(|| {
+                    panic!("FastCGI worker {pid} exited before checking reaping")
+                }),
+            )
+        })
+        .collect::<HashMap<_, _>>();
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let survivor = loop {
-        let alive = first_pids
+        let alive = process_start_times
             .iter()
-            .copied()
-            .filter(|pid| std::path::Path::new("/proc").join(pid.to_string()).exists())
+            .filter_map(|(&pid, &start_time)| process_is_running(pid, start_time).then_some(pid))
             .collect::<Vec<_>>();
         if alive.len() == 1 {
             break alive[0];
@@ -578,10 +605,9 @@ async fn immediately_restarts_cleanly_exited_cli_app() {
 async fn rejects_missing_application_at_startup() {
     let root = new_root();
     std::fs::create_dir_all(&root).unwrap();
-    let reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = reservation.local_addr().unwrap();
-    drop(reservation);
-    let mut server = Command::new(env!("CARGO_BIN_EXE_project-charlotte"))
+    let address = common::reserve_tcp_address();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_project-charlotte"));
+    command
         .arg("--bind")
         .arg(address.to_string())
         .arg("--root")
@@ -589,9 +615,8 @@ async fn rejects_missing_application_at_startup() {
         .arg("--fastcgi-app")
         .arg("php=/no/such/charlotte-fastcgi-app")
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+        .stderr(Stdio::null());
+    let mut server = common::spawn(&mut command).unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let status = loop {
         if let Some(status) = server.try_wait().unwrap() {
@@ -850,4 +875,27 @@ fn response_pid(response: HttpResponse) -> u32 {
     assert_eq!(response.status, 200);
     let body = String::from_utf8(response.body).unwrap();
     field(&body, "pid").parse().unwrap()
+}
+
+fn process_start_time(pid: u32) -> Option<u64> {
+    process_info(pid).map(|(_, start_time)| start_time)
+}
+
+fn process_is_running(pid: u32, start_time: u64) -> bool {
+    process_info(pid).is_some_and(|(state, actual_start_time)| {
+        actual_start_time == start_time && !matches!(state, 'Z' | 'X')
+    })
+}
+
+fn process_info(pid: u32) -> Option<(char, u64)> {
+    let stat = std::fs::read_to_string(
+        std::path::Path::new("/proc")
+            .join(pid.to_string())
+            .join("stat"),
+    )
+    .ok()?;
+    let mut fields = stat.rsplit_once(") ")?.1.split_whitespace();
+    let state = fields.next()?.chars().next()?;
+    let start_time = fields.nth(18)?.parse().ok()?;
+    Some((state, start_time))
 }

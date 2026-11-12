@@ -13,7 +13,7 @@ use http_body::{Body, Frame};
 use http_body_util::{BodyExt, Full, Limited, StreamBody};
 use modsecurity::{Intervention, ModSecurity, Rules, Transaction};
 
-use crate::handler::{self, ResponseBody};
+use crate::response::{self, ResponseBody};
 
 const CONNECTOR_INFO: &str = "project-charlotte/0.1.0";
 /// How long a client may take to deliver a request body for inspection.
@@ -149,7 +149,7 @@ impl Waf {
             Ok(transaction) => transaction,
             Err(error) => {
                 eprintln!("ModSecurity transaction creation failed: {error}");
-                return handler::error_response(
+                return response::error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "Request inspection failed\n",
                 );
@@ -174,7 +174,7 @@ impl Waf {
                 if let Err(error) = finish_logging(&mut transaction) {
                     eprintln!("ModSecurity logging failed: {error}");
                 }
-                return handler::error_response(
+                return response::error_response(
                     StatusCode::REQUEST_TIMEOUT,
                     "Request body timed out\n",
                 );
@@ -183,12 +183,12 @@ impl Waf {
             Ok(Err(error)) if error.is::<http_body_util::LengthLimitError>() => {
                 if let Err(error) = finish_logging(&mut transaction) {
                     eprintln!("ModSecurity logging failed: {error}");
-                    return handler::error_response(
+                    return response::error_response(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "Request inspection failed\n",
                     );
                 }
-                return handler::error_response(
+                return response::error_response(
                     StatusCode::PAYLOAD_TOO_LARGE,
                     "Request body too large\n",
                 );
@@ -197,12 +197,12 @@ impl Waf {
                 eprintln!("Request body read failed during ModSecurity inspection: {error}");
                 if let Err(error) = finish_logging(&mut transaction) {
                     eprintln!("ModSecurity logging failed: {error}");
-                    return handler::error_response(
+                    return response::error_response(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "Request inspection failed\n",
                     );
                 }
-                return handler::error_response(StatusCode::BAD_REQUEST, "Invalid request body\n");
+                return response::error_response(StatusCode::BAD_REQUEST, "Invalid request body\n");
             }
         };
         let request_body = collected.to_bytes();
@@ -348,7 +348,7 @@ impl Waf {
                     }
                     if let Err(error) = finish_logging(&mut transaction) {
                         eprintln!("ModSecurity logging failed: {error}");
-                        return handler::error_response(
+                        return response::error_response(
                             StatusCode::INTERNAL_SERVER_ERROR,
                             "Response inspection failed\n",
                         );
@@ -441,7 +441,7 @@ async fn finish_intervention(
     pause_for_intervention(&intervention).await;
     if let Err(error) = finish_logging(transaction) {
         eprintln!("ModSecurity logging failed: {error}");
-        return handler::error_response(
+        return response::error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Request inspection failed\n",
         );
@@ -452,10 +452,10 @@ async fn finish_intervention(
         intervention.status as u16,
         block_status,
     );
-    let mut response = handler::error_response(status, "Request blocked by ModSecurity\n");
+    let mut response = response::error_response(status, "Request blocked by ModSecurity\n");
     if let Some(url) = intervention.url {
         let Ok(value) = HeaderValue::from_str(&url) else {
-            return handler::error_response(
+            return response::error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Invalid ModSecurity redirect\n",
             );
@@ -495,7 +495,7 @@ fn fail_closed(transaction: &mut Transaction<'static>) -> Response<ResponseBody>
     if let Err(error) = finish_logging(transaction) {
         eprintln!("ModSecurity logging failed: {error}");
     }
-    handler::error_response(
+    response::error_response(
         StatusCode::INTERNAL_SERVER_ERROR,
         "Request inspection failed\n",
     )
@@ -628,7 +628,8 @@ impl Drop for StreamingBody {
     }
 }
 
-#[cfg(test)]
+// The tests drive the WAF through the static file handler.
+#[cfg(all(test, feature = "hosting"))]
 mod tests {
     use std::sync::{Arc, OnceLock};
 

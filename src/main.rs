@@ -1,22 +1,31 @@
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "acme")]
 mod acme;
 mod config;
+#[cfg(feature = "hosting")]
 mod fastcgi;
+#[cfg(feature = "hosting")]
 mod fastcgi_app;
+#[cfg(feature = "hosting")]
 mod handler;
+#[cfg(feature = "http3")]
 mod http3;
 mod httpdate;
+#[cfg(feature = "hosting")]
 mod mime;
 mod privileges;
+#[cfg(feature = "proxy")]
 mod proxy;
 mod reload;
+mod response;
 mod tls;
 mod vhost;
 mod waf;
+#[cfg(feature = "hosting")]
 mod worker;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "hosting"))]
 mod fuzz_support;
 
 use std::{error::Error, net::SocketAddr, sync::Arc, time::Duration};
@@ -36,9 +45,12 @@ use tokio::{
 };
 use tokio_rustls::TlsAcceptor;
 
+#[cfg(feature = "acme")]
+use crate::acme::AcmeManager;
+#[cfg(feature = "hosting")]
+use crate::config::FastCgiAddress;
 use crate::{
-    acme::AcmeManager,
-    config::{Config, FastCgiAddress, ParseResult},
+    config::{Config, ParseResult},
     tls::TlsSetup,
     vhost::{Router, TlsSni},
     waf::Waf,
@@ -104,8 +116,12 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         }
         ParseResult::Config(config) => *config,
     };
+    #[cfg(feature = "hosting")]
     let mut config = config;
+    #[cfg(not(feature = "hosting"))]
+    let config = config;
 
+    #[cfg(feature = "hosting")]
     if config.worker {
         if let Ok(app_env) = std::env::var(config::WORKER_APP_ENV) {
             config.apply_fastcgi_app_env(&app_env)?;
@@ -127,11 +143,17 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 }
 
 async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> {
+    #[cfg(feature = "hosting")]
     let root = tokio::fs::canonicalize(&config.root).await?;
+    #[cfg(feature = "hosting")]
     if !tokio::fs::metadata(&root).await?.is_dir() {
         return Err(format!("document root is not a directory: {}", root.display()).into());
     }
+    #[cfg(feature = "hosting")]
     let mut config = Config { root, ..config };
+    #[cfg(not(feature = "hosting"))]
+    let config = config;
+    #[cfg(feature = "hosting")]
     let _fastcgi_apps = fastcgi_app::start_apps(&mut config).await?;
     let listener = TcpListener::bind(config.bind).await?;
     let waf = if config.modsecurity_rules.is_empty() {
@@ -146,28 +168,30 @@ async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> 
                 .map(|status| StatusCode::from_u16(status).expect("validated ModSecurity status")),
         )?)
     };
-    let mut router =
-        Router::load(Arc::new(config.clone()), config.config_file.as_ref(), waf).await?;
-    let acme = match config.acme.clone() {
-        Some(settings) => Some(AcmeManager::load(settings, router.acme_names()).await?),
-        None => None,
-    };
-    if let Some(settings) = &config.acme {
-        let cache = tokio::fs::canonicalize(&settings.cache).await?;
-        for root in router.document_roots() {
-            let root = tokio::fs::canonicalize(root).await?;
-            if cache.starts_with(root) {
-                return Err("ACME cache must be outside every served document root".into());
+    let router = Router::load(Arc::new(config.clone()), config.config_file.as_ref(), waf).await?;
+    #[cfg(feature = "acme")]
+    let router = {
+        let mut router = router;
+        if let Some(settings) = config.acme.clone() {
+            let cache = settings.cache.clone();
+            let acme = AcmeManager::load(settings, router.acme_names()).await?;
+            let cache = tokio::fs::canonicalize(&cache).await?;
+            for root in router.document_roots() {
+                let root = tokio::fs::canonicalize(root).await?;
+                if cache.starts_with(root) {
+                    return Err("ACME cache must be outside every served document root".into());
+                }
             }
+            router.set_acme_manager(Some(acme));
         }
-    }
-    router.set_acme_manager(acme.clone());
+        router
+    };
     let router = Arc::new(router);
-    let acme_store = acme.as_ref().map(AcmeManager::certificate_store);
-    let tls_setup = TlsSetup::load(&config, &router, acme_store)?;
+    let tls_setup = TlsSetup::load(&config, &router)?;
     if config.tls_bind.is_some() && tls_setup.is_none() {
         return Err("--tls-bind requires a global or virtual-host TLS certificate".into());
     }
+    #[cfg(feature = "acme")]
     if config.acme.is_some() {
         eprintln!(
             "ACME enabled; eligible virtual-host certificates will be provisioned on plaintext traffic"
@@ -177,26 +201,35 @@ async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> 
         (Some(address), Some(_)) => Some(TcpListener::bind(address).await?),
         _ => None,
     };
+    #[cfg(feature = "http3")]
     let http3_endpoint = if let Some(tls) = &tls_setup {
         Some(http3::bind(config.http3_bind, &tls.http3)?)
     } else {
         None
     };
+    #[cfg(feature = "http3")]
     let alt_svc_port = http3_endpoint.as_ref().map(|(_, address)| address.port());
+    #[cfg(not(feature = "http3"))]
+    let alt_svc_port = None;
     let tls_acceptor = tls_setup
         .as_ref()
         .map(|tls| TlsAcceptor::from(Arc::clone(&tls.tcp)));
+    #[cfg(feature = "hosting")]
     eprintln!(
         "Listening on http://{} with root {}",
         config.bind,
         config.root.display()
     );
+    #[cfg(not(feature = "hosting"))]
+    eprintln!("Listening on http://{}", config.bind);
     if let Some(listener) = &tls_listener {
         eprintln!("Listening on https://{}", listener.local_addr()?);
     }
+    #[cfg(feature = "http3")]
     if let Some((_, address)) = &http3_endpoint {
         eprintln!("Listening on {} (HTTP/3)", address);
     }
+    #[cfg(feature = "hosting")]
     for backend in &config.fastcgi {
         if let FastCgiAddress::Cgi(interpreter) = &backend.address {
             let interpreter = interpreter.as_ref().map_or_else(
@@ -223,6 +256,7 @@ async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> 
     }
 
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+    #[cfg(feature = "http3")]
     let http3_task = http3_endpoint.map(|(endpoint, address)| {
         let router = Arc::clone(&router);
         let shutdown = shutdown_rx.clone();
@@ -236,7 +270,6 @@ async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> 
                 dir,
                 config.clone(),
                 tls_setup.as_ref().map(|tls| tls.sni.clone()),
-                acme.clone(),
                 shutdown_rx.clone(),
             )
         })
@@ -331,6 +364,7 @@ async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> 
             eprintln!("Connection task failed: {error}");
         }
     }
+    #[cfg(feature = "http3")]
     if let Some(task) = http3_task {
         match task.await {
             Ok(Ok(())) => {}

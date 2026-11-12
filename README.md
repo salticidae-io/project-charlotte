@@ -37,6 +37,48 @@ cargo build --release
 cargo test
 ```
 
+## Build features
+
+The major parts of the server are Cargo features. All four are enabled by
+default; leave some out to build a smaller server.
+
+| Feature | Provides | Without it |
+| --- | --- | --- |
+| `hosting` | The fallback site (`--root`), virtual hosts with a document root and their worker processes, static files, FastCGI, and CGI. | Hosting options and virtual hosts with a `root` are refused. Requests that match no virtual host get `404`. |
+| `proxy` | Virtual hosts with `proxy_pass`. | Virtual hosts with `proxy_pass` are refused. |
+| `acme` | ACME certificate provisioning (`--acme-*`). | The ACME options and `acme: true` are refused. |
+| `http3` | The HTTP/3 listener (`--http3-bind`). | TLS is served over TCP only. |
+
+TLS termination, SNI certificate selection, ModSecurity, `--user`/`--group`,
+and virtual-host reloading are part of every build. A build refuses the
+options and virtual-host settings of a feature it lacks at startup and names
+the feature, rather than ignoring them. `project-charlotte --help` lists the
+options the binary accepts and the features it was built with.
+
+For example, to build a reverse proxy that terminates TLS, provisions its
+certificates with ACME, and serves HTTP/3, but hosts nothing itself:
+
+```sh
+cargo build --release --no-default-features --features proxy,acme,http3
+```
+
+`scripts/check-features.sh` checks that every combination of features
+compiles without warnings.
+
+### Debian packages
+
+[`cargo-deb`](https://github.com/kornelski/cargo-deb) builds two packages,
+which both install `/usr/bin/project-charlotte` and so conflict with each
+other:
+
+| Package | Command | Features |
+| --- | --- | --- |
+| `project-charlotte` | `cargo deb` | all |
+| `project-charlotte-proxy` | `cargo deb --variant proxy` | `proxy`, `acme`, `http3` |
+
+The `Debian packages` GitHub workflow builds both for each supported Ubuntu
+release.
+
 ## Quick start
 
 Create a small document root and start the server using its default local
@@ -202,5 +244,9 @@ general server configuration.
 
 ## Development
 
-Run tests with `cargo test`. Fuzz target setup, seed tests, and target commands
-are documented in [FUZZING.md](FUZZING.md).
+Run tests with `cargo test`. Tests that need a feature are compiled only when
+it is enabled, so a reduced build is tested with the same feature flags it is
+built with, for example
+`cargo test --no-default-features --features proxy,acme,http3`. Fuzz target
+setup, seed tests, and target commands are documented in
+[FUZZING.md](FUZZING.md); the fuzz targets need the default features.
