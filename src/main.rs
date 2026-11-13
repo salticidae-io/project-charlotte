@@ -276,6 +276,7 @@ async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> 
     }
 
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     #[cfg(feature = "http3")]
     let http3_task = http3_endpoint.map(|(endpoint, address)| {
         let router = Arc::clone(&router);
@@ -298,8 +299,15 @@ async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> 
     let limiter = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     let signal_tx = shutdown_tx.clone();
     tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            let _ = signal_tx.send(true);
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                if result.is_ok() {
+                    let _ = signal_tx.send(true);
+                }
+            }
+            _ = terminate.recv() => {
+                let _ = signal_tx.send(true);
+            }
         }
     });
 

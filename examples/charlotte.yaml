@@ -161,10 +161,11 @@ vhost:
 # pool on the loopback interface:
     fastcgi: ["cgi=127.0.0.1:9001"]
 
-# Apps charlotte starts and supervises for this virtual host. One worker starts
-# at launch; additional workers are started on demand when concurrent requests
-# need them. Each worker has its own private FastCGI listening socket on file
-# descriptor 0, using FCGI_LISTENSOCK_FILENO; do not pass php-cgi's `-b` option.
+# Apps charlotte starts and supervises for this virtual host. No worker starts
+# at launch; the first request starts one, and more are started on demand when
+# concurrent requests need them. Each worker has its own private FastCGI
+# listening socket on file descriptor 0, using FCGI_LISTENSOCK_FILENO; do not
+# pass php-cgi's `-b` option.
 # Apps run as this vhost's user with the document root as their working
 # directory. Their environment is cleared except for PATH and variables
 # configured below. If an app exits (including after PHP_FCGI_MAX_REQUESTS),
@@ -182,8 +183,8 @@ vhost:
 # demand (1-256); defaults to 1.
         max_workers: 4
 
-# Optional. Reap surplus idle workers after this many seconds (1-86400); one
-# worker is always kept ready. Defaults to 60 seconds.
+# Optional. Stop each idle worker after this many seconds (1-86400), allowing
+# the pool to scale back to zero. Defaults to 60 seconds.
         idle_timeout: 60
 
 # Optional environment for the child. Keys must look like shell identifiers:
