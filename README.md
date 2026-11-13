@@ -150,13 +150,15 @@ without it, the rule's `status` is used when valid, otherwise Charlotte returns
 host can override the global setting with `modsecurity_block_status: CODE` in
 its YAML declaration; this requires global ModSecurity rules.
 
-Server-managed FastCGI apps start with one worker and spawn additional workers
-only when concurrent requests need them, up to `--fastcgi-app-max-workers`.
-Surplus idle workers are reaped after `--fastcgi-app-idle-timeout`, while one
-worker stays ready. The old `--fastcgi-app-workers` option remains as a
-deprecated alias for `--fastcgi-app-max-workers`. Workers restart immediately
-after a clean exit if they ran for at least 50 ms; failed or very short-lived
-processes are delayed to avoid a rapid restart loop.
+Server-managed FastCGI apps start with no workers. The first request starts one,
+and additional workers are started only when concurrent requests need them, up
+to `--fastcgi-app-max-workers`. Every idle worker is reaped after
+`--fastcgi-app-idle-timeout`, so the pool can scale back to zero; a request after
+that starts a fresh worker. The idle timeout defaults to 60 seconds. The old
+`--fastcgi-app-workers` option remains as a deprecated alias for
+`--fastcgi-app-max-workers`. Workers restart immediately after a clean exit if
+they ran for at least 50 ms; failed or very short-lived processes are delayed
+to avoid a rapid restart loop.
 
 Classic CGI entries can be configured from the command line or in each virtual
 host's YAML `cgi` list. Without an interpreter, the script must be executable;

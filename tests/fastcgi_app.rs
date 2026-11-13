@@ -15,7 +15,10 @@ use std::{
     time::Duration,
 };
 
-use nix::unistd::{User, geteuid};
+use nix::{
+    sys::signal::{Signal, kill},
+    unistd::{Pid, User, geteuid},
+};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpStream, UnixListener},
@@ -43,6 +46,35 @@ impl Fixture {
         extra_env: &[&str],
         extra_args: &[&str],
     ) -> Self {
+        Self::start_configured(root, vhost_config, exit_after, None, extra_env, extra_args).await
+    }
+
+    async fn start_with_program(
+        root: PathBuf,
+        program: PathBuf,
+        app_args: Vec<String>,
+        extra_env: &[&str],
+        extra_args: &[&str],
+    ) -> Self {
+        Self::start_configured(
+            root,
+            None,
+            None,
+            Some((program, app_args)),
+            extra_env,
+            extra_args,
+        )
+        .await
+    }
+
+    async fn start_configured(
+        root: PathBuf,
+        vhost_config: Option<String>,
+        exit_after: Option<usize>,
+        app_command: Option<(PathBuf, Vec<String>)>,
+        extra_env: &[&str],
+        extra_args: &[&str],
+    ) -> Self {
         let startup_guard = STARTUP_LOCK.lock().await;
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("echo.php"), "not served statically").unwrap();
@@ -64,11 +96,18 @@ impl Fixture {
             std::fs::write(&config_path, config).unwrap();
             command.arg("--config").arg(config_path);
         } else {
-            command.arg("--fastcgi-app").arg(format!(
-                "php={}",
-                std::env::current_exe().unwrap().display()
-            ));
-            for arg in ["--exact", "fcgi_app_helper", "--nocapture"] {
+            let (program, app_args) = app_command.unwrap_or_else(|| {
+                (
+                    std::env::current_exe().unwrap(),
+                    ["--exact", "fcgi_app_helper", "--nocapture"]
+                        .map(str::to_owned)
+                        .to_vec(),
+                )
+            });
+            command
+                .arg("--fastcgi-app")
+                .arg(format!("php={}", program.display()));
+            for arg in app_args {
                 command.arg("--fastcgi-app-arg").arg(format!("php={arg}"));
             }
             command
@@ -368,7 +407,7 @@ async fn sequential_requests_reuse_one_on_demand_worker() {
 }
 
 #[tokio::test]
-async fn reaps_extra_workers_after_the_pool_becomes_idle() {
+async fn reaps_all_workers_after_the_pool_becomes_idle() {
     let fixture = Fixture::start_with(
         new_root(),
         None,
@@ -435,12 +474,12 @@ async fn reaps_extra_workers_after_the_pool_becomes_idle() {
             .iter()
             .filter(|(pid, start_time)| process_is_running(**pid, **start_time))
             .count();
-        if remaining == 1 {
+        if remaining == 0 {
             break;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "expected idle workers to be reaped, but {remaining} of 3 remain: {:?}",
+            "expected all idle workers to be reaped, but {remaining} of 3 remain: {:?}",
             process_start_times
                 .keys()
                 .map(|&pid| (pid, process_info(pid).map(|(state, _)| state)))
@@ -451,7 +490,7 @@ async fn reaps_extra_workers_after_the_pool_becomes_idle() {
 }
 
 #[tokio::test]
-async fn scales_pool_within_max_workers_and_back_up_after_reaping() {
+async fn scales_pool_within_max_workers_and_back_up_from_zero_after_reaping() {
     let fixture = Fixture::start_with(
         new_root(),
         None,
@@ -497,21 +536,21 @@ async fn scales_pool_within_max_workers_and_back_up_after_reaping() {
         .collect::<HashMap<_, _>>();
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    let survivor = loop {
+    loop {
         let alive = process_start_times
             .iter()
             .filter_map(|(&pid, &start_time)| process_is_running(pid, start_time).then_some(pid))
             .collect::<Vec<_>>();
-        if alive.len() == 1 {
-            break alive[0];
+        if alive.is_empty() {
+            break;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "expected idle pool to shrink to one worker, but {} of 2 remain",
+            "expected idle pool to shrink to zero workers, but {} of 2 remain",
             alive.len()
         );
         sleep(Duration::from_millis(100)).await;
-    };
+    }
 
     let mut requests = tokio::task::JoinSet::new();
     for index in 1..=2 {
@@ -531,12 +570,89 @@ async fn scales_pool_within_max_workers_and_back_up_after_reaping() {
         "second burst should scale up to two workers"
     );
     assert!(
-        second_pids.contains(&survivor),
-        "the worker retained after reaping should be reused"
+        second_pids.is_disjoint(&first_pids),
+        "every worker in the second burst should be new after the pool reached zero"
     );
+}
+
+#[tokio::test]
+async fn starts_no_worker_until_requested_and_scales_up_after_reaping_to_zero() {
+    let root = new_root();
+    std::fs::create_dir_all(&root).unwrap();
+    let worker_pid_file = root.join("worker-pids");
+    let app_script = root.join("fastcgi-wrapper.sh");
+    std::fs::write(
+        &app_script,
+        "#!/bin/sh\nprintf '%s\\n' \"$$\" >> \"$CHARLOTTE_FCGI_WORKER_PID_FILE\"\nexec \"$CHARLOTTE_FCGI_HELPER_BIN\" --exact fcgi_app_helper --nocapture\n",
+    )
+    .unwrap();
+    let pid_file_env = format!(
+        "CHARLOTTE_FCGI_WORKER_PID_FILE={}",
+        worker_pid_file.display()
+    );
+    let helper_bin_env = format!(
+        "CHARLOTTE_FCGI_HELPER_BIN={}",
+        std::env::current_exe().unwrap().display()
+    );
+    let fixture = Fixture::start_with_program(
+        root,
+        PathBuf::from("/bin/sh"),
+        vec![app_script.display().to_string()],
+        &[pid_file_env.as_str(), helper_bin_env.as_str()],
+        &[
+            "--fastcgi-app-max-workers",
+            "php=2",
+            "--fastcgi-app-idle-timeout",
+            "php=1",
+        ],
+    )
+    .await;
     assert!(
-        second_pids.iter().any(|pid| !first_pids.contains(pid)),
-        "the second burst should spawn a replacement worker"
+        !worker_pid_file.exists(),
+        "the pool should not start a worker before the first request"
+    );
+
+    let first_pid = response_pid(
+        request(
+            fixture.address,
+            "localhost",
+            "GET",
+            "/echo.php?pool=first",
+            &[],
+            b"",
+        )
+        .await,
+    );
+    let start_time = process_start_time(first_pid)
+        .unwrap_or_else(|| panic!("FastCGI worker {first_pid} exited before checking reaping"));
+    assert_eq!(
+        std::fs::read_to_string(&worker_pid_file).unwrap().trim(),
+        first_pid.to_string()
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while process_is_running(first_pid, start_time) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the worker should be reaped after idle_timeout"
+        );
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    let second_pid = response_pid(
+        request(
+            fixture.address,
+            "localhost",
+            "GET",
+            "/echo.php?pool=second",
+            &[],
+            b"",
+        )
+        .await,
+    );
+    assert_ne!(
+        second_pid, first_pid,
+        "a request should spawn a fresh worker"
     );
 }
 
@@ -599,6 +715,111 @@ async fn immediately_restarts_cleanly_exited_cli_app() {
         started.elapsed() < Duration::from_secs(2),
         "clean exits should not incur the crash-loop restart delay"
     );
+}
+
+#[tokio::test]
+async fn cleans_up_fastcgi_descendants_on_reap_and_sigterm() {
+    let root = new_root();
+    std::fs::create_dir_all(&root).unwrap();
+    let child_pid_file = root.join("child-pids");
+    let app_script = root.join("fastcgi-wrapper.sh");
+    std::fs::write(
+        &app_script,
+        "#!/bin/sh\nsleep 300 &\nprintf '%s\\n' \"$!\" >> \"$CHARLOTTE_FCGI_CHILD_PID_FILE\"\nexec \"$CHARLOTTE_FCGI_HELPER_BIN\" --exact fcgi_app_helper --nocapture\n",
+    )
+    .unwrap();
+    let child_pid_file_env = format!("CHARLOTTE_FCGI_CHILD_PID_FILE={}", child_pid_file.display());
+    let helper_bin_env = format!(
+        "CHARLOTTE_FCGI_HELPER_BIN={}",
+        std::env::current_exe().unwrap().display()
+    );
+    let mut fixture = Fixture::start_with_program(
+        root,
+        PathBuf::from("/bin/sh"),
+        vec![app_script.display().to_string()],
+        &[
+            "CHARLOTTE_FCGI_DELAY_MS=300",
+            child_pid_file_env.as_str(),
+            helper_bin_env.as_str(),
+        ],
+        &[
+            "--fastcgi-app-max-workers",
+            "php=3",
+            "--fastcgi-app-idle-timeout",
+            "php=1",
+        ],
+    )
+    .await;
+    let _child_cleanup = ChildProcessCleanup {
+        pid_file: child_pid_file.clone(),
+    };
+
+    let mut requests = tokio::task::JoinSet::new();
+    for index in 0..3 {
+        let address = fixture.address;
+        requests.spawn(async move {
+            request(
+                address,
+                "localhost",
+                "GET",
+                &format!("/echo.php?descendant={index}"),
+                &[],
+                b"",
+            )
+            .await
+        });
+    }
+    let mut worker_pids = HashSet::new();
+    while let Some(response) = requests.join_next().await {
+        worker_pids.insert(response_pid(response.unwrap()));
+    }
+    assert_eq!(worker_pids.len(), 3, "the burst should start three workers");
+    let child_processes = wait_for_child_processes(&child_pid_file, 3).await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let running = child_processes
+            .iter()
+            .filter(|(pid, start_time)| process_is_running(*pid, *start_time))
+            .count();
+        if running == 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "idle reaping should stop every worker's descendants; {running} remain"
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    let server_pid = i32::try_from(fixture.server.id()).unwrap();
+    kill(Pid::from_raw(server_pid), Signal::SIGTERM).unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if fixture.server.try_wait().unwrap().is_some() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "server did not stop after SIGTERM"
+        );
+        sleep(Duration::from_millis(20)).await;
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let running = child_processes
+            .iter()
+            .filter(|(pid, start_time)| process_is_running(*pid, *start_time))
+            .count();
+        if running == 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "FastCGI descendants remained after server SIGTERM: {running}"
+        );
+        sleep(Duration::from_millis(20)).await;
+    }
 }
 
 #[tokio::test]
@@ -875,6 +1096,46 @@ fn response_pid(response: HttpResponse) -> u32 {
     assert_eq!(response.status, 200);
     let body = String::from_utf8(response.body).unwrap();
     field(&body, "pid").parse().unwrap()
+}
+
+struct ChildProcessCleanup {
+    pid_file: PathBuf,
+}
+
+impl Drop for ChildProcessCleanup {
+    fn drop(&mut self) {
+        let Ok(contents) = std::fs::read_to_string(&self.pid_file) else {
+            return;
+        };
+        for pid in contents.lines().filter_map(|line| line.parse::<i32>().ok()) {
+            let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
+        }
+    }
+}
+
+async fn wait_for_child_processes(pid_file: &PathBuf, expected: usize) -> Vec<(u32, u64)> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    loop {
+        if let Ok(contents) = std::fs::read_to_string(pid_file) {
+            let pids = contents
+                .lines()
+                .filter_map(|line| line.parse::<u32>().ok())
+                .collect::<HashSet<_>>();
+            let processes = pids
+                .into_iter()
+                .filter_map(|pid| process_start_time(pid).map(|start_time| (pid, start_time)))
+                .collect::<Vec<_>>();
+            if processes.len() == expected {
+                return processes;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "expected {expected} recorded FastCGI descendants in {}",
+            pid_file.display()
+        );
+        sleep(Duration::from_millis(20)).await;
+    }
 }
 
 fn process_start_time(pid: u32) -> Option<u64> {

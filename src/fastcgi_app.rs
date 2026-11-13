@@ -1,23 +1,29 @@
 use std::{
     error::Error,
+    ffi::OsString,
     fmt,
     fs::{self, DirBuilder},
     io,
     os::{
         fd::AsFd,
-        unix::{fs::DirBuilderExt, net::UnixListener},
+        unix::{
+            ffi::OsStrExt,
+            fs::{DirBuilderExt, PermissionsExt},
+            net::UnixListener,
+            process::CommandExt,
+        },
     },
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
 
 use nix::{
-    sys::signal::{Signal, kill},
+    sys::signal::{Signal, killpg},
     unistd::Pid,
 };
 use tokio::{
@@ -50,6 +56,7 @@ struct WorkerSlot {
     socket_path: Arc<Path>,
     busy: bool,
     last_used: Instant,
+    stopping: Arc<AtomicBool>,
     supervisor: JoinHandle<()>,
     pid: Arc<AtomicU32>,
 }
@@ -74,6 +81,7 @@ impl fmt::Debug for AppPool {
 
 impl AppPool {
     fn new(app: FastCgiApp, root: PathBuf) -> io::Result<Arc<Self>> {
+        validate_app_program(&app, &root)?;
         let socket_dir = create_socket_dir()?;
         let max_workers = app.max_workers;
         let pool = Arc::new(Self {
@@ -86,11 +94,6 @@ impl AppPool {
             permits: Arc::new(Semaphore::new(max_workers)),
             reaper: Mutex::new(None),
         });
-        let initial_slot = pool.spawn_slot()?;
-        pool.slots
-            .lock()
-            .expect("FastCGI pool mutex poisoned")
-            .push(initial_slot);
         pool.start_reaper();
         Ok(pool)
     }
@@ -134,6 +137,7 @@ impl AppPool {
         let id = NEXT_SOCKET_ID.fetch_add(1, Ordering::Relaxed);
         let (socket_path, listener) = create_listener(&self.socket_dir, id)?;
         let pid = Arc::new(AtomicU32::new(0));
+        let stopping = Arc::new(AtomicBool::new(false));
         let (child, started) = spawn_app(&self.app, &self.root, &listener, &pid)?;
         let supervisor = tokio::spawn(supervise(
             listener,
@@ -142,12 +146,14 @@ impl AppPool {
             child,
             started,
             Arc::clone(&pid),
+            Arc::clone(&stopping),
         ));
         Ok(WorkerSlot {
             id,
             socket_path: socket_path.into(),
             busy: false,
             last_used: Instant::now(),
+            stopping,
             supervisor,
             pid,
         })
@@ -172,7 +178,7 @@ impl AppPool {
         let now = Instant::now();
         let mut slots = self.slots.lock().expect("FastCGI pool mutex poisoned");
         let mut index = 0;
-        while slots.len() > 1 && index < slots.len() {
+        while index < slots.len() {
             let slot = &slots[index];
             if !slot.busy && now.duration_since(slot.last_used) >= self.idle_timeout {
                 let slot = slots.remove(index);
@@ -230,12 +236,13 @@ impl WorkerLease {
 }
 
 fn stop_slot(slot: WorkerSlot) {
+    slot.stopping.store(true, Ordering::SeqCst);
     slot.supervisor.abort();
     let pid = slot.pid.swap(0, Ordering::SeqCst);
     if let Ok(pid) = i32::try_from(pid)
         && pid > 0
     {
-        let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
+        let _ = killpg(Pid::from_raw(pid), Signal::SIGKILL);
     }
     if let Err(error) = fs::remove_file(&slot.socket_path)
         && error.kind() != io::ErrorKind::NotFound
@@ -255,7 +262,7 @@ pub(crate) async fn start_apps(config: &mut Config) -> Result<(), Box<dyn Error 
         };
         let pool = AppPool::new(app.clone(), root.clone())?;
         eprintln!(
-            "Started FastCGI app pool .{}: {} (maximum {} workers)",
+            "Started FastCGI app pool .{}: {} (0–{} workers on demand)",
             backend.extension,
             app.program.display(),
             app.max_workers,
@@ -287,6 +294,52 @@ fn create_listener(socket_dir: &Path, id: u64) -> io::Result<(PathBuf, UnixListe
     Ok((socket_path, listener))
 }
 
+fn validate_app_program(app: &FastCgiApp, root: &Path) -> io::Result<()> {
+    let path = app
+        .env
+        .get("PATH")
+        .map(OsString::from)
+        .or_else(|| std::env::var_os("PATH"))
+        .unwrap_or_default();
+    let program = &app.program;
+    let candidates = if program.as_os_str().as_bytes().contains(&b'/') {
+        vec![if program.is_absolute() {
+            program.to_path_buf()
+        } else {
+            root.join(program)
+        }]
+    } else {
+        std::env::split_paths(&path)
+            .map(|directory| {
+                if directory.is_absolute() {
+                    directory.join(program)
+                } else {
+                    root.join(directory).join(program)
+                }
+            })
+            .collect()
+    };
+
+    for candidate in candidates {
+        match fs::metadata(candidate) {
+            Ok(metadata) if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 => {
+                return Ok(());
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!(
+            "FastCGI app program {} was not found or is not executable",
+            program.display()
+        ),
+    ))
+}
+
 fn spawn_app(
     app: &FastCgiApp,
     root: &Path,
@@ -307,6 +360,7 @@ fn spawn_app(
         .stderr(Stdio::inherit())
         .current_dir(root)
         .kill_on_drop(true);
+    command.as_std_mut().process_group(0);
     let child = command.spawn()?;
     // Recorded without an intervening await so shutdown can't see a stale pid.
     pid.store(child.id().unwrap_or(0), Ordering::SeqCst);
@@ -320,10 +374,21 @@ async fn supervise(
     mut child: Child,
     mut started: Instant,
     pid: Arc<AtomicU32>,
+    stopping: Arc<AtomicBool>,
 ) {
     loop {
+        if stopping.load(Ordering::SeqCst) {
+            return;
+        }
+        let child_pid = child.id().and_then(|pid| i32::try_from(pid).ok());
         let status = child.wait().await;
+        if let Some(pid) = child_pid {
+            let _ = killpg(Pid::from_raw(pid), Signal::SIGKILL);
+        }
         pid.store(0, Ordering::SeqCst);
+        if stopping.load(Ordering::SeqCst) {
+            return;
+        }
         let clean_exit = match status {
             Ok(status) => {
                 eprintln!("FastCGI app {} exited with {status}", app.program.display());
@@ -342,8 +407,18 @@ async fn supervise(
         }
 
         loop {
+            if stopping.load(Ordering::SeqCst) {
+                return;
+            }
             match spawn_app(&app, &root, &listener, &pid) {
                 Ok((restarted, restarted_at)) => {
+                    if stopping.load(Ordering::SeqCst) {
+                        if let Some(pid) = restarted.id().and_then(|pid| i32::try_from(pid).ok()) {
+                            let _ = killpg(Pid::from_raw(pid), Signal::SIGKILL);
+                        }
+                        pid.store(0, Ordering::SeqCst);
+                        return;
+                    }
                     child = restarted;
                     started = restarted_at;
                     break;

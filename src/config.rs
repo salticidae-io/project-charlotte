@@ -144,7 +144,7 @@ struct Cli {
     /// Maximum worker processes of a spawned FastCGI application
     #[arg(long, alias = "fastcgi-app-workers", value_name = "EXT=N", hide = !HOSTING, allow_hyphen_values = true)]
     fastcgi_app_max_workers: Vec<String>,
-    /// Seconds an extra idle FastCGI application worker is kept
+    /// Seconds an idle FastCGI application worker is kept before it is stopped
     #[arg(long, value_name = "EXT=SECS", hide = !HOSTING, allow_hyphen_values = true)]
     fastcgi_app_idle_timeout: Vec<String>,
     /// Environment variable of a spawned FastCGI application

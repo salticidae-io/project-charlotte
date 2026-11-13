@@ -106,12 +106,12 @@ implemented.
 
 ## FastCGI application pools
 
-Each server-managed FastCGI app starts with one supervised process. Requests
-lease an idle process; if all existing processes are busy, the pool starts
-another up to `max_workers` (1–256, default 1). Each process has its own Unix
-listening socket in a private per-app directory. When the pool is idle, extra
-processes are reaped after `idle_timeout` seconds (1–86,400, default 60), while
-one process remains available. The CLI options are
+Each server-managed FastCGI app starts with no process. The first request starts
+a worker; requests lease an idle process, and if all existing processes are
+busy, the pool starts another up to `max_workers` (1–256, default 1). Each
+process has its own Unix listening socket in a private per-app directory. Every
+idle process is reaped after `idle_timeout` seconds (1–86,400, default 60), so
+the pool can shrink to zero and the next request starts a new worker. The CLI options are
 `--fastcgi-app-max-workers EXT=N` and
 `--fastcgi-app-idle-timeout EXT=SECS`; virtual-host YAML uses `max_workers` and
 `idle_timeout` (the older `workers` YAML field and
