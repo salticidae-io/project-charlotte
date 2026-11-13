@@ -537,7 +537,7 @@ fn if_range_matches(value: &str, etag: &str, modified: DateTime<Utc>) -> bool {
     }
 }
 
-fn parse_byte_range(value: &str, size: u64) -> Result<Option<(u64, u64)>, ()> {
+pub(crate) fn parse_byte_range(value: &str, size: u64) -> Result<Option<(u64, u64)>, ()> {
     let value = value.strip_prefix("bytes=").ok_or(())?;
     if value.contains(',') {
         return Err(());
@@ -696,7 +696,7 @@ fn hex_value(value: u8) -> Option<u8> {
     }
 }
 
-fn escape_html_into(escaped: &mut String, value: &str) {
+pub(crate) fn escape_html_into(escaped: &mut String, value: &str) {
     for character in value.chars() {
         match character {
             '&' => escaped.push_str("&amp;"),

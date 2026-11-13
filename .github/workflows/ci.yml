@@ -103,26 +103,70 @@ jobs:
         working-directory: project-charlotte
         run: cargo test --locked --no-default-features --features acme,http3,proxy
 
+  bench:
+    name: Gungraun benchmarks
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential \
+            pkg-config \
+            libmodsecurity-dev \
+            valgrind
+
+      - name: Check out project-charlotte
+        uses: actions/checkout@v4
+        with:
+          path: project-charlotte
+
+      - name: Check out modsecurity-rs
+        uses: actions/checkout@v4
+        with:
+          repository: fzylogic/modsecurity-rs
+          token: ${{ secrets.MODSECURITY_RS_TOKEN || github.token }}
+          path: modsecurity-rs
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: project-charlotte -> target
+
+      - name: Install Gungraun runner
+        run: cargo install gungraun-runner --version 0.20.0 --locked
+
+      - name: Run benchmarks
+        working-directory: project-charlotte
+        run: cargo bench --locked
+
   # The one status check to mark as required in the branch protection rule for
-  # main. It always runs, and passes only when both test jobs succeeded, so a
-  # failed, cancelled or skipped test job blocks the pull request.
+  # main. It always runs, and passes only when all validation jobs succeeded,
+  # so a failed, cancelled or skipped job blocks the pull request.
   required:
     name: Required checks
     if: always()
     needs:
       - test
       - features
+      - bench
     runs-on: ubuntu-24.04
     steps:
-      - name: Require the test jobs to succeed
+      - name: Require all validation jobs to succeed
         env:
           TEST_RESULT: ${{ needs.test.result }}
           FEATURES_RESULT: ${{ needs.features.result }}
+          BENCH_RESULT: ${{ needs.bench.result }}
         run: |
           echo "Tests: $TEST_RESULT"
           echo "Feature combinations: $FEATURES_RESULT"
+          echo "Benchmarks: $BENCH_RESULT"
           test "$TEST_RESULT" = success
           test "$FEATURES_RESULT" = success
+          test "$BENCH_RESULT" = success
 
   fuzz:
     name: Fuzz targets

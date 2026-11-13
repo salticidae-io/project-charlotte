@@ -273,3 +273,11 @@ built with, for example
 `cargo test --no-default-features --features proxy,acme,http3`. Fuzz target
 setup, seed tests, and target commands are documented in
 [FUZZING.md](FUZZING.md); the fuzz targets need the default features.
+
+Run the Gungraun callgrind benchmarks with `cargo bench`. They require Valgrind
+and the matching runner version:
+
+```sh
+cargo install gungraun-runner --version 0.20.0 --locked
+cargo bench
+```

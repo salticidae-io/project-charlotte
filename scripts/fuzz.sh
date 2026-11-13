@@ -17,7 +17,7 @@ target_dir="${CARGO_TARGET_DIR:-target}"
 crate=project_charlotte
 
 # The seed tests record each target's starting corpus under target/corpus.
-cargo test --bin project-charlotte --quiet
+cargo test --lib --quiet
 
 # Rust target names use `::`, which is not supported in artifact paths on all
 # platforms. The corpus store uses dots; test-fuzz still needs the original

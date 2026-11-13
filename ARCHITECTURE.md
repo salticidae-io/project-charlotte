@@ -3,9 +3,10 @@
 `project-charlotte` is an asynchronous Rust web server. It serves static files
 and directory listings, can route configured virtual hosts to separate worker
 processes or HTTP/HTTPS upstreams, and optionally integrates FastCGI, CGI,
-ModSecurity, TLS, ACME certificate provisioning, and HTTP/3. `src/main.rs` is
+ModSecurity, TLS, ACME certificate provisioning, and HTTP/3. `src/lib.rs` is
 the composition root: it parses configuration, initializes shared services,
-starts listeners, and coordinates shutdown.
+starts listeners, and coordinates shutdown. `src/main.rs` is a thin executable
+wrapper that calls the library's `run` function.
 
 ## Build features
 
