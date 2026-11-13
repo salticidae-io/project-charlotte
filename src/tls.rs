@@ -155,7 +155,7 @@ fn select_index<T>(entries: &[(String, T)], host: &str) -> Option<usize> {
         .map(|(index, _)| index)
 }
 
-fn select_key<'a, T>(
+pub(crate) fn select_key<'a, T>(
     entries: &'a [(String, T)],
     fallback: Option<&'a T>,
     server_name: Option<&str>,

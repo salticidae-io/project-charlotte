@@ -78,7 +78,7 @@ running the unit tests records those calls as the seed corpus under
 `target/corpus/` and verifies that every seed passes:
 
 ```sh
-cargo test --bin project-charlotte
+cargo test --lib
 cargo test-fuzz --list
 ```
 
