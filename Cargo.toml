@@ -1,8 +1,8 @@
 [package]
 name = "project-charlotte"
-version = "0.7.1"
+version = "0.8.0"
 edition = "2024"
-description = "Asynchronous web server for static sites and fastcgi dynamic content"
+description = "General-purpose webserver and reverse proxy meant for large-scale environments"
 
 [features]
 default = ["acme", "hosting", "http3", "proxy"]

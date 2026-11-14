@@ -127,6 +127,7 @@ async fn writes_global_and_vhost_access_and_error_logs() {
         vhost_error.contains("[error] [client 127.0.0.1] CGI stderr: script complaint"),
         "{vhost_error}"
     );
+    assert!(!vhost_error.contains("GET /"), "{vhost_error}");
     let access = wait_for_line(&global_access, "static.txt").await;
     assert!(access.contains("127.0.0.1 - - ["), "{access}");
     assert!(
@@ -135,6 +136,8 @@ async fn writes_global_and_vhost_access_and_error_logs() {
     );
     assert!(!access.contains("noisy.cgi"), "{access}");
     assert!(global_error.exists());
+    let global_error = std::fs::read_to_string(&global_error).unwrap();
+    assert!(!global_error.contains("GET /"), "{global_error}");
 
     common::shutdown(&mut server);
     let _ = std::fs::remove_dir_all(&base);
