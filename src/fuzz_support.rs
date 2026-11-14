@@ -1,3 +1,5 @@
+//! Shared fixtures and helpers for request-handling fuzz tests.
+
 use std::{
     future::Future,
     io,

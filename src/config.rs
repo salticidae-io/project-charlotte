@@ -1,3 +1,5 @@
+//! Command-line parsing and shared server, virtual-host, and backend settings.
+
 // Every build parses the same settings into the same structures, and refuses
 // the options of a feature it was built without before they take effect.
 // What a reduced build never reads is therefore not an oversight.

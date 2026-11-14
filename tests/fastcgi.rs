@@ -1,3 +1,5 @@
+//! Integration tests for FastCGI backends over TCP and Unix sockets.
+
 #![forbid(unsafe_code)]
 #![cfg(feature = "hosting")]
 

@@ -1,3 +1,5 @@
+//! Drops master privileges and narrows process capabilities.
+
 use std::error::Error;
 
 use caps::{CapSet, Capability, CapsHashSet};

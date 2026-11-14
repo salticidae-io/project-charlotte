@@ -1,3 +1,5 @@
+//! Integration tests for server-managed FastCGI application pooling and lifecycle.
+
 #![forbid(unsafe_code)]
 #![cfg(feature = "hosting")]
 

@@ -1,3 +1,5 @@
+//! Private HTTP/2 worker service with request metadata validation and privilege dropping.
+
 use std::{
     error::Error,
     net::SocketAddr,

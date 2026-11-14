@@ -1,3 +1,5 @@
+//! Integration tests for reverse-proxy routing, headers, and HTTP/HTTPS upstreams.
+
 #![forbid(unsafe_code)]
 #![cfg(feature = "proxy")]
 

@@ -1,3 +1,5 @@
+//! Integration tests for HTTP/3 serving with TLS and backend request routing.
+
 #![forbid(unsafe_code)]
 #![cfg(all(feature = "hosting", feature = "http3"))]
 

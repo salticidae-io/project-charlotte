@@ -1,3 +1,5 @@
+//! Trusted-proxy matching, forwarded-client resolution, and optional access logging.
+
 use std::{
     io::Write,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},

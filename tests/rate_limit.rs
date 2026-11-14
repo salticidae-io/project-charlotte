@@ -1,3 +1,5 @@
+//! Integration tests for global rate limits and virtual-host overrides.
+
 #![forbid(unsafe_code)]
 #![cfg(feature = "hosting")]
 

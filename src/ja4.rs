@@ -1,3 +1,5 @@
+//! Captures TLS ClientHello data and parses JA4 fingerprints.
+
 use std::{
     io,
     pin::Pin,

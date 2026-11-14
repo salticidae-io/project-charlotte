@@ -1,3 +1,5 @@
+//! FastCGI and CGI script resolution, request parameters, and backend exchange.
+
 use std::{
     borrow::Cow,
     collections::HashSet,

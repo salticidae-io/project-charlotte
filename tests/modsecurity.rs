@@ -1,3 +1,5 @@
+//! Integration tests for ModSecurity request and response inspection.
+
 #![forbid(unsafe_code)]
 #![cfg(feature = "hosting")]
 

@@ -1,3 +1,5 @@
+//! HTTP/1.1 JSON control API served over a Unix socket.
+
 use std::{
     io,
     os::unix::{

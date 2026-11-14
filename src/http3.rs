@@ -1,3 +1,5 @@
+//! QUIC and HTTP/3 connection handling and request forwarding to the router.
+
 use std::{error::Error, io, net::SocketAddr, sync::Arc};
 
 use bytes::{Buf, Bytes};

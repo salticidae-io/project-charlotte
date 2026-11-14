@@ -1,3 +1,5 @@
+//! Bounded per-client GCRA request buckets and rate-limit responses.
+
 use std::{
     collections::HashMap,
     hash::{BuildHasher, Hash, Hasher, RandomState},

@@ -1,3 +1,5 @@
+//! Spawns, supervises, and forwards requests to workers for hosted virtual hosts.
+
 use std::{
     error::Error,
     ffi::OsString,

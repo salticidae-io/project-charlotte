@@ -1,3 +1,5 @@
+//! Integration tests for loading and reloading virtual hosts from a directory.
+
 #![forbid(unsafe_code)]
 #![cfg(feature = "hosting")]
 

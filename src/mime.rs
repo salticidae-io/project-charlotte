@@ -1,3 +1,5 @@
+//! Maps file extensions to MIME content types.
+
 use std::path::Path;
 
 pub fn for_path(path: &Path) -> &'static str {
