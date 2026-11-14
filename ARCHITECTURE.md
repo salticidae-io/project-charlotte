@@ -86,9 +86,14 @@ handled first. A vhost can inherit the global limiter, replace it with an
 independent limiter, or disable rate limiting. Buckets use the resolved client
 IP (IPv6 grouped by `/64`) when the direct peer is trusted, otherwise the
 socket peer IP. The limiter uses bounded, sharded in-memory state and returns
-`429` with `Retry-After`. With `--access-log`, each completed request logs the
-resolved client and direct peer addresses along with the request and response
-status.
+`429` with `Retry-After`. When an access log is configured (globally or for the
+selected vhost), `Router::dispatch` wraps the response body so that one record
+is written, in the configured Apache `LogFormat`, once the body finishes or is
+dropped. Dispatch also scopes a task-local request context (client, local
+address, server name, and the vhost's error log) so that errors raised while
+handling the request, including CGI and FastCGI stderr, reach the right error
+log. Hosted workers write their errors to stderr, which the master points at
+the vhost (or global) error-log file when it spawns them.
 
 Bot detection is opt-in through `--bot-detection` or `--bot-config`. Global
 policy is inherited by vhosts unless they specify `bot: off` or a policy map.
@@ -218,7 +223,8 @@ cleanup is handled when their router-owned handles are dropped.
 | `proxy` | Pooled HTTP/HTTPS upstream clients and reverse-proxy header/body handling. |
 | `waf` | ModSecurity rule loading and request/response inspection. |
 | `ratelimit` | Bounded per-client GCRA request buckets and `429` responses. |
-| `forwarded` | Trusted-proxy CIDR matching, XFF resolution/sanitization, and optional access logging. |
+| `forwarded` | Trusted-proxy CIDR matching and XFF resolution/sanitization. |
+| `logging` | Apache-compatible access/error log formats, file targets, request context, and logging macros. |
 | `tls` | Rustls configuration, static certificates, and SNI certificate selection. |
 | `acme` | ACME account, HTTP-01 challenges, certificate cache, and renewal. |
 | `http3` | QUIC and HTTP/3 connection handling, forwarding requests to the router. |

@@ -1,13 +1,11 @@
-//! Trusted-proxy matching, forwarded-client resolution, and optional access logging.
+//! Trusted-proxy matching and forwarded-client resolution.
 
 use std::{
-    io::Write,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     str::FromStr,
 };
 
-use chrono::{SecondsFormat, Utc};
-use http::{HeaderMap, HeaderName, HeaderValue, Method, Version};
+use http::{HeaderMap, HeaderName, HeaderValue};
 
 const MAX_FORWARDED_HOPS: usize = 64;
 const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
@@ -207,56 +205,9 @@ pub(crate) fn sanitize(headers: &mut HeaderMap, trusted_chain: Option<&str>) {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct DirectPeer(pub SocketAddr);
 
-pub(crate) fn log_access(
-    client: SocketAddr,
-    peer: SocketAddr,
-    method: &Method,
-    path: &str,
-    version: Version,
-    status: u16,
-    host: &str,
-    user_agent: &str,
-    ja4: &str,
-) {
-    let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-    let method = escape_log_field(method.as_str());
-    let path = escape_log_field(path);
-    let version = escape_log_field(match version {
-        Version::HTTP_09 => "HTTP/0.9",
-        Version::HTTP_10 => "HTTP/1.0",
-        Version::HTTP_11 => "HTTP/1.1",
-        Version::HTTP_2 => "HTTP/2.0",
-        Version::HTTP_3 => "HTTP/3.0",
-        _ => "HTTP/1.1",
-    });
-    let host = escape_log_field(host);
-    let user_agent = escape_log_field(user_agent);
-    let mut stdout = std::io::stdout().lock();
-    let _ = writeln!(
-        stdout,
-        "{client} {peer} [{timestamp}] \"{method} {path} {version}\" {status} \"{host}\" \"{user_agent}\" \"{ja4}\""
-    );
-}
-
-fn escape_log_field(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len());
-    for character in value.chars() {
-        match character {
-            '"' => escaped.push_str("\\\""),
-            '\\' => escaped.push_str("\\\\"),
-            character if character.is_control() => {
-                use std::fmt::Write as _;
-                let _ = write!(escaped, "\\u{{{:x}}}", character as u32);
-            }
-            character => escaped.push(character),
-        }
-    }
-    escaped
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{DirectPeer, TrustedProxy, escape_log_field, resolve, sanitize};
+    use super::{DirectPeer, TrustedProxy, resolve, sanitize};
     use http::{HeaderMap, HeaderValue};
     use std::{net::SocketAddr, str::FromStr};
 
@@ -365,7 +316,6 @@ mod tests {
         assert_eq!(headers.get("x-forwarded-for").unwrap(), "203.0.113.9");
         sanitize(&mut headers, None);
         assert!(!headers.contains_key("x-forwarded-for"));
-        assert_eq!(escape_log_field("a\"b\\c\n"), "a\\\"b\\\\c\\u{a}");
         assert_eq!(DirectPeer(peer("127.0.0.1:80")).0, peer("127.0.0.1:80"));
     }
 }

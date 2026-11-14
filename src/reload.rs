@@ -11,13 +11,13 @@ pub(crate) async fn apply_vhost_change(router: &Router, config: &Config, sni: Op
     if let Some(sni) = sni
         && let Err(error) = sni.update(config, router)
     {
-        eprintln!("failed to reload virtual-host TLS certificates: {error}");
+        crate::log_error!("failed to reload virtual-host TLS certificates: {error}");
     }
     #[cfg(feature = "acme")]
     if let Some(acme) = router.acme_manager()
         && let Err(error) = acme.set_eligible(router.acme_names()).await
     {
-        eprintln!("failed to update ACME virtual-host names: {error}");
+        crate::log_error!("failed to update ACME virtual-host names: {error}");
     }
 }
 
@@ -41,7 +41,7 @@ pub(crate) fn spawn_watcher(
                 event = events_rx.recv() => {
                     match event {
                         Some(Ok(_)) => {}
-                        Some(Err(error)) => eprintln!("vhost directory watcher error: {error}"),
+                        Some(Err(error)) => crate::log_error!("vhost directory watcher error: {error}"),
                         None => break,
                     }
                 }
@@ -60,7 +60,7 @@ pub(crate) fn spawn_watcher(
                     event = events_rx.recv() => {
                         match event {
                             Some(Ok(_)) => {}
-                            Some(Err(error)) => eprintln!("vhost directory watcher error: {error}"),
+                            Some(Err(error)) => crate::log_error!("vhost directory watcher error: {error}"),
                             None => return,
                         }
                     }
@@ -74,11 +74,11 @@ pub(crate) fn spawn_watcher(
 
             match router.reload_dir().await {
                 Ok(true) => {
-                    eprintln!("reloaded virtual hosts from {}", dir.display());
+                    crate::log_error!("reloaded virtual hosts from {}", dir.display());
                     apply_vhost_change(&router, &config, sni.as_ref()).await;
                 }
                 Ok(false) => {}
-                Err(error) => eprintln!("failed to reload virtual hosts: {error}"),
+                Err(error) => crate::log_error!("failed to reload virtual hosts: {error}"),
             }
         }
     }))

@@ -74,7 +74,7 @@ pub(crate) async fn spawn(
                 }
                 Some(result) = connections.join_next(), if !connections.is_empty() => {
                     if let Err(error) = result {
-                        eprintln!("control connection task failed: {error}");
+                        crate::log_error!("control connection task failed: {error}");
                     }
                 }
                 accepted = listener.accept(), if slots.available_permits() > 0 => {
@@ -87,12 +87,12 @@ pub(crate) async fn spawn(
                             connections.spawn(async move {
                                 let _permit = permit;
                                 if let Err(error) = serve_connection(stream, state).await {
-                                    eprintln!("control connection failed: {error}");
+                                    crate::log_error!("control connection failed: {error}");
                                 }
                             });
                         }
                         Err(error) => {
-                            eprintln!("control socket accept failed: {error}");
+                            crate::log_error!("control socket accept failed: {error}");
                             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                         }
                     }
@@ -142,7 +142,7 @@ fn remove_socket_file(path: &Path) {
     if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_socket())
         && let Err(error) = std::fs::remove_file(path)
     {
-        eprintln!(
+        crate::log_error!(
             "could not remove control socket {}: {error}",
             path.display()
         );

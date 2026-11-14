@@ -213,7 +213,7 @@ impl Drop for AppPool {
         if let Err(error) = fs::remove_dir_all(&self.socket_dir)
             && error.kind() != io::ErrorKind::NotFound
         {
-            eprintln!(
+            crate::log_error!(
                 "could not remove FastCGI app socket directory {}: {error}",
                 self.socket_dir.display()
             );
@@ -249,7 +249,7 @@ fn stop_slot(slot: WorkerSlot) {
     if let Err(error) = fs::remove_file(&slot.socket_path)
         && error.kind() != io::ErrorKind::NotFound
     {
-        eprintln!(
+        crate::log_error!(
             "could not remove FastCGI app socket {}: {error}",
             slot.socket_path.display()
         );
@@ -263,7 +263,7 @@ pub(crate) async fn start_apps(config: &mut Config) -> Result<(), Box<dyn Error 
             continue;
         };
         let pool = AppPool::new(app.clone(), root.clone())?;
-        eprintln!(
+        crate::log_error!(
             "Started FastCGI app pool .{}: {} (0–{} workers on demand)",
             backend.extension,
             app.program.display(),
@@ -393,11 +393,11 @@ async fn supervise(
         }
         let clean_exit = match status {
             Ok(status) => {
-                eprintln!("FastCGI app {} exited with {status}", app.program.display());
+                crate::log_error!("FastCGI app {} exited with {status}", app.program.display());
                 status.success()
             }
             Err(error) => {
-                eprintln!(
+                crate::log_error!(
                     "could not wait for FastCGI app {}: {error}",
                     app.program.display()
                 );
@@ -426,7 +426,7 @@ async fn supervise(
                     break;
                 }
                 Err(error) => {
-                    eprintln!(
+                    crate::log_error!(
                         "could not restart FastCGI app {}: {error}",
                         app.program.display()
                     );

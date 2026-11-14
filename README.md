@@ -123,6 +123,10 @@ see all command-line options. Common options include:
 | `--rate-limit-burst N` | Set the allowed burst; requires `--rate-limit` and defaults to the rate rounded up per second. |
 | `--trusted-proxy CIDR` | Trust a proxy address or network when resolving `X-Forwarded-For`; repeatable and empty by default. |
 | `--access-log` | Write one access-log record per request to stdout. |
+| `--access-log-file FILE` | Append access-log records to `FILE` (takes precedence over `--access-log`). |
+| `--access-log-format FORMAT` | Apache `LogFormat` string or nickname (`common`, `combined`, `vhost_common`, `vhost_combined`, `referer`, `agent`). |
+| `--error-log-file FILE` | Append error-log records (including CGI/FastCGI stderr) to `FILE` instead of stderr. |
+| `--error-log-format FORMAT` | Apache `ErrorLogFormat` string; defaults to `[%t] [%l] [pid %P] [module %m] %M`. |
 | `--bot-detection` | Enable the built-in bot policy in enforcing mode. |
 | `--bot-config FILE` | Load bot-detection settings from YAML; enables detection and overrides the defaults. |
 | `--fastcgi EXT=ADDR` | Route a file extension to a FastCGI TCP or Unix-socket backend. |
@@ -147,6 +151,36 @@ append `X-Forwarded-For`; trusting arbitrary clients lets them spoof their
 address for rate limiting and access logs. `--access-log` writes the resolved
 client address and direct peer address, request line, status, host, and user
 agent to stdout; quotes, backslashes, and control characters are escaped.
+
+### Logging
+
+Access and error logs can be written directly to files for the whole server
+(`--access-log-file`, `--error-log-file`) and overridden per virtual host with
+the `access_log`, `access_log_format`, `error_log`, and `error_log_format` YAML
+keys. A vhost without its own setting inherits the server's file and format.
+Files are opened in append mode with mode `0640`; vhost log paths are relative
+to the YAML file and are reopened when virtual hosts are reloaded. Vhost log
+files are opened after the server drops privileges, so they must be writable
+by the server user.
+
+Access formats follow Apache `mod_log_config`: `%%`, `%a`, `%{c}a`, `%A`, `%b`,
+`%B`, `%D`, `%h`, `%H`, `%{Name}i`, `%{Name}o`, `%{Name}C`, `%l`, `%m`,
+`%{ja4}n`, `%p`, `%{local|remote|canonical}p`, `%P`, `%q`, `%r`, `%s`, `%>s`,
+`%t`, `%{strftime}t` (with `begin:`/`end:` and `sec`, `msec`, `usec`,
+`msec_frac`, `usec_frac`), `%T`, `%{s|ms|us}T`, `%u`, `%U`, `%v`, and `%V`, plus
+status conditions such as `%400,501{User-Agent}i` and `%!200{Referer}i`.
+Unsupported directives are rejected at startup. The default format keeps the
+previous stdout layout. Records are written when the response body finishes,
+so `%b`, `%D`, and `%T` reflect what was sent.
+
+Error formats follow Apache `ErrorLogFormat`: `%%`, `%a`, `%A`, `%t`, `%{u}t`,
+`%{c}t`, `%{cu}t`, `%l`, `%m`, `%M`, `%P`, `%T`, and `%v`. As in Apache, a
+field introduced with `% ` (for example `% ,\ host\ %v`) is omitted with its
+prefix when empty, `\ ` is a literal space, and `%-x` omits an empty value.
+CGI stderr lines and FastCGI `FCGI_STDERR` records are logged at `error` level
+to the error log of the virtual host that ran the script, together with the
+client address. Processes spawned with `fastcgi_app` inherit the worker's
+stderr, so their raw output is appended to the same file unformatted.
 
 ### Configuration socket
 
@@ -314,6 +348,10 @@ vhost:
     proxy_preserve_host: true
     proxy_timeout: 60
     proxy_ca_root: trust/backend-ca.pem
+    access_log: logs/api-access.log
+    access_log_format: combined
+    error_log: logs/api-error.log
+    error_log_format: "[%t] [%l] [client %a] %M"
 ```
 
 `proxy_pass` may include a path prefix but not a query. The original request

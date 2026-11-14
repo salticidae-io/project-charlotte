@@ -18,6 +18,7 @@ mod handler;
 mod http3;
 mod httpdate;
 mod ja4;
+mod logging;
 #[cfg(feature = "hosting")]
 mod mime;
 mod privileges;
@@ -162,7 +163,7 @@ async fn accepted_stream(
     match result {
         Ok(connection) => Some(connection),
         Err(error) => {
-            eprintln!("Could not accept connection: {error}");
+            crate::log_error!("Could not accept connection: {error}");
             tokio::time::sleep(ACCEPT_ERROR_DELAY).await;
             None
         }
@@ -182,6 +183,39 @@ pub fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut config = config;
     #[cfg(not(feature = "hosting"))]
     let config = config;
+
+    let error_target = if cfg!(feature = "hosting") && config.worker {
+        logging::LogTarget::stderr()
+    } else if let Some(path) = config.error_log_file.as_deref() {
+        logging::open_log(path, "error")?
+    } else {
+        logging::LogTarget::stderr()
+    };
+    logging::set_global_error_log(std::sync::Arc::new(logging::ErrorLog::new(
+        error_target,
+        logging::ErrorFormat::parse(&config.error_log_format)?,
+    )));
+    let access_target = if config.access_log_file.is_some() {
+        Some(logging::open_log(
+            config
+                .access_log_file
+                .as_deref()
+                .expect("checked access log path"),
+            "access",
+        )?)
+    } else if config.access_log {
+        Some(logging::LogTarget::stdout())
+    } else {
+        None
+    };
+    let access_log = access_target.map(|target| {
+        logging::AccessLog::new(
+            target,
+            logging::AccessFormat::parse(&config.access_log_format)
+                .expect("validated access log format"),
+        )
+    });
+    logging::set_global_access_log(access_log.map(std::sync::Arc::new));
 
     #[cfg(feature = "hosting")]
     if config.worker {
@@ -268,7 +302,7 @@ async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> 
     }
     #[cfg(feature = "acme")]
     if config.acme.is_some() {
-        eprintln!(
+        crate::log_error!(
             "ACME enabled; eligible virtual-host certificates will be provisioned on plaintext traffic"
         );
     }
@@ -303,7 +337,7 @@ async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> 
         .map(|tls| TlsAcceptor::from(Arc::clone(&tls.tcp)));
     #[cfg(feature = "hosting")]
     if let Some(listener) = &listener {
-        eprintln!(
+        crate::log_notice!(
             "Listening on http://{} with root {}",
             listener.local_addr()?,
             config.root.display()
@@ -311,14 +345,14 @@ async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> 
     }
     #[cfg(not(feature = "hosting"))]
     if let Some(listener) = &listener {
-        eprintln!("Listening on http://{}", listener.local_addr()?);
+        crate::log_notice!("Listening on http://{}", listener.local_addr()?);
     }
     if let Some(listener) = &tls_listener {
-        eprintln!("Listening on https://{}", listener.local_addr()?);
+        crate::log_notice!("Listening on https://{}", listener.local_addr()?);
     }
     #[cfg(feature = "http3")]
     if let Some((_, address)) = &http3_endpoint {
-        eprintln!("Listening on {} (HTTP/3)", address);
+        crate::log_notice!("Listening on {} (HTTP/3)", address);
     }
     #[cfg(feature = "hosting")]
     for backend in &config.fastcgi {
@@ -327,7 +361,7 @@ async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> 
                 || "direct executable".to_owned(),
                 |path| path.display().to_string(),
             );
-            eprintln!("CGI .{} -> {interpreter}", backend.extension);
+            crate::log_notice!("CGI .{} -> {interpreter}", backend.extension);
             continue;
         }
         let address = match &backend.address {
@@ -337,10 +371,10 @@ async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> 
             FastCgiAddress::Spawn(app) => format!("spawn:{}", app.program.display()),
             FastCgiAddress::Pool(pool) => format!("spawn:{}", pool.app().program.display()),
         };
-        eprintln!("FastCGI .{} -> {address}", backend.extension);
+        crate::log_notice!("FastCGI .{} -> {address}", backend.extension);
     }
     if !config.modsecurity_rules.is_empty() {
-        eprintln!(
+        crate::log_notice!(
             "ModSecurity enabled with {} rule file(s)",
             config.modsecurity_rules.len()
         );
@@ -405,7 +439,7 @@ async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> 
             // would hold its task allocation until shutdown.
             Some(result) = connections.join_next(), if !connections.is_empty() => {
                 if let Err(error) = result {
-                    eprintln!("Connection task failed: {error}");
+                    crate::log_error!("Connection task failed: {error}");
                 }
             }
             (accepted, permit) = accept(listener.as_ref(), &limiter) => {
@@ -426,7 +460,7 @@ async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> 
                         None,
                         None,
                     ).await {
-                        eprintln!("Connection from {peer} failed: {error}");
+                        crate::log_error!("Connection from {peer} failed: {error}");
                     }
                 });
             }
@@ -465,13 +499,13 @@ async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> 
                             )
                             .await
                             {
-                                eprintln!("TLS connection from {peer} failed: {error}");
+                                crate::log_error!("TLS connection from {peer} failed: {error}");
                             }
                         }
                         Ok(Err(error)) => {
-                            eprintln!("TLS handshake from {peer} failed: {error}");
+                            crate::log_error!("TLS handshake from {peer} failed: {error}");
                         }
-                        Err(_) => eprintln!("TLS handshake from {peer} timed out"),
+                        Err(_) => crate::log_error!("TLS handshake from {peer} timed out"),
                     }
                 });
             }
@@ -482,24 +516,24 @@ async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> 
     if let Some(task) = reload_task
         && let Err(error) = task.await
     {
-        eprintln!("vhost watcher task failed: {error}");
+        crate::log_error!("vhost watcher task failed: {error}");
     }
     if let Some(task) = control_task
         && let Err(error) = task.await
     {
-        eprintln!("control socket task failed: {error}");
+        crate::log_error!("control socket task failed: {error}");
     }
     while let Some(result) = connections.join_next().await {
         if let Err(error) = result {
-            eprintln!("Connection task failed: {error}");
+            crate::log_error!("Connection task failed: {error}");
         }
     }
     #[cfg(feature = "http3")]
     if let Some(task) = http3_task {
         match task.await {
             Ok(Ok(())) => {}
-            Ok(Err(error)) => eprintln!("HTTP/3 server failed: {error}"),
-            Err(error) => eprintln!("HTTP/3 server task failed: {error}"),
+            Ok(Err(error)) => crate::log_error!("HTTP/3 server failed: {error}"),
+            Err(error) => crate::log_error!("HTTP/3 server task failed: {error}"),
         }
     }
     Ok(())

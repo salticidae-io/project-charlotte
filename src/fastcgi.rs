@@ -294,7 +294,7 @@ where
     match tokio::time::timeout(timeout, operation).await {
         Ok(Ok(response)) => response,
         Ok(Err(error)) => {
-            eprintln!("FastCGI request failed: {error}");
+            crate::log_error!("FastCGI request failed: {error}");
             handler::error_response(StatusCode::BAD_GATEWAY, "FastCGI backend failed\n")
         }
         Err(_) => {
@@ -347,19 +347,27 @@ async fn execute_cgi(
         .stderr
         .take()
         .ok_or_else(|| "could not capture CGI stderr".to_owned())?;
+    let request_context = crate::logging::captured_context();
+    let input_context = request_context.clone();
     let input_task = tokio::spawn(async move {
-        let mut stdin = stdin;
-        if let Err(error) = stdin.write_all(&request_body).await
-            && error.kind() != io::ErrorKind::BrokenPipe
-        {
-            eprintln!("could not write CGI request body: {error}");
-        }
+        crate::logging::with_request_context(input_context, async move {
+            let mut stdin = stdin;
+            if let Err(error) = stdin.write_all(&request_body).await
+                && error.kind() != io::ErrorKind::BrokenPipe
+            {
+                crate::log_error!("could not write CGI request body: {error}");
+            }
+        })
+        .await;
     });
     let stderr_task = tokio::spawn(async move {
-        let mut lines = BufReader::new(stderr).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            eprintln!("CGI stderr: {line}");
-        }
+        crate::logging::with_request_context(request_context, async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                crate::log_error!("CGI stderr: {line}");
+            }
+        })
+        .await;
     });
 
     let (headers, initial_body) = match read_cgi_headers(&mut stdout, timeout).await {
@@ -491,7 +499,7 @@ fn cgi_response_body(
                 Ok(Err(error)) => Some((Err(error), None)),
                 Ok(Ok(status)) => {
                     if !status.success() {
-                        eprintln!("CGI process exited with {status}");
+                        crate::log_error!("CGI process exited with {status}");
                     }
                     if tokio::time::timeout(output.timeout, &mut output.input_task)
                         .await
@@ -1010,7 +1018,7 @@ where
 
 fn log_stderr(bytes: &[u8]) {
     if !bytes.is_empty() {
-        eprintln!(
+        crate::log_error!(
             "FastCGI stderr: {}",
             String::from_utf8_lossy(bytes).trim_end()
         );
@@ -1062,6 +1070,10 @@ mod tests {
             rate_limit: None,
             trusted_proxies: Vec::new(),
             access_log: false,
+            access_log_file: None,
+            access_log_format: "%a %U".to_owned(),
+            error_log_file: None,
+            error_log_format: "[%l] %M".to_owned(),
             bot: None,
             modsecurity_rules: Vec::new(),
             modsecurity_block_status: None,

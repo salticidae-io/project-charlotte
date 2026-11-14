@@ -96,7 +96,7 @@ impl Waf {
         let mut modsecurity = ModSecurity::new()?;
         modsecurity.set_connector_info(CONNECTOR_INFO)?;
         modsecurity.set_log_callback(|message| {
-            eprintln!("ModSecurity: {}", String::from_utf8_lossy(message));
+            crate::log_error!("ModSecurity: {}", String::from_utf8_lossy(message));
         });
 
         let rule_files = Box::leak(rule_files.to_vec().into_boxed_slice());
@@ -150,7 +150,7 @@ impl Waf {
         let mut transaction = match Transaction::new(self.modsecurity, self.rules) {
             Ok(transaction) => transaction,
             Err(error) => {
-                eprintln!("ModSecurity transaction creation failed: {error}");
+                crate::log_error!("ModSecurity transaction creation failed: {error}");
                 return response::error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "Request inspection failed\n",
@@ -162,7 +162,7 @@ impl Waf {
         let intervention = match phase_result {
             Ok(intervention) => intervention,
             Err(error) => {
-                eprintln!("ModSecurity request-header inspection failed: {error}");
+                crate::log_error!("ModSecurity request-header inspection failed: {error}");
                 return fail_closed(&mut transaction);
             }
         };
@@ -174,7 +174,7 @@ impl Waf {
         let collected = match tokio::time::timeout(REQUEST_BODY_TIMEOUT, collecting).await {
             Err(_) => {
                 if let Err(error) = finish_logging(&mut transaction) {
-                    eprintln!("ModSecurity logging failed: {error}");
+                    crate::log_error!("ModSecurity logging failed: {error}");
                 }
                 return response::error_response(
                     StatusCode::REQUEST_TIMEOUT,
@@ -184,7 +184,7 @@ impl Waf {
             Ok(Ok(body)) => body,
             Ok(Err(error)) if error.is::<http_body_util::LengthLimitError>() => {
                 if let Err(error) = finish_logging(&mut transaction) {
-                    eprintln!("ModSecurity logging failed: {error}");
+                    crate::log_error!("ModSecurity logging failed: {error}");
                     return response::error_response(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "Request inspection failed\n",
@@ -196,9 +196,11 @@ impl Waf {
                 );
             }
             Ok(Err(error)) => {
-                eprintln!("Request body read failed during ModSecurity inspection: {error}");
+                crate::log_error!(
+                    "Request body read failed during ModSecurity inspection: {error}"
+                );
                 if let Err(error) = finish_logging(&mut transaction) {
-                    eprintln!("ModSecurity logging failed: {error}");
+                    crate::log_error!("ModSecurity logging failed: {error}");
                     return response::error_response(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "Request inspection failed\n",
@@ -223,7 +225,7 @@ impl Waf {
             }
             Ok(None) => {}
             Err(error) => {
-                eprintln!("ModSecurity request-body inspection failed: {error}");
+                crate::log_error!("ModSecurity request-body inspection failed: {error}");
                 return fail_closed(&mut transaction);
             }
         }
@@ -262,7 +264,7 @@ impl Waf {
             }
             Ok(None) => {}
             Err(error) => {
-                eprintln!("ModSecurity response-header inspection failed: {error}");
+                crate::log_error!("ModSecurity response-header inspection failed: {error}");
                 return fail_closed(&mut transaction);
             }
         }
@@ -289,7 +291,7 @@ impl Waf {
                                     }
                                     Ok(None) => {}
                                     Err(error) => {
-                                        eprintln!(
+                                        crate::log_error!(
                                             "ModSecurity response-body inspection failed: {error}"
                                         );
                                         return fail_closed(&mut transaction);
@@ -320,7 +322,9 @@ impl Waf {
                             }
                             Ok(None) => {}
                             Err(error) => {
-                                eprintln!("ModSecurity response-body inspection failed: {error}");
+                                crate::log_error!(
+                                    "ModSecurity response-body inspection failed: {error}"
+                                );
                                 return fail_closed(&mut transaction);
                             }
                         }
@@ -329,7 +333,9 @@ impl Waf {
                     buffered.push_back(frame);
                 }
                 Some(Err(error)) => {
-                    eprintln!("Response body read failed during ModSecurity inspection: {error}");
+                    crate::log_error!(
+                        "Response body read failed during ModSecurity inspection: {error}"
+                    );
                     return fail_closed(&mut transaction);
                 }
                 None => {
@@ -344,12 +350,14 @@ impl Waf {
                         }
                         Ok(None) => {}
                         Err(error) => {
-                            eprintln!("ModSecurity response-body inspection failed: {error}");
+                            crate::log_error!(
+                                "ModSecurity response-body inspection failed: {error}"
+                            );
                             return fail_closed(&mut transaction);
                         }
                     }
                     if let Err(error) = finish_logging(&mut transaction) {
-                        eprintln!("ModSecurity logging failed: {error}");
+                        crate::log_error!("ModSecurity logging failed: {error}");
                         return response::error_response(
                             StatusCode::INTERNAL_SERVER_ERROR,
                             "Response inspection failed\n",
@@ -439,10 +447,10 @@ async fn finish_intervention(
     intervention: Intervention,
     block_status: Option<StatusCode>,
 ) -> Response<ResponseBody> {
-    eprintln!("ModSecurity intervention: {intervention}");
+    crate::log_error!("ModSecurity intervention: {intervention}");
     pause_for_intervention(&intervention).await;
     if let Err(error) = finish_logging(transaction) {
-        eprintln!("ModSecurity logging failed: {error}");
+        crate::log_error!("ModSecurity logging failed: {error}");
         return response::error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Request inspection failed\n",
@@ -495,7 +503,7 @@ async fn pause_for_intervention(intervention: &Intervention) {
 
 fn fail_closed(transaction: &mut Transaction<'static>) -> Response<ResponseBody> {
     if let Err(error) = finish_logging(transaction) {
-        eprintln!("ModSecurity logging failed: {error}");
+        crate::log_error!("ModSecurity logging failed: {error}");
     }
     response::error_response(
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -544,7 +552,9 @@ fn streaming_response_body(
                 {
                     match transaction.append_response_body(data) {
                         Ok(Some(intervention)) => {
-                            eprintln!("ModSecurity response-body intervention: {intervention}");
+                            crate::log_error!(
+                                "ModSecurity response-body intervention: {intervention}"
+                            );
                             pause_for_intervention(&intervention).await;
                             let _ = state.finish();
                             return Some((
@@ -554,7 +564,9 @@ fn streaming_response_body(
                         }
                         Ok(None) => {}
                         Err(error) => {
-                            eprintln!("ModSecurity response-body inspection failed: {error}");
+                            crate::log_error!(
+                                "ModSecurity response-body inspection failed: {error}"
+                            );
                             let _ = state.finish();
                             return Some((
                                 Err(io::Error::other("response inspection failed")),
@@ -575,7 +587,9 @@ fn streaming_response_body(
                 {
                     match transaction.process_response_body() {
                         Ok(Some(intervention)) => {
-                            eprintln!("ModSecurity response-body intervention: {intervention}");
+                            crate::log_error!(
+                                "ModSecurity response-body intervention: {intervention}"
+                            );
                             pause_for_intervention(&intervention).await;
                             let _ = state.finish();
                             return Some((
@@ -585,7 +599,9 @@ fn streaming_response_body(
                         }
                         Ok(None) => {}
                         Err(error) => {
-                            eprintln!("ModSecurity response-body inspection failed: {error}");
+                            crate::log_error!(
+                                "ModSecurity response-body inspection failed: {error}"
+                            );
                             let _ = state.finish();
                             return Some((
                                 Err(io::Error::other("response inspection failed")),
@@ -595,7 +611,7 @@ fn streaming_response_body(
                     }
                 }
                 if let Err(error) = state.finish() {
-                    eprintln!("ModSecurity logging failed: {error}");
+                    crate::log_error!("ModSecurity logging failed: {error}");
                     return Some((Err(io::Error::other("ModSecurity logging failed")), state));
                 }
                 None
@@ -625,7 +641,7 @@ impl StreamingBody {
 impl Drop for StreamingBody {
     fn drop(&mut self) {
         if let Err(error) = self.finish() {
-            eprintln!("ModSecurity logging failed after response stream closed: {error}");
+            crate::log_error!("ModSecurity logging failed after response stream closed: {error}");
         }
     }
 }

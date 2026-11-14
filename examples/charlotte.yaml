@@ -30,8 +30,8 @@
 # marked `default: true`.
 #
 # Relative paths (root, tls_cert, tls_key, proxy_ca_root, interpreter, unix:
-# FastCGI sockets) are resolved against the directory containing this file,
-# not the working directory.
+# FastCGI sockets, access_log, error_log) are resolved against the directory
+# containing this file, not the working directory.
 # `vhost_dir` is also relative to this file; visible `*.yaml` and `*.yml` files
 # in that directory are watched for additions, changes, deletions and renames.
 # Invalid updates are rejected and the last valid configuration remains active.
@@ -94,6 +94,15 @@ vhost:
 # bot:
 #   mode: log
 #   exempt_paths: [/health]
+
+# Optional. Per-vhost log files and Apache-compatible formats. Each setting
+# falls back to --access-log-file / --access-log-format and --error-log-file /
+# --error-log-format. Files are appended to and must be writable by the server
+# user. CGI and FastCGI stderr goes to this host's error log. For example:
+# access_log: logs/example-access.log
+# access_log_format: combined
+# error_log: logs/example-error.log
+# error_log_format: "[%t] [%l] [client %a] %M"
 
 # Optional. At most one virtual host in the file may set this. It receives
 # every request that matches no other host (and supplies the fallback
