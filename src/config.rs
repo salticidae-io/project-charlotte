@@ -53,6 +53,7 @@ pub struct Config {
     pub root: PathBuf,
     pub config_file: Option<PathBuf>,
     pub vhost_dir: Option<PathBuf>,
+    pub control_socket: Option<PathBuf>,
     pub index: String,
     pub listing: bool,
     pub try_files: Vec<String>,
@@ -201,6 +202,9 @@ struct Cli {
     /// Directory of virtual-host YAML files, reloaded on change
     #[arg(long, value_name = "DIRECTORY", allow_hyphen_values = true)]
     vhost_dir: Option<PathBuf>,
+    /// Unix socket for managing virtual hosts
+    #[arg(long, value_name = "PATH", allow_hyphen_values = true)]
+    control_socket: Option<PathBuf>,
     /// Fallback TLS certificate chain (PEM)
     #[arg(long, value_name = "PATH", allow_hyphen_values = true)]
     tls_cert: Option<PathBuf>,
@@ -384,6 +388,7 @@ impl Config {
             modsecurity_body_limit: body_limit,
             config_file,
             vhost_dir,
+            control_socket,
             tls_cert,
             tls_key,
             acme_directory,
@@ -532,6 +537,7 @@ impl Config {
             root,
             config_file,
             vhost_dir,
+            control_socket,
             index,
             listing,
             try_files,
@@ -971,9 +977,26 @@ mod tests {
         assert_eq!(config.http3_bind, config.bind);
         assert_eq!(config.root.as_path(), std::path::Path::new("public"));
         assert_eq!(config.config_file, None);
+        assert_eq!(config.control_socket, None);
         assert_eq!(config.index, "home.htm");
         assert!(!config.listing);
         assert!(config.try_files.is_empty());
+    }
+
+    #[test]
+    fn parses_control_socket() {
+        let parsed = Config::parse([
+            "--control-socket".to_owned(),
+            "/run/charlotte/control.sock".to_owned(),
+        ])
+        .unwrap();
+        let ParseResult::Config(config) = parsed else {
+            panic!("expected config")
+        };
+        assert_eq!(
+            config.control_socket.as_deref(),
+            Some(std::path::Path::new("/run/charlotte/control.sock"))
+        );
     }
 
     #[test]

@@ -3,16 +3,20 @@ use std::time::Duration;
 use std::{
     collections::BTreeMap,
     error::Error,
-    io,
+    fs::OpenOptions,
+    io::{self, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
-    sync::{Arc, RwLock},
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use bytes::Bytes;
 use http::{HeaderValue, Request, Response, StatusCode, header::HOST};
 use http_body::Body;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 #[cfg(feature = "acme")]
@@ -53,7 +57,7 @@ struct FileConfig {
 // Every build accepts the same declarations, so that one built without a
 // feature can say which feature a setting needs instead of calling it unknown.
 #[cfg_attr(not(feature = "hosting"), allow(dead_code))]
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct VhostFile {
     server_names: Vec<String>,
@@ -88,14 +92,14 @@ struct VhostFile {
     proxy_ca_root: Option<PathBuf>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(untagged)]
 enum RuleIdFile {
     Integer(u64),
     RangeOrId(String),
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(untagged)]
 enum BotPolicyDeclarationFile {
     String(String),
@@ -112,7 +116,7 @@ impl RuleIdFile {
 }
 
 #[cfg_attr(not(feature = "hosting"), allow(dead_code))]
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct FastCgiAppFile {
     extension: String,
@@ -162,6 +166,15 @@ pub(crate) struct Router {
     bot_state: Arc<BotState>,
     #[cfg(feature = "acme")]
     acme: Option<AcmeManager>,
+}
+
+pub(crate) enum ControlError {
+    BadRequest(String),
+    PayloadTooLarge,
+    NotFound,
+    Conflict(String),
+    Unavailable(String),
+    Internal(String),
 }
 
 struct VhostTable {
@@ -249,16 +262,58 @@ impl Router {
     }
 
     pub(crate) async fn reload_dir(&self) -> Result<bool, Box<dyn Error + Send + Sync>> {
+        self.reload_dir_with(None, false).await
+    }
+
+    async fn reload_dir_with(
+        &self,
+        override_file: Option<(PathBuf, Option<String>)>,
+        create_only: bool,
+    ) -> Result<bool, Box<dyn Error + Send + Sync>> {
         let Some(dir) = &self.dir else {
             return Ok(false);
         };
         let mut sources = self.sources.lock().await;
         ensure_trusted_config(dir)?;
-        let paths = scan_vhost_files(dir)?;
+        let mut paths = scan_vhost_files(dir)?;
+        if let Some((path, content)) = &override_file {
+            if path.parent() != Some(dir.as_path()) {
+                return Err("virtual-host override is outside the configured directory".into());
+            }
+            if content.is_some()
+                && create_only
+                && paths.iter().any(|candidate| {
+                    candidate.file_stem().is_some() && candidate.file_stem() == path.file_stem()
+                })
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "virtual host already exists",
+                )
+                .into());
+            }
+            if content.is_none() && !paths.contains(path) {
+                return Err(
+                    io::Error::new(io::ErrorKind::NotFound, "virtual host not found").into(),
+                );
+            }
+            if content.is_some() && !paths.contains(path) {
+                paths.push(path.clone());
+                paths.sort();
+            } else if content.is_none() {
+                paths.retain(|candidate| candidate != path);
+            }
+        }
         let mut candidates = Vec::with_capacity(paths.len());
         for path in paths {
-            ensure_trusted_config(&path)?;
-            let content = std::fs::read_to_string(&path)?;
+            let content = if let Some((override_path, Some(content))) = &override_file
+                && override_path == &path
+            {
+                content.clone()
+            } else {
+                ensure_trusted_config(&path)?;
+                std::fs::read_to_string(&path)?
+            };
             let old = sources.files.get(&path);
             let entries = if old.is_some_and(|source| source.content == content) {
                 old.expect("checked source exists").entries.clone()
@@ -361,6 +416,16 @@ impl Router {
         if !changed {
             changed = new_table.vhosts.len() != self.snapshot().vhosts.len();
         }
+        if let Some((path, content)) = &override_file {
+            match content {
+                Some(content) => persist_vhost_file(dir, path, content)?,
+                None if path.exists() => {
+                    std::fs::remove_file(path)?;
+                    std::fs::File::open(dir)?.sync_all()?;
+                }
+                None => {}
+            }
+        }
         sources.main_vhosts = Some(main_vhosts);
         sources.files = loaded;
         if changed {
@@ -370,6 +435,192 @@ impl Router {
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = new_table;
         }
         Ok(changed)
+    }
+
+    pub(crate) async fn control_list(&self) -> Vec<serde_json::Value> {
+        let sources = self.sources.lock().await;
+        let mut vhosts = Vec::new();
+        let config_file = self
+            .fallback
+            .config_file
+            .as_ref()
+            .map_or_else(|| "config".to_owned(), |path| path.display().to_string());
+        for (index, entry) in sources.main_entries.iter().enumerate() {
+            let name = entry
+                .server_names
+                .first()
+                .cloned()
+                .unwrap_or_else(|| format!("config-{}", index + 1));
+            vhosts.push(serde_json::json!({
+                "name": name,
+                "file": config_file,
+                "server_names": entry.server_names,
+                "source": "config",
+                "read_only": true,
+            }));
+        }
+        for (path, source) in &sources.files {
+            let name = path
+                .file_stem()
+                .map_or_else(String::new, |stem| stem.to_string_lossy().into_owned());
+            let server_names = source
+                .entries
+                .iter()
+                .flat_map(|entry| entry.server_names.iter().cloned())
+                .collect::<Vec<_>>();
+            vhosts.push(serde_json::json!({
+                "name": name,
+                "file": path.display().to_string(),
+                "server_names": server_names,
+                "source": "vhost_dir",
+                "read_only": false,
+            }));
+        }
+        vhosts
+    }
+
+    pub(crate) async fn control_get(&self, name: &str) -> Result<serde_json::Value, ControlError> {
+        if !valid_control_name(name) {
+            return Err(ControlError::BadRequest(
+                "invalid virtual-host name".to_owned(),
+            ));
+        }
+        let sources = self.sources.lock().await;
+        let source = sources
+            .files
+            .iter()
+            .find(|(path, _)| {
+                path.extension().is_some_and(|extension| extension == "yml")
+                    && path
+                        .file_stem()
+                        .is_some_and(|stem| stem.to_string_lossy() == name)
+            })
+            .or_else(|| {
+                sources.files.iter().find(|(path, _)| {
+                    path.file_stem()
+                        .is_some_and(|stem| stem.to_string_lossy() == name)
+                })
+            });
+        if let Some((path, source)) = source {
+            let entries = source
+                .entries
+                .iter()
+                .map(serde_json::to_value)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| ControlError::Internal(error.to_string()))?;
+            return Ok(serde_json::json!({
+                "name": name,
+                "file": path.display().to_string(),
+                "source": "vhost_dir",
+                "read_only": false,
+                "vhost": entries,
+            }));
+        }
+        if let Some((index, entry)) = sources.main_entries.iter().enumerate().find(|(_, entry)| {
+            entry
+                .server_names
+                .first()
+                .is_some_and(|primary| primary == name)
+        }) {
+            let entry = serde_json::to_value(entry)
+                .map_err(|error| ControlError::Internal(error.to_string()))?;
+            let file = self
+                .fallback
+                .config_file
+                .as_ref()
+                .map_or_else(|| "config".to_owned(), |path| path.display().to_string());
+            return Ok(serde_json::json!({
+                "name": sources.main_entries[index].server_names.first(),
+                "file": file,
+                "source": "config",
+                "read_only": true,
+                "vhost": [entry],
+            }));
+        }
+        Err(ControlError::NotFound)
+    }
+
+    pub(crate) async fn control_put(
+        &self,
+        name: &str,
+        value: serde_yaml_ng::Value,
+        create_only: bool,
+    ) -> Result<(), ControlError> {
+        let dir = self.dir.as_ref().ok_or_else(|| {
+            ControlError::Unavailable("no vhost directory is configured".to_owned())
+        })?;
+        if !valid_control_name(name) {
+            return Err(ControlError::BadRequest(
+                "invalid virtual-host name".to_owned(),
+            ));
+        }
+        let content = render_control_vhost(value)
+            .map_err(|error| ControlError::BadRequest(error.to_string()))?;
+        if self.is_read_only_main_vhost(name).await {
+            return Err(ControlError::Conflict(
+                "virtual hosts in the main configuration are read-only".to_owned(),
+            ));
+        }
+        let yaml_path = dir.join(format!("{name}.yaml"));
+        let yml_path = dir.join(format!("{name}.yml"));
+        let exists = yaml_path.exists() || yml_path.exists();
+        if create_only && exists {
+            return Err(ControlError::Conflict(
+                "virtual host already exists".to_owned(),
+            ));
+        }
+        let path = if yml_path.exists() {
+            yml_path
+        } else {
+            yaml_path
+        };
+        self.reload_dir_with(Some((path, Some(content))), create_only)
+            .await
+            .map_err(control_reload_error)?;
+        Ok(())
+    }
+
+    pub(crate) async fn control_delete(&self, name: &str) -> Result<(), ControlError> {
+        let dir = self.dir.as_ref().ok_or_else(|| {
+            ControlError::Unavailable("no vhost directory is configured".to_owned())
+        })?;
+        if !valid_control_name(name) {
+            return Err(ControlError::BadRequest(
+                "invalid virtual-host name".to_owned(),
+            ));
+        }
+        if self.is_read_only_main_vhost(name).await {
+            return Err(ControlError::Conflict(
+                "virtual hosts in the main configuration are read-only".to_owned(),
+            ));
+        }
+        let yaml_path = dir.join(format!("{name}.yaml"));
+        let yml_path = dir.join(format!("{name}.yml"));
+        let path = if yml_path.exists() {
+            yml_path
+        } else if yaml_path.exists() {
+            yaml_path
+        } else {
+            return Err(ControlError::NotFound);
+        };
+        self.reload_dir_with(Some((path, None)), false)
+            .await
+            .map_err(control_reload_error)?;
+        Ok(())
+    }
+
+    async fn is_read_only_main_vhost(&self, name: &str) -> bool {
+        let sources = self.sources.lock().await;
+        sources.main_entries.iter().any(|entry| {
+            entry
+                .server_names
+                .first()
+                .is_some_and(|primary| primary == name)
+        })
+    }
+
+    pub(crate) fn control_vhost_count(&self) -> usize {
+        self.snapshot().vhosts.len()
     }
 
     fn snapshot(&self) -> Arc<VhostTable> {
@@ -1368,6 +1619,16 @@ fn scan_vhost_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+fn control_reload_error(error: Box<dyn Error + Send + Sync>) -> ControlError {
+    let message = error.to_string();
+    match error.downcast_ref::<io::Error>().map(io::Error::kind) {
+        Some(io::ErrorKind::AlreadyExists) => ControlError::Conflict(message),
+        Some(io::ErrorKind::NotFound) => ControlError::NotFound,
+        Some(_) => ControlError::Unavailable(message),
+        None => ControlError::BadRequest(message),
+    }
+}
+
 fn parse_file_config(content: &str) -> Result<FileConfig, serde_yaml_ng::Error> {
     if content.trim().is_empty() {
         Ok(FileConfig::default())
@@ -1376,14 +1637,95 @@ fn parse_file_config(content: &str) -> Result<FileConfig, serde_yaml_ng::Error> 
     }
 }
 
+fn valid_control_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+        && bytes.len() <= 63
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+}
+
+fn render_control_vhost(value: serde_yaml_ng::Value) -> Result<String, serde_yaml_ng::Error> {
+    let entry: VhostFile = serde_yaml_ng::from_value(value)?;
+    Ok(format!("vhost:\n{}", serde_yaml_ng::to_string(&[entry])?))
+}
+
+fn persist_vhost_file(dir: &Path, path: &Path, content: &str) -> io::Result<()> {
+    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    if path.parent() != Some(dir) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "virtual-host file is outside the configured directory",
+        ));
+    }
+    let name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "virtual-host path has no file name",
+        )
+    })?;
+    let mut temp_path = None;
+    let mut temp_file = None;
+    for _ in 0..16 {
+        let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let candidate = dir.join(format!(
+            ".{}.tmp-{}-{id}",
+            name.to_string_lossy(),
+            std::process::id()
+        ));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o640)
+            .open(&candidate)
+        {
+            Ok(file) => {
+                if let Err(error) = file.set_permissions(std::fs::Permissions::from_mode(0o640)) {
+                    drop(file);
+                    let _ = std::fs::remove_file(&candidate);
+                    return Err(error);
+                }
+                temp_path = Some(candidate);
+                temp_file = Some(file);
+                break;
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let temp_path = temp_path.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not allocate a temporary virtual-host file",
+        )
+    })?;
+    let mut temp_file = temp_file.expect("temporary path and file are created together");
+    let result = (|| {
+        temp_file.write_all(content.as_bytes())?;
+        temp_file.sync_all()?;
+        drop(temp_file);
+        std::fs::rename(&temp_path, path)?;
+        std::fs::File::open(dir)?.sync_all()
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(temp_path);
+    }
+    result
+}
+
 #[cfg(all(test, feature = "hosting"))]
 mod tests {
     use super::{
         FileConfig, Router, TlsSni, Vhost, VhostFile, VhostTable, Worker, WorkerArgs,
         build_worker_args, ensure_trusted_config, match_score, normalize_host,
-        normalize_server_name, parse_file_config, request_host, resolve_identity, scan_vhost_files,
-        select_route, validate_index, validate_vhost_declarations, validate_vhost_waf_declarations,
-        worker_app_env, worker_request,
+        normalize_server_name, parse_file_config, render_control_vhost, request_host,
+        resolve_identity, scan_vhost_files, select_route, valid_control_name, validate_index,
+        validate_vhost_declarations, validate_vhost_waf_declarations, worker_app_env,
+        worker_request,
     };
     use crate::{
         config::{
@@ -1415,6 +1757,30 @@ mod tests {
             let authority = input.parse::<http::uri::Authority>().unwrap();
             assert_eq!(normalize_host(authority.host()).as_deref(), Some(expected));
         }
+    }
+
+    #[test]
+    fn validates_control_names_and_renders_vhost_yaml() {
+        for name in ["example", "example.test", "vhost-1", "site_2"] {
+            assert!(valid_control_name(name));
+        }
+        for name in ["", ".hidden", "../escape", "a/b"] {
+            assert!(!valid_control_name(name));
+        }
+        assert!(!valid_control_name(&"a".repeat(65)));
+
+        let entry: serde_yaml_ng::Value = serde_yaml_ng::from_str(
+            "server_names: [control.example]\nroot: /srv/site\nuser: nobody\n",
+        )
+        .unwrap();
+        let rendered = render_control_vhost(entry).unwrap();
+        let parsed = parse_file_config(&rendered).unwrap();
+        assert_eq!(parsed.vhost.len(), 1);
+        assert_eq!(parsed.vhost[0].server_names, ["control.example"]);
+        assert_eq!(
+            parsed.vhost[0].root.as_deref(),
+            Some(Path::new("/srv/site"))
+        );
     }
 
     #[test]

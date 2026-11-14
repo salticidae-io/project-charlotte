@@ -7,10 +7,10 @@ description = "Asynchronous web server for static sites and fastcgi dynamic cont
 [features]
 default = ["acme", "hosting", "http3", "proxy"]
 # ACME (HTTP-01) certificate provisioning and renewal.
-acme = ["dep:instant-acme", "dep:serde_json", "dep:x509-parser"]
+acme = ["dep:instant-acme", "dep:x509-parser"]
 # The fallback site and virtual hosts with a document root: static files,
 # FastCGI, CGI, and the per-host worker processes.
-hosting = ["dep:fastcgi-client", "dep:serde_json", "hyper/client"]
+hosting = ["dep:fastcgi-client", "hyper/client"]
 # The HTTP/3 (QUIC) listener.
 http3 = ["dep:h3", "dep:h3-quinn", "dep:quinn"]
 # Virtual hosts that forward to an HTTP or HTTPS upstream.
@@ -40,7 +40,7 @@ quinn = { version = "0.11", default-features = false, features = ["runtime-tokio
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 ring = "0.17"
 serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", optional = true }
+serde_json = "1"
 serde_yaml_ng = "0.10"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }

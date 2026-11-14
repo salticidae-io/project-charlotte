@@ -20,7 +20,7 @@ server:
 | `acme` | `acme`; `instant-acme`, `x509-parser`. |
 | `http3` | `http3`; `quinn`, `h3`, `h3-quinn`. |
 
-`main`, `config`, `forwarded`, `vhost`, `response`, `waf`, `tls`, `reload`,
+`main`, `config`, `control`, `forwarded`, `vhost`, `response`, `waf`, `tls`, `reload`,
 `privileges`, and `httpdate` are in every build. `Config` and the virtual-host
 declarations keep the same shape whichever features are enabled: `Config::parse`
 and virtual-host validation refuse what belongs to a feature that was left out and
@@ -40,8 +40,9 @@ source. The [examples](examples/) directory contains project examples.
 In master mode, startup canonicalizes the fallback document root, starts any
 configured FastCGI applications, loads the WAF and virtual-host table, and
 initializes ACME and TLS certificate resolution. It then binds the plaintext
-listener and any configured TLS or HTTP/3 listeners. TLS and HTTP/3 require
-TLS configuration or eligible ACME virtual hosts as appropriate.
+listener, any configured TLS or HTTP/3 listeners, and the optional Unix
+configuration socket. The socket is mode `0600`; TLS and HTTP/3 require TLS
+configuration or eligible ACME virtual hosts as appropriate.
 
 ## Processes and request flow
 
@@ -97,6 +98,24 @@ Challenge and crawler caches are bounded; DNS concurrency is limited, and
 proof-of-work cookies are signed and scoped to the client's `/24` or `/64`
 prefix. JA4 is available for captured TCP ClientHello messages, not plaintext
 or HTTP/3.
+
+## Configuration socket
+
+`control` serves an HTTP/1.1 JSON API over a Unix socket when
+`--control-socket` is configured. Its state holds the shared `Router`, startup
+configuration, TLS SNI handle, and process start time; this is also the
+extension point for future statistics. Vhost CRUD is restricted to the watched
+vhost directory; entries in the main configuration are visible but read-only.
+
+For a mutation, `Router` applies a proposed file override to the complete set of
+source files while holding the source-state lock, validates the declarations,
+and builds the candidate vhost table. Only after all checks succeed does it
+write a mode-`0640` temporary file, fsync and rename it (or remove the file for
+delete), then atomically replace the active table. The directory watcher sees
+the resulting filesystem event but skips it because the committed contents are
+already current. Both watcher and socket changes share the TLS SNI and ACME
+post-reload update path. Request bodies are capped at 1 MiB and accepted as
+JSON or YAML.
 
 ## Virtual-host workers
 

@@ -1046,6 +1046,7 @@ mod tests {
             root,
             config_file: None,
             vhost_dir: None,
+            control_socket: None,
             index: "index.php".to_owned(),
             listing: true,
             try_files: Vec::new(),

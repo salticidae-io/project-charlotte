@@ -4,6 +4,7 @@
 mod acme;
 mod bot;
 mod config;
+mod control;
 #[cfg(feature = "hosting")]
 mod fastcgi;
 #[cfg(feature = "hosting")]
@@ -344,6 +345,7 @@ async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> 
     }
 
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+    let started = std::time::Instant::now();
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     #[cfg(feature = "http3")]
     let http3_task = http3_endpoint.map(|(endpoint, address)| {
@@ -363,6 +365,21 @@ async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> 
             )
         })
         .transpose()?;
+    let control_task = if let Some(path) = config.control_socket.clone() {
+        Some(
+            control::spawn(
+                path,
+                Arc::clone(&router),
+                config.clone(),
+                tls_setup.as_ref().map(|tls| tls.sni.clone()),
+                started,
+                shutdown_rx.clone(),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
     let mut connections = JoinSet::new();
     let limiter = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     let signal_tx = shutdown_tx.clone();
@@ -464,6 +481,11 @@ async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> 
         && let Err(error) = task.await
     {
         eprintln!("vhost watcher task failed: {error}");
+    }
+    if let Some(task) = control_task
+        && let Err(error) = task.await
+    {
+        eprintln!("control socket task failed: {error}");
     }
     while let Some(result) = connections.join_next().await {
         if let Err(error) = result {
