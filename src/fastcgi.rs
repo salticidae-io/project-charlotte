@@ -842,14 +842,45 @@ struct ParsedHeaders {
     headers: HeaderMap,
 }
 
+fn parse_status_code(value: &str) -> Result<StatusCode, String> {
+    let code = value
+        .split_ascii_whitespace()
+        .next()
+        .ok_or_else(|| "empty FastCGI status code".to_owned())?
+        .parse::<u16>()
+        .map_err(|_| "invalid FastCGI status code".to_owned())?;
+    if !(200..=599).contains(&code) {
+        return Err("invalid FastCGI status code".to_owned());
+    }
+    StatusCode::from_u16(code).map_err(|_| "invalid FastCGI status code".to_owned())
+}
+
 fn parse_cgi_headers(bytes: &[u8]) -> Result<ParsedHeaders, String> {
     let mut fields = Vec::new();
     let mut connection_headers = HashSet::new();
+    let mut status = None;
+    let mut first_non_empty_line = true;
     for line in bytes.split(|byte| *byte == b'\n') {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
         if line.is_empty() {
             continue;
         }
+        if first_non_empty_line && line.starts_with(b"HTTP/") {
+            let line =
+                std::str::from_utf8(line).map_err(|_| "invalid FastCGI status line".to_owned())?;
+            let mut parts = line.split_ascii_whitespace();
+            let version = parts.next().unwrap_or_default();
+            if !matches!(version, "HTTP/1.0" | "HTTP/1.1" | "HTTP/2" | "HTTP/3") {
+                return Err("invalid FastCGI status line".to_owned());
+            }
+            let code = parts
+                .next()
+                .ok_or_else(|| "missing FastCGI status code".to_owned())?;
+            status = Some(parse_status_code(code)?);
+            first_non_empty_line = false;
+            continue;
+        }
+        first_non_empty_line = false;
         let colon = line
             .iter()
             .position(|byte| *byte == b':')
@@ -867,25 +898,13 @@ fn parse_cgi_headers(bytes: &[u8]) -> Result<ParsedHeaders, String> {
         fields.push((name, value));
     }
 
-    let mut status = None;
     let mut location = false;
     let mut headers = HeaderMap::new();
     for (name, value) in fields {
         if name.as_str().eq_ignore_ascii_case("status") {
             let value = std::str::from_utf8(value)
                 .map_err(|_| "invalid FastCGI status header".to_owned())?;
-            let code = value
-                .split_ascii_whitespace()
-                .next()
-                .ok_or_else(|| "empty FastCGI status header".to_owned())?
-                .parse::<u16>()
-                .map_err(|_| "invalid FastCGI status code".to_owned())?;
-            if !(100..=599).contains(&code) {
-                return Err("invalid FastCGI status code".to_owned());
-            }
-            status = Some(
-                StatusCode::from_u16(code).map_err(|_| "invalid FastCGI status code".to_owned())?,
-            );
+            status = Some(parse_status_code(value)?);
             continue;
         }
         if name == header::LOCATION {
@@ -1069,11 +1088,36 @@ mod tests {
         assert_eq!(status.status, StatusCode::CREATED);
         assert_eq!(status.headers["x-test"], "value");
 
+        let nph = parse_cgi_headers(b"HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\n\r\n")
+            .unwrap();
+        assert_eq!(nph.status, StatusCode::NOT_FOUND);
+
+        let nph_without_reason = parse_cgi_headers(b"HTTP/1.0 304\n\n").unwrap();
+        assert_eq!(nph_without_reason.status, StatusCode::NOT_MODIFIED);
+
+        let nph_status_overridden =
+            parse_cgi_headers(b"HTTP/1.1 404 Not Found\r\nStatus: 503 Service Unavailable\r\n\r\n")
+                .unwrap();
+        assert_eq!(
+            nph_status_overridden.status,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        let location_with_status =
+            parse_cgi_headers(b"Status: 404 Not Found\r\nLocation: /missing\r\n\r\n").unwrap();
+        assert_eq!(location_with_status.status, StatusCode::NOT_FOUND);
+
         let redirect = parse_cgi_headers(b"Location: /next\r\n\r\n").unwrap();
         assert_eq!(redirect.status, StatusCode::FOUND);
 
         assert!(parse_cgi_headers(b"Broken header\r\n\r\n").is_err());
+        assert!(parse_cgi_headers(b"Status: 101 Switching Protocols\r\n\r\n").is_err());
+        assert!(parse_cgi_headers(b"HTTP/1.1 101 Switching Protocols\r\n\r\n").is_err());
         assert!(parse_cgi_headers(b"Status: 999 Nope\r\n\r\n").is_err());
+        assert!(
+            parse_cgi_headers(b"Content-Type: text/plain\r\nHTTP/1.1 404 Not Found\r\n\r\n")
+                .is_err()
+        );
     }
 
     #[tokio::test]

@@ -54,6 +54,20 @@ printf 'Status: 201 Created\r\nContent-Type: text/plain\r\n\r\ncreated'
             0o755,
         );
         write_script(
+            &root.join("nph.cgi"),
+            r##"#!/bin/sh
+printf 'HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\n\r\nnph missing'
+"##,
+            0o755,
+        );
+        write_script(
+            &root.join("not-found.cgi"),
+            r##"#!/bin/sh
+printf 'Status: 404 Not Found\r\nContent-Type: text/plain\r\n\r\nmissing'
+"##,
+            0o755,
+        );
+        write_script(
             &root.join("broken.cgi"),
             r##"#!/bin/sh
 printf 'not a CGI header\r\n\r\nbroken'
@@ -319,6 +333,14 @@ async fn serves_classic_cgi_scripts_and_preserves_static_fallback() {
     assert_eq!(response.status, 201);
     assert_eq!(response.headers.get("content-type").unwrap(), "text/plain");
     assert_eq!(response.body, b"created");
+
+    let response = request(fixture.address, "GET", "/nph.cgi", b"").await;
+    assert_eq!(response.status, 404);
+    assert_eq!(response.body, b"nph missing");
+
+    let response = request(fixture.address, "GET", "/not-found.cgi", b"").await;
+    assert_eq!(response.status, 404);
+    assert_eq!(response.body, b"missing");
 
     let response = request(fixture.address, "GET", "/broken.cgi", b"").await;
     assert_eq!(response.status, 502);
