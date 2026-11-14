@@ -1,0 +1,5 @@
+[coverage]
+engine = "Llvm"
+out = ["Xml", "Html", "Lcov"]
+output-dir = "target/coverage"
+exclude-files = ["**/benches/**", "**/fuzz/**"]
