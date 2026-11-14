@@ -182,7 +182,10 @@ impl ReverseProxy {
             .get("x-forwarded-for")
             .and_then(|value| value.to_str().ok())
             .filter(|value| !value.trim().is_empty())
-            .map_or_else(|| peer.to_string(), |value| format!("{value}, {peer}"));
+            .map_or_else(
+                || peer.ip().to_string(),
+                |value| format!("{value}, {}", peer.ip()),
+            );
         if let Ok(value) = HeaderValue::from_str(&forwarded_for) {
             request.headers_mut().insert("x-forwarded-for", value);
         }

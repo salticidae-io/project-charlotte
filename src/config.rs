@@ -6,6 +6,11 @@
     allow(dead_code)
 )]
 
+use crate::{
+    bot::{BotPolicy, BotPolicyFile},
+    forwarded::TrustedProxy,
+    ratelimit::RateLimit,
+};
 use clap::{
     ArgMatches, ColorChoice, CommandFactory, FromArgMatches, Parser, error::ErrorKind,
     parser::ValueSource,
@@ -55,6 +60,10 @@ pub struct Config {
     pub fastcgi_timeout: Duration,
     pub threads: Option<usize>,
     pub worker_threads: usize,
+    pub(crate) rate_limit: Option<RateLimit>,
+    pub(crate) trusted_proxies: Vec<TrustedProxy>,
+    pub(crate) access_log: bool,
+    pub(crate) bot: Option<BotPolicyFile>,
     pub modsecurity_rules: Vec<PathBuf>,
     pub modsecurity_block_status: Option<u16>,
     pub modsecurity_body_limit: usize,
@@ -159,6 +168,24 @@ struct Cli {
     /// Runtime threads of each vhost worker
     #[arg(long, value_name = "N", default_value_t = DEFAULT_WORKER_THREADS, value_parser = parse_thread_count, hide = !HOSTING, allow_hyphen_values = true)]
     worker_threads: usize,
+    /// Per-client request rate (N/s, N/m, or N/h)
+    #[arg(long, value_name = "RATE", allow_hyphen_values = true)]
+    rate_limit: Option<String>,
+    /// Maximum burst for --rate-limit; defaults to the rate per second, rounded up
+    #[arg(long, value_name = "N", allow_hyphen_values = true)]
+    rate_limit_burst: Option<u32>,
+    /// Trusted reverse-proxy address or CIDR; may be repeated
+    #[arg(long, value_name = "CIDR", allow_hyphen_values = true)]
+    trusted_proxy: Vec<String>,
+    /// Write access-log records to stdout
+    #[arg(long)]
+    access_log: bool,
+    /// Enable the built-in bot-detection policy
+    #[arg(long)]
+    bot_detection: bool,
+    /// Load a bot-detection policy from YAML (also enables detection)
+    #[arg(long, value_name = "FILE", allow_hyphen_values = true)]
+    bot_config: Option<PathBuf>,
     /// ModSecurity rules file (repeatable)
     #[arg(long, value_name = "FILE", allow_hyphen_values = true)]
     modsecurity_rules: Vec<PathBuf>,
@@ -346,6 +373,12 @@ impl Config {
             fastcgi_timeout,
             threads,
             worker_threads,
+            rate_limit,
+            rate_limit_burst,
+            trusted_proxy,
+            access_log,
+            bot_detection,
+            bot_config,
             modsecurity_rules,
             modsecurity_block_status,
             modsecurity_body_limit: body_limit,
@@ -364,6 +397,30 @@ impl Config {
             ..
         } = cli;
         let listing = !no_listing;
+        let rate_limit = match rate_limit {
+            Some(rate) => Some(RateLimit::parse(&rate, rate_limit_burst)?),
+            None if rate_limit_burst.is_some() => {
+                return Err("--rate-limit-burst requires --rate-limit".to_owned());
+            }
+            None => None,
+        };
+        let trusted_proxies = trusted_proxy
+            .iter()
+            .map(|value| value.parse())
+            .collect::<Result<Vec<TrustedProxy>, String>>()?;
+        let bot = if let Some(path) = bot_config {
+            let content = std::fs::read_to_string(&path).map_err(|error| {
+                format!("could not read bot policy {}: {error}", path.display())
+            })?;
+            let policy: BotPolicyFile = serde_yaml_ng::from_str(&content)
+                .map_err(|error| format!("invalid bot policy {}: {error}", path.display()))?;
+            BotPolicy::parse(policy.clone())?;
+            Some(policy)
+        } else if bot_detection {
+            Some(BotPolicyFile::default())
+        } else {
+            None
+        };
         let modsecurity_body_limit = body_limit.unwrap_or(16 * 1024 * 1024);
         let modsecurity_response_body_limit = body_limit.unwrap_or(1024 * 1024);
 
@@ -482,6 +539,10 @@ impl Config {
             fastcgi_timeout,
             threads,
             worker_threads,
+            rate_limit,
+            trusted_proxies,
+            access_log,
+            bot,
             modsecurity_rules,
             modsecurity_block_status,
             modsecurity_body_limit,
@@ -884,6 +945,8 @@ mod tests {
     use super::{Config, ParseResult, parse_modsecurity_block_status};
     #[cfg(feature = "hosting")]
     use super::{DEFAULT_FASTCGI_APP_IDLE_TIMEOUT_SECS, FastCgiAddress, validate_try_files};
+    use crate::forwarded::TrustedProxy;
+    use crate::ratelimit::RateLimit;
     use std::path::PathBuf;
     #[cfg(feature = "hosting")]
     use std::time::Duration;
@@ -911,6 +974,90 @@ mod tests {
         assert_eq!(config.index, "home.htm");
         assert!(!config.listing);
         assert!(config.try_files.is_empty());
+    }
+
+    #[test]
+    fn parses_rate_limit_and_rejects_invalid_options() {
+        let parsed = Config::parse([
+            "--rate-limit".to_owned(),
+            "20/s".to_owned(),
+            "--rate-limit-burst".to_owned(),
+            "40".to_owned(),
+        ])
+        .unwrap();
+        let ParseResult::Config(config) = parsed else {
+            panic!("expected config")
+        };
+        assert_eq!(
+            config.rate_limit,
+            Some(RateLimit::parse("20/s", Some(40)).unwrap())
+        );
+
+        assert!(Config::parse(["--rate-limit-burst".to_owned(), "2".to_owned()]).is_err());
+        assert!(Config::parse(["--rate-limit".to_owned(), "0/m".to_owned()]).is_err());
+        assert!(
+            Config::parse([
+                "--rate-limit".to_owned(),
+                "1/s".to_owned(),
+                "--rate-limit-burst".to_owned(),
+                "0".to_owned()
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn parses_trusted_proxies_and_access_logging() {
+        let parsed = Config::parse([
+            "--trusted-proxy".to_owned(),
+            "10.0.0.0/8".to_owned(),
+            "--trusted-proxy".to_owned(),
+            "::1".to_owned(),
+            "--access-log".to_owned(),
+        ])
+        .unwrap();
+        let ParseResult::Config(config) = parsed else {
+            panic!("expected config")
+        };
+        assert_eq!(
+            config.trusted_proxies,
+            vec![
+                "10.0.0.0/8".parse::<TrustedProxy>().unwrap(),
+                "::1".parse::<TrustedProxy>().unwrap(),
+            ]
+        );
+        assert!(config.access_log);
+        assert!(Config::parse(["--trusted-proxy".to_owned(), "10.0.0.0/99".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn enables_default_bot_detection_and_loads_valid_policy_yaml() {
+        let parsed = Config::parse(["--bot-detection".to_owned()]).unwrap();
+        let ParseResult::Config(config) = parsed else {
+            panic!("expected config")
+        };
+        assert!(config.bot.is_some());
+
+        let path = std::env::temp_dir().join(format!(
+            "project-charlotte-bot-config-{}-{}.yaml",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::write(
+            &path,
+            "mode: log\nchallenge_threshold: 20\nblock_threshold: 70\nverify_crawlers: false\n",
+        )
+        .unwrap();
+        let parsed = Config::parse([
+            "--bot-config".to_owned(),
+            path.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+        let ParseResult::Config(config) = parsed else {
+            panic!("expected config")
+        };
+        assert!(config.bot.is_some());
+        std::fs::remove_file(path).unwrap();
     }
 
     #[cfg(feature = "hosting")]

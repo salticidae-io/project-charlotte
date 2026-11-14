@@ -19,6 +19,8 @@
 # command-line options; see `project-charlotte --help`. Set the global blocking
 # response status with `--modsecurity-block-status CODE` (400-599); a vhost may
 # override it with `modsecurity_block_status` below.
+# Bot detection is enabled with `--bot-detection` or `--bot-config FILE`; a
+# vhost can override it with `bot: off` or a policy map.
 #
 # Worker-backed virtual hosts run in their own worker process, re-executing
 # this binary with `--worker` and dropping privileges to the configured user
@@ -85,6 +87,13 @@ vhost:
 # --modsecurity-block-status for blocking interventions on this vhost; valid
 # values are 400-599. Redirect interventions retain their configured status.
 # modsecurity_block_status: 451
+
+# Optional. Inherits the global bot policy by default; use `off` to exempt this
+# host or a map to override selected policy fields. For example:
+# bot: off
+# bot:
+#   mode: log
+#   exempt_paths: [/health]
 
 # Optional. At most one virtual host in the file may set this. It receives
 # every request that matches no other host (and supplies the fallback

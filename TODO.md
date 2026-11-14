@@ -10,9 +10,6 @@
   * Customizable log formats
 * Configuration API
 * Internal statistics tracking and display (ala apache-status or nginx's admin socket)
-* x-forwarded-for support (both passing and accepting)
-* Bot detection/blocking?
-* Rate limiting
 * Connection limiting
 * Swarm mode
   * Utilizing Redis to detect fleet-wide abuse

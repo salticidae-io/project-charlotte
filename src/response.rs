@@ -60,6 +60,30 @@ pub(crate) fn error_response(status: StatusCode, message: &'static str) -> Respo
     response
 }
 
+pub(crate) fn bot_response(parts: crate::bot::ResponseParts) -> Response<ResponseBody> {
+    let bytes = Bytes::from(parts.body);
+    let length = bytes.len();
+    let mut response = response(parts.status, full_body(bytes));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(parts.content_type),
+    );
+    response
+        .headers_mut()
+        .insert(header::CONTENT_LENGTH, HeaderValue::from(length));
+    if let Some(location) = parts.location
+        && let Ok(value) = HeaderValue::from_str(&location)
+    {
+        response.headers_mut().insert(header::LOCATION, value);
+    }
+    if let Some(cookie) = parts.set_cookie
+        && let Ok(value) = HeaderValue::from_str(&cookie)
+    {
+        response.headers_mut().append(header::SET_COOKIE, value);
+    }
+    response
+}
+
 #[cfg(feature = "acme")]
 pub(crate) fn text_response(status: StatusCode, text: String) -> Response<ResponseBody> {
     let bytes = Bytes::from(text);

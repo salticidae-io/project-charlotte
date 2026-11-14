@@ -1,6 +1,6 @@
 [package]
 name = "project-charlotte"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 description = "Asynchronous web server for static sites and fastcgi dynamic content"
 
@@ -21,6 +21,7 @@ bytes = "1"
 caps = "0.5"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4", features = ["derive"] }
+dns-lookup = "2"
 fastcgi-client = { version = "0.12", features = ["tokio"], optional = true }
 futures-util = "0.3"
 h3 = { version = "0.0.8", optional = true }
@@ -37,6 +38,7 @@ nix = { version = "0.31.3", features = ["process", "signal", "user"] }
 notify = { version = "8", default-features = false }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"], optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+ring = "0.17"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", optional = true }
 serde_yaml_ng = "0.10"
@@ -54,6 +56,13 @@ test-fuzz = "8.1.1"
 [[bench]]
 name = "hot_paths"
 harness = false
+
+# Fat LTO with a single codegen unit measured ~2-5% faster than the default
+# opt-level 3 and gave a ~33% smaller stripped binary, at roughly twice the
+# release build time. The bench profile inherits these settings.
+[profile.release]
+lto = "fat"
+codegen-units = 1
 
 [profile.bench]
 debug = true

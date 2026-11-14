@@ -2,21 +2,25 @@
 
 #[cfg(feature = "acme")]
 mod acme;
+mod bot;
 mod config;
 #[cfg(feature = "hosting")]
 mod fastcgi;
 #[cfg(feature = "hosting")]
 mod fastcgi_app;
+mod forwarded;
 #[cfg(feature = "hosting")]
 mod handler;
 #[cfg(feature = "http3")]
 mod http3;
 mod httpdate;
+mod ja4;
 #[cfg(feature = "hosting")]
 mod mime;
 mod privileges;
 #[cfg(feature = "proxy")]
 mod proxy;
+mod ratelimit;
 mod reload;
 mod response;
 mod tls;
@@ -51,6 +55,8 @@ use crate::acme::AcmeManager;
 use crate::config::FastCgiAddress;
 use crate::{
     config::{Config, ParseResult},
+    ja4::{ClientHelloInfo, RecordingStream, TlsFingerprint, parse_client_hello},
+    ratelimit::RateLimiter,
     tls::TlsSetup,
     vhost::{Router, TlsSni},
     waf::Waf,
@@ -225,7 +231,16 @@ async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> 
                 .map(|status| StatusCode::from_u16(status).expect("validated ModSecurity status")),
         )?)
     };
-    let router = Router::load(Arc::new(config.clone()), config.config_file.as_ref(), waf).await?;
+    let rate_limit = config
+        .rate_limit
+        .map(|limit| Arc::new(RateLimiter::new(limit)));
+    let router = Router::load(
+        Arc::new(config.clone()),
+        config.config_file.as_ref(),
+        rate_limit,
+        waf,
+    )
+    .await?;
     #[cfg(feature = "acme")]
     let router = {
         let mut router = router;
@@ -390,6 +405,7 @@ async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> 
                         connection_shutdown,
                         alt_svc_port,
                         None,
+                        None,
                     ).await {
                         eprintln!("Connection from {peer} failed: {error}");
                     }
@@ -407,9 +423,17 @@ async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> 
                     .clone();
                 connections.spawn(async move {
                     let _permit = permit;
-                    match timeout(Duration::from_secs(10), acceptor.accept(stream)).await {
+                    let recording = RecordingStream::new(stream);
+                    let captured = recording.captured();
+                    match timeout(Duration::from_secs(10), acceptor.accept(recording)).await {
                         Ok(Ok(stream)) => {
                             let sni = stream.get_ref().1.server_name().map(Arc::<str>::from);
+                            let fingerprint = parse_client_hello(
+                                &captured
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                            )
+                            .map(Arc::new);
                             if let Err(error) = serve_connection(
                                 stream,
                                 peer,
@@ -418,6 +442,7 @@ async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> 
                                 connection_shutdown,
                                 alt_svc_port,
                                 Some(sni),
+                                fingerprint,
                             )
                             .await
                             {
@@ -464,6 +489,7 @@ async fn serve_connection<I>(
     mut shutdown: watch::Receiver<bool>,
     alt_svc_port: Option<u16>,
     sni: Option<Option<Arc<str>>>,
+    fingerprint: Option<Arc<ClientHelloInfo>>,
 ) -> Result<(), Box<dyn Error + Send + Sync>>
 where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -473,10 +499,14 @@ where
     let service = service_fn(move |mut request: Request<hyper::body::Incoming>| {
         let router = Arc::clone(&router);
         let sni = sni.clone();
+        let fingerprint = fingerprint.clone();
         request_seen.send_replace(true);
         async move {
             if let Some(sni) = sni {
                 request.extensions_mut().insert(TlsSni(sni));
+            }
+            if let Some(fingerprint) = fingerprint {
+                request.extensions_mut().insert(TlsFingerprint(fingerprint));
             }
             let mut response = router.dispatch(request, peer, local).await;
             if let Some(port) = alt_svc_port

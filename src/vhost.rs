@@ -19,12 +19,18 @@ use tokio::sync::Mutex;
 use crate::acme::AcmeManager;
 #[cfg(feature = "hosting")]
 use crate::config::FastCgiAddress;
+#[cfg(feature = "proxy")]
+use crate::forwarded::DirectPeer;
 #[cfg(feature = "hosting")]
 use crate::handler;
 #[cfg(feature = "proxy")]
 use crate::proxy::ReverseProxy;
 use crate::{
+    bot::{self, BotAction, BotPolicy, BotPolicyFile, BotState},
     config::{Config, TlsFiles},
+    forwarded,
+    ja4::TlsFingerprint,
+    ratelimit::{RateLimit, RateLimiter},
     response::{self, ResponseBody},
     waf::{RuleIdSpec, Waf},
 };
@@ -65,6 +71,9 @@ struct VhostFile {
     fastcgi_app: Vec<FastCgiAppFile>,
     fastcgi_timeout: Option<u64>,
     worker_threads: Option<usize>,
+    rate_limit: Option<String>,
+    rate_limit_burst: Option<u32>,
+    bot: Option<BotPolicyDeclarationFile>,
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
     #[serde(default)]
@@ -84,6 +93,13 @@ struct VhostFile {
 enum RuleIdFile {
     Integer(u64),
     RangeOrId(String),
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+enum BotPolicyDeclarationFile {
+    String(String),
+    Policy(BotPolicyFile),
 }
 
 impl RuleIdFile {
@@ -115,10 +131,24 @@ struct Vhost {
     acme: bool,
     default: bool,
     waf: Option<Waf>,
+    rate_limit: VhostRateLimit,
+    bot: VhostBot,
     #[cfg(feature = "hosting")]
     worker: Option<Arc<Worker>>,
     #[cfg(feature = "proxy")]
     proxy: Option<Arc<ReverseProxy>>,
+}
+
+enum VhostRateLimit {
+    Inherit,
+    Off,
+    Limit(Arc<RateLimiter>),
+}
+
+enum VhostBot {
+    Inherit,
+    Off,
+    Policy(Arc<BotPolicy>),
 }
 
 pub(crate) struct Router {
@@ -127,6 +157,9 @@ pub(crate) struct Router {
     sources: Mutex<SourceState>,
     dir: Option<PathBuf>,
     waf: Option<Waf>,
+    rate_limit: Option<Arc<RateLimiter>>,
+    bot: Option<Arc<BotPolicy>>,
+    bot_state: Arc<BotState>,
     #[cfg(feature = "acme")]
     acme: Option<AcmeManager>,
 }
@@ -155,8 +188,16 @@ impl Router {
     pub(crate) async fn load(
         fallback: Arc<Config>,
         path: Option<&PathBuf>,
+        rate_limit: Option<Arc<RateLimiter>>,
         waf: Option<Waf>,
     ) -> Result<Self, Box<dyn Error + Send + Sync>> {
+        let bot = fallback
+            .bot
+            .clone()
+            .map(BotPolicy::parse)
+            .transpose()?
+            .map(Arc::new);
+        let bot_state = BotState::new().map_err(io::Error::other)?;
         let current_dir = std::env::current_dir()?;
         let config_dir = if let Some(path) = path {
             let config_dir = path
@@ -190,7 +231,16 @@ impl Router {
                     .map(|dir| resolve_config_path(dir, &config_dir))
             })
             .map(|dir| resolve_config_path(dir, &current_dir));
-        let mut router = Self::from_file(Arc::clone(&fallback), file, &config_dir, waf).await?;
+        let mut router = Self::from_file(
+            Arc::clone(&fallback),
+            file,
+            &config_dir,
+            rate_limit,
+            waf,
+            bot,
+            bot_state,
+        )
+        .await?;
         router.dir = dir;
         if router.dir.is_some() {
             router.reload_dir().await?;
@@ -245,7 +295,10 @@ impl Router {
                     Arc::clone(&self.fallback),
                     file,
                     &std::env::current_dir()?,
+                    self.rate_limit.clone(),
                     self.waf,
+                    self.bot.clone(),
+                    Arc::clone(&self.bot_state),
                 )
                 .await?;
                 router.snapshot().vhosts.clone()
@@ -277,7 +330,10 @@ impl Router {
                         vhost_dir: None,
                     },
                     config_dir,
+                    self.rate_limit.clone(),
                     self.waf,
+                    self.bot.clone(),
+                    Arc::clone(&self.bot_state),
                 )
                 .await?;
                 vhosts.extend(router.snapshot().vhosts.iter().cloned());
@@ -335,7 +391,10 @@ impl Router {
         fallback: Arc<Config>,
         file: FileConfig,
         config_dir: &Path,
+        rate_limit: Option<Arc<RateLimiter>>,
         waf: Option<Waf>,
+        bot: Option<Arc<BotPolicy>>,
+        bot_state: Arc<BotState>,
     ) -> Result<Self, Box<dyn Error + Send + Sync>> {
         validate_vhost_declarations(&file.vhost)?;
         validate_vhost_waf_declarations(&file.vhost, waf.is_some())?;
@@ -344,6 +403,27 @@ impl Router {
         let default = file.vhost.iter().position(|entry| entry.default);
 
         for mut entry in file.vhost {
+            let vhost_rate_limit = match entry.rate_limit.as_deref() {
+                None => VhostRateLimit::Inherit,
+                Some("off") => VhostRateLimit::Off,
+                Some(rate) => VhostRateLimit::Limit(Arc::new(RateLimiter::new(RateLimit::parse(
+                    rate,
+                    entry.rate_limit_burst,
+                )?))),
+            };
+            let vhost_bot = match entry.bot.take() {
+                None => VhostBot::Inherit,
+                Some(BotPolicyDeclarationFile::String(value)) if value == "off" => VhostBot::Off,
+                Some(BotPolicyDeclarationFile::String(value)) => {
+                    return Err(format!(
+                        "vhost bot setting must be `off` or a policy map: {value}"
+                    )
+                    .into());
+                }
+                Some(BotPolicyDeclarationFile::Policy(policy)) => {
+                    VhostBot::Policy(Arc::new(BotPolicy::parse(policy)?))
+                }
+            };
             let block_status = entry
                 .modsecurity_block_status
                 .or(fallback.modsecurity_block_status)
@@ -400,6 +480,8 @@ impl Router {
                     acme: entry.acme.unwrap_or(true),
                     default: entry.default,
                     waf: vhost_waf,
+                    rate_limit: vhost_rate_limit,
+                    bot: vhost_bot,
                     #[cfg(feature = "hosting")]
                     worker: None,
                     #[cfg(feature = "proxy")]
@@ -560,6 +642,8 @@ impl Router {
                     acme: entry.acme.unwrap_or(true),
                     default: entry.default,
                     waf: vhost_waf,
+                    rate_limit: vhost_rate_limit,
+                    bot: vhost_bot,
                     #[cfg(feature = "hosting")]
                     worker: Some(worker),
                     #[cfg(feature = "proxy")]
@@ -582,6 +666,9 @@ impl Router {
             }),
             dir: None,
             waf,
+            rate_limit,
+            bot,
+            bot_state,
             #[cfg(feature = "acme")]
             acme: None,
         })
@@ -644,6 +731,11 @@ impl Router {
         B::Error: Into<Box<dyn Error + Send + Sync>>,
     {
         let mut request = request;
+        let (client, trusted_chain) =
+            forwarded::resolve(peer, request.headers(), &self.fallback.trusted_proxies);
+        forwarded::sanitize(request.headers_mut(), trusted_chain.as_deref());
+        #[cfg(feature = "proxy")]
+        request.extensions_mut().insert(DirectPeer(peer));
         // Routing follows the authority of an absolute request target (or of
         // HTTP/2's `:authority`) in preference to `Host`. Make the header agree
         // before anything inspects it, so that the WAF and the backend see the
@@ -653,6 +745,56 @@ impl Router {
         {
             request.headers_mut().insert(HOST, value);
         }
+        let access_log = self.fallback.access_log.then(|| {
+            (
+                request.method().clone(),
+                request
+                    .uri()
+                    .path_and_query()
+                    .map_or("/", |path_and_query| path_and_query.as_str())
+                    .to_owned(),
+                request.version(),
+                request_host(&request).unwrap_or_default(),
+                request
+                    .headers()
+                    .get("user-agent")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_owned(),
+                request
+                    .extensions()
+                    .get::<TlsFingerprint>()
+                    .map_or_else(|| "-".to_owned(), |fingerprint| fingerprint.0.ja4.clone()),
+            )
+        });
+        let response = self.dispatch_inner(request, client, local).await;
+        if let Some((method, path, version, host, user_agent, ja4)) = access_log {
+            forwarded::log_access(
+                client,
+                peer,
+                &method,
+                &path,
+                version,
+                response.status().as_u16(),
+                &host,
+                &user_agent,
+                &ja4,
+            );
+        }
+        response
+    }
+
+    async fn dispatch_inner<B>(
+        &self,
+        request: Request<B>,
+        peer: SocketAddr,
+        local: SocketAddr,
+    ) -> Response<ResponseBody>
+    where
+        B: Body<Data = Bytes> + Send + 'static,
+        B::Error: Into<Box<dyn Error + Send + Sync>>,
+    {
+        let request = request;
         let table = self.snapshot();
         // Nothing below changes the authority or `Host`, so the host is
         // worked out once and shared by every step that routes on it.
@@ -675,6 +817,70 @@ impl Router {
         let selected = host
             .and_then(|host| Self::select_vhost(&table, host))
             .or(table.default);
+        let rate_limit = match selected {
+            Some(index) => match &table.vhosts[index].rate_limit {
+                VhostRateLimit::Inherit => self.rate_limit.as_ref(),
+                VhostRateLimit::Off => None,
+                VhostRateLimit::Limit(rate_limit) => Some(rate_limit),
+            },
+            None => self.rate_limit.as_ref(),
+        };
+        if let Some(rate_limit) = rate_limit
+            && let Err(retry_after) = rate_limit.check(peer.ip())
+        {
+            return crate::ratelimit::too_many_requests(retry_after);
+        }
+        let bot_policy = match selected {
+            Some(index) => match &table.vhosts[index].bot {
+                VhostBot::Inherit => self.bot.as_ref(),
+                VhostBot::Off => None,
+                VhostBot::Policy(policy) => Some(policy),
+            },
+            None => self.bot.as_ref(),
+        };
+        if let Some(policy) = bot_policy {
+            let tls = request.extensions().get::<TlsSni>().is_some();
+            if request.uri().path() == bot::CHALLENGE_PATH {
+                if request.method() != http::Method::GET {
+                    return response::error_response(
+                        StatusCode::FORBIDDEN,
+                        "Invalid bot challenge\n",
+                    );
+                }
+                let (difficulty, ttl) = policy.challenge_parameters();
+                return response::bot_response(
+                    self.bot_state
+                        .solve_challenge(&request, peer, tls, difficulty, ttl),
+                );
+            }
+            let fingerprint = request
+                .extensions()
+                .get::<TlsFingerprint>()
+                .map(|fingerprint| fingerprint.0.as_ref());
+            let verdict = bot::evaluate(policy, &self.bot_state, &request, peer, fingerprint).await;
+            if verdict.action != BotAction::Allow {
+                eprintln!(
+                    "bot detection: client={peer} score={} action={:?} reasons={:?}",
+                    verdict.score, verdict.action, verdict.reasons
+                );
+            }
+            match verdict.action {
+                BotAction::Allow | BotAction::Log => {}
+                BotAction::Block => {
+                    return response::error_response(StatusCode::FORBIDDEN, "Forbidden\n");
+                }
+                BotAction::Challenge
+                    if self
+                        .bot_state
+                        .has_valid_cookie(request.headers(), peer.ip()) => {}
+                BotAction::Challenge => {
+                    let (difficulty, ttl) = policy.challenge_parameters();
+                    return response::bot_response(
+                        self.bot_state.challenge(&request, peer, difficulty, ttl),
+                    );
+                }
+            }
+        }
         let waf = selected
             .and_then(|index| table.vhosts[index].waf)
             .or(self.waf);
@@ -740,7 +946,11 @@ impl Router {
         #[cfg(feature = "proxy")]
         if let Some(proxy) = &vhost.proxy {
             let tls = request.extensions().get::<TlsSni>().is_some();
-            let response = proxy.forward(request, peer, tls).await;
+            let direct_peer = request
+                .extensions()
+                .get::<DirectPeer>()
+                .map_or(peer, |direct_peer| direct_peer.0);
+            let response = proxy.forward(request, direct_peer, tls).await;
             let (parts, body) = response.into_parts();
             return Response::from_parts(parts, response::coalesce_ready_body(body));
         }
@@ -952,6 +1162,42 @@ fn validate_vhost_declarations<'a>(
         if let Some(threads) = entry.worker_threads {
             crate::config::parse_thread_count(&threads.to_string())
                 .map_err(|error| format!("vhost {} worker_threads: {error}", index + 1))?;
+        }
+        match entry.rate_limit.as_deref() {
+            Some("off") => {
+                if entry.rate_limit_burst.is_some() {
+                    return Err(format!(
+                        "vhost {} rate_limit_burst cannot be used with rate_limit: off",
+                        index + 1
+                    )
+                    .into());
+                }
+            }
+            Some(rate) => {
+                RateLimit::parse(rate, entry.rate_limit_burst)
+                    .map_err(|error| format!("vhost {} rate_limit: {error}", index + 1))?;
+            }
+            None if entry.rate_limit_burst.is_some() => {
+                return Err(
+                    format!("vhost {} rate_limit_burst requires rate_limit", index + 1).into(),
+                );
+            }
+            None => {}
+        }
+        match &entry.bot {
+            Some(BotPolicyDeclarationFile::String(value)) if value == "off" => {}
+            Some(BotPolicyDeclarationFile::String(value)) => {
+                return Err(format!(
+                    "vhost {} bot setting must be `off` or a policy map: {value}",
+                    index + 1
+                )
+                .into());
+            }
+            Some(BotPolicyDeclarationFile::Policy(policy)) => {
+                BotPolicy::parse(policy.clone())
+                    .map_err(|error| format!("vhost {} bot: {error}", index + 1))?;
+            }
+            None => {}
         }
         if let Some(status) = entry.modsecurity_block_status {
             crate::config::parse_modsecurity_block_status(&status.to_string()).map_err(
@@ -1196,6 +1442,9 @@ mod tests {
             fastcgi_app: Vec::new(),
             fastcgi_timeout: None,
             worker_threads: None,
+            rate_limit: None,
+            rate_limit_burst: None,
+            bot: None,
             tls_cert: None,
             tls_key: None,
             default: is_default,
@@ -1283,6 +1532,43 @@ mod tests {
             entry.worker_threads = Some(invalid);
             assert!(validate_vhost_declarations(std::slice::from_ref(&entry)).is_err());
         }
+    }
+
+    #[test]
+    fn validates_vhost_rate_limit_settings() {
+        let parsed: FileConfig = serde_yaml_ng::from_str(
+            r#"
+                vhost:
+                  - server_names: [limit.example]
+                    root: /tmp/site
+                    user: user
+                    rate_limit: "10/s"
+                    rate_limit_burst: 20
+            "#,
+        )
+        .unwrap();
+        assert_eq!(parsed.vhost[0].rate_limit.as_deref(), Some("10/s"));
+        assert_eq!(parsed.vhost[0].rate_limit_burst, Some(20));
+        assert!(validate_vhost_declarations(&parsed.vhost).is_ok());
+
+        let mut entry = declaration(&["limit.example"], false);
+        entry.rate_limit = Some("10/s".to_owned());
+        assert!(validate_vhost_declarations(std::slice::from_ref(&entry)).is_ok());
+
+        entry.rate_limit_burst = Some(20);
+        assert!(validate_vhost_declarations(std::slice::from_ref(&entry)).is_ok());
+
+        entry.rate_limit = Some("off".to_owned());
+        assert!(validate_vhost_declarations(std::slice::from_ref(&entry)).is_err());
+        entry.rate_limit_burst = None;
+        assert!(validate_vhost_declarations(std::slice::from_ref(&entry)).is_ok());
+
+        entry.rate_limit = Some("invalid".to_owned());
+        assert!(validate_vhost_declarations(std::slice::from_ref(&entry)).is_err());
+        entry.rate_limit = None;
+        assert!(validate_vhost_declarations(std::slice::from_ref(&entry)).is_ok());
+        entry.rate_limit_burst = Some(1);
+        assert!(validate_vhost_declarations(std::slice::from_ref(&entry)).is_err());
     }
 
     #[test]
@@ -1430,6 +1716,40 @@ mod tests {
             .expect("example virtual host declarations should be valid");
         assert_eq!(entries[2].fastcgi_app.len(), 2);
         assert_eq!(parsed.vhost_dir.as_deref(), Some(Path::new("vhosts.d")));
+    }
+
+    #[test]
+    fn parses_and_validates_vhost_bot_modes() {
+        let off: FileConfig = serde_yaml_ng::from_str(
+            "vhost:\n  - server_names: [off.example]\n    root: /srv/off\n    user: site\n    bot: off\n",
+        )
+        .unwrap();
+        validate_vhost_declarations(&off.vhost).unwrap();
+        assert!(matches!(
+            off.vhost[0].bot,
+            Some(super::BotPolicyDeclarationFile::String(ref value)) if value == "off"
+        ));
+
+        let policy: FileConfig = serde_yaml_ng::from_str(
+            "vhost:\n  - server_names: [policy.example]\n    root: /srv/policy\n    user: site\n    bot:\n      mode: log\n      verify_crawlers: false\n",
+        )
+        .unwrap();
+        validate_vhost_declarations(&policy.vhost).unwrap();
+        assert!(matches!(
+            policy.vhost[0].bot,
+            Some(super::BotPolicyDeclarationFile::Policy(_))
+        ));
+
+        let invalid: FileConfig = serde_yaml_ng::from_str(
+            "vhost:\n  - server_names: [invalid.example]\n    root: /srv/invalid\n    user: site\n    bot:\n      challenge_threshold: 90\n      block_threshold: 80\n",
+        )
+        .unwrap();
+        assert!(validate_vhost_declarations(&invalid.vhost).is_err());
+        let invalid_mode: FileConfig = serde_yaml_ng::from_str(
+            "vhost:\n  - server_names: [unknown.example]\n    root: /srv/unknown\n    user: site\n    bot: enabled\n"
+        )
+        .unwrap();
+        assert!(validate_vhost_declarations(&invalid_mode.vhost).is_err());
     }
 
     #[test]
@@ -1661,7 +1981,7 @@ mod tests {
         let (peer, local) = fuzz_support::addresses();
         let method = request.method().clone();
         let collected = fuzz_support::collect(async {
-            let router = Router::load(Arc::new(config), None, None)
+            let router = Router::load(Arc::new(config), None, None, None)
                 .await
                 .expect("fallback router loads");
             router.dispatch(request, peer, local).await
@@ -1693,6 +2013,8 @@ mod tests {
                 acme: false,
                 default,
                 waf: None,
+                rate_limit: super::VhostRateLimit::Inherit,
+                bot: super::VhostBot::Inherit,
                 worker: Some(Arc::new(Worker {
                     uid: 0,
                     gid: 0,
