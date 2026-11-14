@@ -11,7 +11,7 @@ use ring::{
     hmac,
     rand::{SecureRandom, SystemRandom},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 
 use crate::{forwarded::TrustedProxy, ja4::ClientHelloInfo};
@@ -22,7 +22,7 @@ pub(crate) const CHALLENGE_PATH: &str = "/.well-known/charlotte-bot-challenge";
 const BOT_COOKIE: &str = "charlotte_bot";
 const SHA256_JS: &str = r#"const sha256K=[],sha256H=[];function sha256(input){if(!sha256K.length){const marked={};for(let candidate=2,n=0;n<64;candidate++){if(!marked[candidate]){for(let multiple=candidate*candidate;multiple<313;multiple+=candidate)marked[multiple]=true;if(n<8)sha256H[n]=(Math.sqrt(candidate)%1*4294967296)|0;sha256K[n]=(Math.pow(candidate,1/3)%1*4294967296)|0;n++}}}const bitLength=input.length*8;input+='\x80';while(input.length%64!==56)input+='\x00';const words=[];for(let i=0;i<input.length;i++)words[i>>2]=(words[i>>2]||0)|(input.charCodeAt(i)<<(24-(i%4)*8));words.push((bitLength/4294967296)|0,bitLength|0);const hash=sha256H.slice(),rotate=(x,n)=>(x>>>n)|(x<<(32-n));for(let offset=0;offset<words.length;offset+=16){const schedule=words.slice(offset,offset+16);for(let i=16;i<64;i++){const x=schedule[i-15],y=schedule[i-2],s0=rotate(x,7)^rotate(x,18)^(x>>>3),s1=rotate(y,17)^rotate(y,19)^(y>>>10);schedule[i]=(schedule[i-16]+s0+schedule[i-7]+s1)|0}let[a,b,c,d,e,f,g,h]=hash;for(let i=0;i<64;i++){const s1=rotate(e,6)^rotate(e,11)^rotate(e,25),choice=(e&f)^(~e&g),t1=(h+s1+choice+sha256K[i]+schedule[i])|0,s0=rotate(a,2)^rotate(a,13)^rotate(a,22),majority=(a&b)^(a&c)^(b&c),t2=(s0+majority)|0;h=g;g=f;f=e;e=(d+t1)|0;d=c;c=b;b=a;a=(t1+t2)|0}hash[0]=(hash[0]+a)|0;hash[1]=(hash[1]+b)|0;hash[2]=(hash[2]+c)|0;hash[3]=(hash[3]+d)|0;hash[4]=(hash[4]+e)|0;hash[5]=(hash[5]+f)|0;hash[6]=(hash[6]+g)|0;hash[7]=(hash[7]+h)|0}return hash.map(value=>(value>>>0).toString(16).padStart(8,'0')).join('')}"#;
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum BotMode {
     #[default]
@@ -31,7 +31,7 @@ pub(crate) enum BotMode {
     Off,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct BotPolicyFile {
     #[serde(default)]

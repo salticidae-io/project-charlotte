@@ -211,6 +211,7 @@ pub(crate) fn fuzz_config(root: PathBuf) -> Config {
         root,
         config_file: None,
         vhost_dir: None,
+        control_socket: None,
         index: "index.html".to_owned(),
         listing: true,
         try_files: Vec::new(),

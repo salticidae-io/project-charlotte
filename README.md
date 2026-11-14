@@ -116,6 +116,7 @@ see all command-line options. Common options include:
 | `--try-files ENTRY` | Add a candidate or fallback rule; may be specified more than once. |
 | `--config FILE` | Load virtual-host declarations from a YAML file. |
 | `--vhost-dir DIRECTORY` | Load and watch additional `.yaml` and `.yml` virtual-host files in a directory. |
+| `--control-socket PATH` | Serve the local HTTP configuration API on a Unix socket. |
 | `--tls-bind ADDRESS` | Listen for HTTPS; configure a certificate with `--tls-cert` and `--tls-key`, or use eligible ACME virtual hosts. |
 | `--http3-bind ADDRESS` | Enable the HTTP/3 listener; TLS configuration is required. |
 | `--rate-limit RATE` | Apply a per-client request limit such as `20/s`, `600/m`, or `36000/h`; disabled by default. |
@@ -146,6 +147,41 @@ append `X-Forwarded-For`; trusting arbitrary clients lets them spoof their
 address for rate limiting and access logs. `--access-log` writes the resolved
 client address and direct peer address, request line, status, host, and user
 agent to stdout; quotes, backslashes, and control characters are escaped.
+
+### Configuration socket
+
+`--control-socket /run/charlotte/control.sock` enables a local HTTP/1.1 JSON
+API for the vhost directory. The socket is created with mode `0600`; its parent
+directory must already exist, be writable by the server's effective account
+(after any privilege drop), and not be writable by untrusted users. `GET /vhosts`
+lists directory-backed vhosts and read-only vhosts from the main config, while
+`GET /vhosts/{name}` returns the YAML entries as JSON.
+Names are limited to 64 ASCII letters, digits, dots, underscores, and hyphens,
+and must begin with a letter, digit, underscore, or hyphen.
+
+`POST /vhosts/{name}` creates a file, `PUT` creates or replaces it, and
+`DELETE` removes it. Mutations require `--vhost-dir`; main-config vhosts are
+read-only. A request body is one vhost mapping in JSON or YAML. Charlotte
+validates the change against the complete vhost configuration, including
+duplicate names and worker setup, before atomically writing a mode-`0640` YAML
+file and switching the running router. Invalid changes leave both the file and
+the active configuration unchanged. `GET /status` reports uptime, vhost count,
+and version; it is the read-only starting point for future server statistics.
+
+```sh
+curl --unix-socket /run/charlotte/control.sock http://localhost/vhosts
+curl --unix-socket /run/charlotte/control.sock \
+  -X PUT -H 'Content-Type: application/json' \
+  --data '{"server_names":["www.example.com"],"root":"/srv/www/example","user":"www-example"}' \
+  http://localhost/vhosts/example
+curl --unix-socket /run/charlotte/control.sock \
+  -X DELETE http://localhost/vhosts/example
+```
+
+The API uses `201` for a successful create, `200` for a successful get or
+replace, and `204` for delete. Invalid requests return `400`, missing vhosts
+`404`, create conflicts `409`, oversized bodies `413`, and unavailable mutation
+storage `503`.
 
 ### Bot detection
 
