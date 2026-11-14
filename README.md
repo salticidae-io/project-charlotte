@@ -224,7 +224,9 @@ The equivalent vhost setting is `cgi: [cgi, "py=/usr/bin/python3"]`. CGI
 scripts are resolved under the document root, run as the server or vhost
 worker's user, and receive CGI request variables plus the request body on
 standard input. Their response headers are parsed as CGI headers and stdout is
-streamed to the client.
+streamed to the client. CGI and FastCGI applications can set the response
+status with a `Status: CODE` header or a leading NPH `HTTP/1.0`, `HTTP/1.1`,
+`HTTP/2`, or `HTTP/3` status line; final statuses must be in the 200–599 range.
 
 The master normally keeps the identity of the account that starts it. To start
 as root and run the master as an unprivileged account, use `--user` and
