@@ -1150,6 +1150,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
+name = "libmodsecurity3-rs"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "701b1d3489fdae7581b9b918e6b8c820225a73f8fecac8c34cfe1de852f081fc"
+
+[[package]]
 name = "lock_api"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1193,11 +1199,6 @@ dependencies = [
  "wasi",
  "windows-sys 0.61.2",
 ]
-
-[[package]]
-name = "modsecurity-rs"
-version = "0.1.0"
-source = "git+https://github.com/fzylogic/modsecurity-rs#b445b2b8de9ea7680b304d36e4c5f60e0a038a7b"
 
 [[package]]
 name = "nix"
@@ -1411,7 +1412,7 @@ dependencies = [
  "hyper-rustls",
  "hyper-util",
  "instant-acme",
- "modsecurity-rs",
+ "libmodsecurity3-rs",
  "nix",
  "notify",
  "quinn",
