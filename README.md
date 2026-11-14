@@ -118,6 +118,12 @@ see all command-line options. Common options include:
 | `--vhost-dir DIRECTORY` | Load and watch additional `.yaml` and `.yml` virtual-host files in a directory. |
 | `--tls-bind ADDRESS` | Listen for HTTPS; configure a certificate with `--tls-cert` and `--tls-key`, or use eligible ACME virtual hosts. |
 | `--http3-bind ADDRESS` | Enable the HTTP/3 listener; TLS configuration is required. |
+| `--rate-limit RATE` | Apply a per-client request limit such as `20/s`, `600/m`, or `36000/h`; disabled by default. |
+| `--rate-limit-burst N` | Set the allowed burst; requires `--rate-limit` and defaults to the rate rounded up per second. |
+| `--trusted-proxy CIDR` | Trust a proxy address or network when resolving `X-Forwarded-For`; repeatable and empty by default. |
+| `--access-log` | Write one access-log record per request to stdout. |
+| `--bot-detection` | Enable the built-in bot policy in enforcing mode. |
+| `--bot-config FILE` | Load bot-detection settings from YAML; enables detection and overrides the defaults. |
 | `--fastcgi EXT=ADDR` | Route a file extension to a FastCGI TCP or Unix-socket backend. |
 | `--cgi EXT[=INTERPRETER]` | Execute matching scripts directly or with an interpreter; repeatable. |
 | `--fastcgi-app EXT=PROGRAM` | Start and supervise a FastCGI application for an extension. |
@@ -126,6 +132,52 @@ see all command-line options. Common options include:
 | `--modsecurity-rules FILE` | Load ModSecurity rules; can be repeated to load multiple files. |
 | `--modsecurity-block-status CODE` | Override the status for ModSecurity blocking interventions (400–599; defaults to the rule status or 403). |
 | `--acme-directory URL --acme-cache DIR` | Configure ACME certificate provisioning and its cache. |
+
+Rate limits return `429 Too Many Requests` with a `Retry-After` header. The
+client key is the socket peer IP unless that peer matches a configured
+`--trusted-proxy` address or CIDR; in that case Charlotte resolves the client
+from the rightmost untrusted `X-Forwarded-For` hop. IPv4 addresses are tracked
+individually and IPv6 addresses are grouped by `/64`.
+
+Charlotte strips `X-Forwarded-For` from requests received from untrusted peers.
+For a trusted proxy, it keeps a normalized IP-only chain and appends the direct
+peer IP when proxying upstream. Configure only proxies that overwrite or safely
+append `X-Forwarded-For`; trusting arbitrary clients lets them spoof their
+address for rate limiting and access logs. `--access-log` writes the resolved
+client address and direct peer address, request line, status, host, and user
+agent to stdout; quotes, backslashes, and control characters are escaped.
+
+### Bot detection
+
+Bot detection is disabled unless `--bot-detection` or `--bot-config` is used.
+The built-in policy scores user-agent, browser-header, and (for TCP TLS)
+ClientHello/JA4 signals; scanner signatures are blocked, and intermediate
+scores receive a proof-of-work challenge. Claimed search-engine crawlers are
+verified with reverse and forward DNS by default. HTTP/3 and plaintext
+connections do not have a JA4 fingerprint.
+
+Use `mode: log` in a policy file to observe scores without enforcing them, or
+configure exceptions for health checks and API clients. A bot policy accepts
+`challenge_threshold` (40), `block_threshold` (80), `challenge_difficulty`
+(16 bits), `challenge_ttl` (seconds), `allow_ips`, `deny_ips`,
+`allow_user_agents`, `deny_user_agents`, `builtin_rules`, `honeypot_paths`,
+`honeypot_ban`, `exempt_paths`, `verify_crawlers`, `ja4_allow`, and `ja4_deny`.
+The challenge cookie is HMAC-signed and bound to the client IPv4 `/24` or IPv6
+`/64`; HTTPS responses mark it `Secure`.
+
+```yaml
+mode: log
+challenge_threshold: 40
+block_threshold: 80
+allow_ips: [192.0.2.0/24]
+exempt_paths: [/health, /api/]
+verify_crawlers: true
+```
+
+Per-vhost YAML can inherit the global policy, disable it with `bot: off`, or
+provide its own policy map. Since automation clients such as `curl` can be
+legitimate health checks, begin with log mode and explicitly allow trusted
+clients before enforcing.
 
 ### OWASP Core Rule Set
 
@@ -203,7 +255,14 @@ vhost:
     group: www-data
     index: index.html
     listing: false
+    rate_limit: "20/s"
+    rate_limit_burst: 40
 ```
+
+Virtual hosts without `rate_limit` inherit the global CLI limit. Set
+`rate_limit: off` to exempt a host, or give it a rate such as `20/s` to create
+an independent per-host bucket; `rate_limit_burst` is optional and defaults to
+the rate rounded up per second.
 
 Worker-backed hosts require a document root and worker user. A host configured
 with `proxy_pass` is served directly by the master and does not need `root` or

@@ -709,7 +709,7 @@ mod tests {
             .query()
             .is_some_and(|query| query.split('&').any(|pair| pair == "block=yes"));
         let collected = fuzz_support::collect(async {
-            let router = Router::load(Arc::new(config), None, Some(fuzz_waf()))
+            let router = Router::load(Arc::new(config), None, None, Some(fuzz_waf()))
                 .await
                 .expect("WAF router loads");
             router.dispatch(request, peer, local).await
@@ -785,7 +785,9 @@ mod tests {
             .unwrap();
             let config = Arc::clone(&config);
             let collected = fuzz_support::collect(async {
-                let router = Router::load(config, None, Some(fuzz_waf())).await.unwrap();
+                let router = Router::load(config, None, None, Some(fuzz_waf()))
+                    .await
+                    .unwrap();
                 router.dispatch(request, peer, local).await
             });
             assert_eq!(

@@ -5,8 +5,10 @@ use std::{
     io,
     net::SocketAddr,
     path::{Component, Path, PathBuf},
+    pin::Pin,
     process::Stdio,
     sync::Arc,
+    task::{Context, Poll},
     time::Duration,
 };
 
@@ -19,6 +21,7 @@ use http_body_util::{BodyExt, BodyStream, Limited, StreamBody};
 use tokio::{
     io::{
         AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter,
+        ReadBuf,
     },
     net::TcpStream,
     process::{Child, ChildStdout, Command},
@@ -32,6 +35,9 @@ use crate::{
 
 const MAX_REQUEST_BODY: usize = 16 * 1024 * 1024;
 const MAX_CGI_HEADER: usize = 64 * 1024;
+const FASTCGI_HEADER_LEN: usize = 8;
+const FASTCGI_END_REQUEST: u8 = 3;
+const FASTCGI_END_REQUEST_CONTENT_LEN: usize = 8;
 
 pub struct ResolvedScript {
     path: PathBuf,
@@ -666,6 +672,114 @@ fn is_cgi_excluded_header(name: &HeaderName, connection_headers: &HashSet<String
         || connection_headers.contains(name.as_str())
 }
 
+struct RecordGuard<S> {
+    inner: S,
+    header: [u8; FASTCGI_HEADER_LEN],
+    header_read: usize,
+    header_offset: usize,
+    record_remaining: usize,
+}
+
+impl<S> RecordGuard<S> {
+    fn new(inner: S) -> Self {
+        Self {
+            inner,
+            header: [0; FASTCGI_HEADER_LEN],
+            header_read: 0,
+            header_offset: 0,
+            record_remaining: 0,
+        }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for RecordGuard<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+
+        loop {
+            if this.header_read == FASTCGI_HEADER_LEN {
+                let count = buf.remaining().min(FASTCGI_HEADER_LEN - this.header_offset);
+                buf.put_slice(&this.header[this.header_offset..this.header_offset + count]);
+                this.header_offset += count;
+                if this.header_offset == FASTCGI_HEADER_LEN {
+                    this.header_read = 0;
+                    this.header_offset = 0;
+                }
+                return Poll::Ready(Ok(()));
+            }
+
+            if this.record_remaining > 0 {
+                let count = buf.remaining().min(this.record_remaining);
+                let read = {
+                    let mut limited = ReadBuf::new(buf.initialize_unfilled_to(count));
+                    match Pin::new(&mut this.inner).poll_read(cx, &mut limited) {
+                        Poll::Ready(Ok(())) => limited.filled().len(),
+                        Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                        Poll::Pending => return Poll::Pending,
+                    }
+                };
+                if read == 0 {
+                    return Poll::Ready(Ok(()));
+                }
+                this.record_remaining -= read;
+                buf.advance(read);
+                return Poll::Ready(Ok(()));
+            }
+
+            let read = {
+                let start = this.header_read;
+                let mut header = ReadBuf::new(&mut this.header[start..]);
+                match Pin::new(&mut this.inner).poll_read(cx, &mut header) {
+                    Poll::Ready(Ok(())) => header.filled().len(),
+                    Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                    Poll::Pending => return Poll::Pending,
+                }
+            };
+            if read == 0 {
+                return Poll::Ready(Ok(()));
+            }
+            this.header_read += read;
+            if this.header_read == FASTCGI_HEADER_LEN {
+                let content_len = usize::from(u16::from_be_bytes([this.header[4], this.header[5]]));
+                if this.header[1] == FASTCGI_END_REQUEST
+                    && content_len < FASTCGI_END_REQUEST_CONTENT_LEN
+                {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "FastCGI END_REQUEST record content is shorter than 8 bytes",
+                    )));
+                }
+                this.record_remaining = content_len + usize::from(this.header[6]);
+            }
+        }
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for RecordGuard<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
 async fn execute<S>(
     stream: S,
     params: Params<'_>,
@@ -675,7 +789,10 @@ async fn execute<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let client = Client::new_tokio(BufWriter::with_capacity(64 * 1024, stream));
+    let client = Client::new_tokio(BufWriter::with_capacity(
+        64 * 1024,
+        RecordGuard::new(stream),
+    ));
     let stdin = tokio::io::BufReader::new(std::io::Cursor::new(request_body));
     let request = FastCgiRequest::new_tokio(params, stdin);
     let mut output = client
@@ -881,7 +998,7 @@ fn log_stderr(bytes: &[u8]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_params, execute, parse_cgi_headers, resolve_script};
+    use super::{RecordGuard, build_params, execute, parse_cgi_headers, resolve_script};
     use crate::{
         config::{Config, FastCgiAddress, FastCgiBackend},
         fuzz_support::{self, FuzzRequest},
@@ -920,6 +1037,10 @@ mod tests {
             fastcgi_timeout: Duration::from_secs(60),
             threads: None,
             worker_threads: 2,
+            rate_limit: None,
+            trusted_proxies: Vec::new(),
+            access_log: false,
+            bot: None,
             modsecurity_rules: Vec::new(),
             modsecurity_block_status: None,
             modsecurity_body_limit: 16 * 1024 * 1024,
@@ -1302,7 +1423,20 @@ mod tests {
         fastcgi_backend_stream(b"a=1".to_vec(), well_formed);
         fastcgi_backend_stream(Vec::new(), truncated);
         fastcgi_backend_stream(Vec::new(), vec![1, 6, 0, 1, 0xff, 0xff, 0xff, 0]);
+        fastcgi_backend_stream(Vec::new(), vec![1, 3, 0, 1, 0, 0, 0, 0]);
         fastcgi_backend_stream(Vec::new(), Vec::new());
+    }
+
+    #[tokio::test]
+    async fn record_guard_rejects_short_end_request() {
+        let (client, mut backend) = tokio::io::duplex(16);
+        backend.write_all(&[1, 3, 0, 1, 0, 0, 0, 0]).await.unwrap();
+        let mut guarded = RecordGuard::new(client);
+        let mut record = [0; 8];
+
+        let error = guarded.read(&mut record).await.unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     }
 
     async fn write_records<W>(writer: &mut W, record_type: u8, content: &[u8])

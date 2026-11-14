@@ -20,10 +20,10 @@ server:
 | `acme` | `acme`; `instant-acme`, `x509-parser`. |
 | `http3` | `http3`; `quinn`, `h3`, `h3-quinn`. |
 
-`main`, `config`, `vhost`, `response`, `waf`, `tls`, `reload`, `privileges`,
-and `httpdate` are in every build. `Config` and the virtual-host declarations
-keep the same shape whichever features are enabled: `Config::parse` and
-virtual-host validation refuse what belongs to a feature that was left out and
+`main`, `config`, `forwarded`, `vhost`, `response`, `waf`, `tls`, `reload`,
+`privileges`, and `httpdate` are in every build. `Config` and the virtual-host
+declarations keep the same shape whichever features are enabled: `Config::parse`
+and virtual-host validation refuse what belongs to a feature that was left out and
 name that feature. Without `hosting` there are no worker processes and no
 fallback site, so a request that matches no virtual host is answered `404`,
 and a master that drops to `--user` retains no capability to change user IDs.
@@ -54,14 +54,18 @@ the same router.
 The request path is:
 
 1. The master accepts a TCP connection, or the HTTP/3 endpoint accepts a QUIC
-   connection. For TLS connections, the handshake obtains the SNI name and
-   selects a certificate.
-2. `Router::dispatch` checks for a matching ACME HTTP-01 challenge first. On
-   plaintext requests with a host, it may also start certificate provisioning
-   in the background.
+   connection. For TCP TLS connections, a bounded recorder captures the
+   ClientHello for JA4 while the handshake obtains SNI and selects a
+   certificate.
+2. `Router::dispatch` resolves the client address from `X-Forwarded-For` only
+   when the socket peer matches a configured trusted-proxy CIDR; otherwise it
+   removes the header. On plaintext requests with a host, it may also start
+   certificate provisioning in the background.
 3. The router selects a virtual host from the request authority, falling back
-   to the default host when configured. It applies that host's WAF, or the
-   global WAF, before normal routing.
+   to the default host when configured. It applies the vhost rate limit or the
+   global rate limit, then the effective bot policy, then that host's WAF or
+   the global WAF, before routing. The challenge endpoint is served by the
+   master and ACME challenges are handled before these checks.
 4. Routing checks that a TLS request's SNI and HTTP authority select the same
    virtual host. A mismatch is rejected with `421 Misdirected Request`.
    Proxy virtual hosts forward directly from the master. Worker-backed hosts
@@ -75,13 +79,32 @@ The request path is:
    enabled for TCP traffic, the master also advertises its endpoint with an
    `Alt-Svc` header.
 
+Rate limiting is optional and runs in `Router::dispatch`, so it covers TCP and
+QUIC requests across HTTP/1, HTTP/2, and HTTP/3. ACME challenge responses are
+handled first. A vhost can inherit the global limiter, replace it with an
+independent limiter, or disable rate limiting. Buckets use the resolved client
+IP (IPv6 grouped by `/64`) when the direct peer is trusted, otherwise the
+socket peer IP. The limiter uses bounded, sharded in-memory state and returns
+`429` with `Retry-After`. With `--access-log`, each completed request logs the
+resolved client and direct peer addresses along with the request and response
+status.
+
+Bot detection is opt-in through `--bot-detection` or `--bot-config`. Global
+policy is inherited by vhosts unless they specify `bot: off` or a policy map.
+The master scores request and JA4/header signals, verifies claimed crawler IPs
+with cached reverse/forward DNS, and applies log, challenge, or block actions.
+Challenge and crawler caches are bounded; DNS concurrency is limited, and
+proof-of-work cookies are signed and scoped to the client's `/24` or `/64`
+prefix. JA4 is available for captured TCP ClientHello messages, not plaintext
+or HTTP/3.
+
 ## Virtual-host workers
 
 Each worker-backed virtual host has a worker that runs the same executable in
 `--worker` mode. The process is started on the first request and reused while
 its connection remains healthy. The router connects to it through a Unix
 socket pair; the private connection uses HTTP/2 and is not a public listener.
-Before forwarding, the master records the original peer and local socket
+Before forwarding, the master records the resolved client and local socket
 addresses and HTTP version in internal `x-charlotte-*` headers, and converts
 the request URI to an absolute form for the internal request. The worker
 validates and removes that metadata, restores the original URI and version,
@@ -100,7 +123,11 @@ Hyper client negotiates HTTP/1.1 or HTTP/2 with HTTPS upstreams using ALPN.
 TCP HTTP/1.1, HTTP/2, and QUIC HTTP/3 clients all use this same routing path.
 Request and response bodies are streamed, hop-by-hop headers (including
 headers named by `Connection`) are removed, and the proxy sets
-`X-Forwarded-For`, `X-Forwarded-Proto`, and `X-Forwarded-Host`. HTTPS upstreams
+`X-Forwarded-For`, `X-Forwarded-Proto`, and `X-Forwarded-Host`. An incoming
+`X-Forwarded-For` chain is retained only when the direct peer matches a
+configured `--trusted-proxy` address or CIDR; otherwise the header is removed.
+The upstream chain contains normalized IP addresses and the direct peer IP,
+without socket ports. HTTPS upstreams
 use system roots by default or a configured PEM CA bundle. Header acquisition
 has a configurable timeout; WebSocket/Upgrade and CONNECT tunnelling are not
 implemented.
@@ -171,6 +198,8 @@ cleanup is handled when their router-owned handles are dropped.
 | `fastcgi_app` | Lifecycle management for FastCGI applications started by the server. |
 | `proxy` | Pooled HTTP/HTTPS upstream clients and reverse-proxy header/body handling. |
 | `waf` | ModSecurity rule loading and request/response inspection. |
+| `ratelimit` | Bounded per-client GCRA request buckets and `429` responses. |
+| `forwarded` | Trusted-proxy CIDR matching, XFF resolution/sanitization, and optional access logging. |
 | `tls` | Rustls configuration, static certificates, and SNI certificate selection. |
 | `acme` | ACME account, HTTP-01 challenges, certificate cache, and renewal. |
 | `http3` | QUIC and HTTP/3 connection handling, forwarding requests to the router. |

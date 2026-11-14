@@ -51,15 +51,19 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Self {
-        Self::new_with_http3_only(false).await
+        Self::new_with_options(false, false).await
     }
 
     #[cfg(feature = "http3")]
     async fn new_http3_only() -> Self {
-        Self::new_with_http3_only(true).await
+        Self::new_with_options(true, false).await
     }
 
-    async fn new_with_http3_only(http3_only: bool) -> Self {
+    async fn new_trusted_proxy() -> Self {
+        Self::new_with_options(false, true).await
+    }
+
+    async fn new_with_options(http3_only: bool, trust_loopback_proxy: bool) -> Self {
         let serial_guard = TEST_LOCK.lock().await;
         let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
@@ -138,6 +142,9 @@ impl Fixture {
             .arg(&key_path)
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        if trust_loopback_proxy {
+            command.arg("--trusted-proxy").arg("127.0.0.1");
+        }
         let server = common::spawn(&mut command).unwrap();
 
         let mut fixture = Self {
@@ -221,6 +228,7 @@ async fn proxies_http1_http2_http3_and_handles_upstream_failures() {
         &[
             ("connection", "close, x-drop"),
             ("x-drop", "secret"),
+            ("x-forwarded-for", "203.0.113.9"),
             ("x-custom", "forwarded"),
         ],
         b"posted body",
@@ -294,6 +302,23 @@ async fn proxies_http1_http2_http3_and_handles_upstream_failures() {
     )
     .await;
     assert_eq!(response.status, StatusCode::BAD_GATEWAY.as_u16());
+}
+
+#[tokio::test]
+async fn preserves_forwarded_chain_only_from_trusted_proxy() {
+    let fixture = Fixture::new_trusted_proxy().await;
+    let response = http1_request(
+        fixture.http_address,
+        "GET",
+        "/xff",
+        "plain.example.test",
+        &[("x-forwarded-for", "203.0.113.9")],
+        b"",
+    )
+    .await;
+    assert_eq!(response.status, 200);
+    let body = String::from_utf8(response.body).unwrap();
+    assert!(body.contains("xff=203.0.113.9, 127.0.0.1"), "{body}");
 }
 
 #[cfg(feature = "http3")]
