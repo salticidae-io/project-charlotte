@@ -2215,6 +2215,11 @@ mod tests {
         {
             return;
         }
+        // Vhost roots are resolved against the config directory before the
+        // master builds worker arguments, so an empty root is unreachable.
+        if root.is_empty() {
+            return;
+        }
         let mut backends = Vec::new();
         for value in &fastcgi {
             let Ok(backend) = parse_fastcgi_backend(value) else {
@@ -2317,6 +2322,15 @@ mod tests {
             Vec::new(),
             1,
             "--help".to_owned(),
+        );
+        worker_args(
+            "index.php".to_owned(),
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            1,
+            String::new(),
         );
     }
 }
