@@ -137,11 +137,15 @@ impl AcmeManager {
                 match tls::load_certified_key(&files) {
                     Ok(key) => {
                         if let Err(error) = store.insert(name.clone(), key) {
-                            eprintln!("ACME cached certificate for {name} is invalid: {error}");
+                            crate::log_error!(
+                                "ACME cached certificate for {name} is invalid: {error}"
+                            );
                         }
                     }
                     Err(error) => {
-                        eprintln!("ACME cached certificate for {name} could not be loaded: {error}")
+                        crate::log_error!(
+                            "ACME cached certificate for {name} could not be loaded: {error}"
+                        )
                     }
                 }
             }
@@ -188,11 +192,15 @@ impl AcmeManager {
                 match tls::load_certified_key(&files) {
                     Ok(key) => {
                         if let Err(error) = self.inner.store.insert(name.clone(), key) {
-                            eprintln!("ACME cached certificate for {name} is invalid: {error}");
+                            crate::log_error!(
+                                "ACME cached certificate for {name} is invalid: {error}"
+                            );
                         }
                     }
                     Err(error) => {
-                        eprintln!("ACME cached certificate for {name} could not be loaded: {error}")
+                        crate::log_error!(
+                            "ACME cached certificate for {name} could not be loaded: {error}"
+                        )
                     }
                 }
             }
@@ -249,10 +257,10 @@ impl AcmeManager {
             match result {
                 Ok(()) => {
                     inner.failures.lock().await.remove(&host);
-                    eprintln!("ACME certificate provisioned for {host}");
+                    crate::log_notice!("ACME certificate provisioned for {host}");
                 }
                 Err(error) => {
-                    eprintln!("ACME provisioning failed for {host}: {error}");
+                    crate::log_error!("ACME provisioning failed for {host}: {error}");
                     inner
                         .failures
                         .lock()

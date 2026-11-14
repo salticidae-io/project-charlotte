@@ -18,6 +18,7 @@ use std::{
 use bytes::Bytes;
 use http::{HeaderValue, Request, Response, StatusCode, header::HOST};
 use http_body::Body;
+use http_body_util::BodyExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
@@ -92,6 +93,10 @@ struct VhostFile {
     proxy_preserve_host: Option<bool>,
     proxy_timeout: Option<u64>,
     proxy_ca_root: Option<PathBuf>,
+    access_log: Option<PathBuf>,
+    access_log_format: Option<String>,
+    error_log: Option<PathBuf>,
+    error_log_format: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -139,6 +144,8 @@ struct Vhost {
     waf: Option<Waf>,
     rate_limit: VhostRateLimit,
     bot: VhostBot,
+    access_log: Option<Arc<crate::logging::AccessLog>>,
+    error_log: Arc<crate::logging::ErrorLog>,
     #[cfg(feature = "hosting")]
     worker: Option<Arc<Worker>>,
     #[cfg(feature = "proxy")]
@@ -166,6 +173,8 @@ pub(crate) struct Router {
     rate_limit: Option<Arc<RateLimiter>>,
     bot: Option<Arc<BotPolicy>>,
     bot_state: Arc<BotState>,
+    access_log: Option<Arc<crate::logging::AccessLog>>,
+    error_log: Arc<crate::logging::ErrorLog>,
     #[cfg(feature = "acme")]
     acme: Option<AcmeManager>,
 }
@@ -206,6 +215,34 @@ impl Router {
         rate_limit: Option<Arc<RateLimiter>>,
         waf: Option<Waf>,
     ) -> Result<Self, Box<dyn Error + Send + Sync>> {
+        let error_log = if let Some(log) = crate::logging::global_error_log() {
+            log
+        } else {
+            let target = match fallback.error_log_file.as_deref() {
+                Some(path) => crate::logging::open_log(path, "error")?,
+                None => crate::logging::LogTarget::stderr(),
+            };
+            Arc::new(crate::logging::ErrorLog::new(
+                target,
+                crate::logging::ErrorFormat::parse(&fallback.error_log_format)?,
+            ))
+        };
+        let access_log = if let Some(log) = crate::logging::global_access_log() {
+            Some(log)
+        } else {
+            let target = match fallback.access_log_file.as_deref() {
+                Some(path) => Some(crate::logging::open_log(path, "access")?),
+                None if fallback.access_log => Some(crate::logging::LogTarget::stdout()),
+                None => None,
+            };
+            target.map(|target| {
+                Arc::new(crate::logging::AccessLog::new(
+                    target,
+                    crate::logging::AccessFormat::parse(&fallback.access_log_format)
+                        .expect("validated access log format"),
+                ))
+            })
+        };
         let bot = fallback
             .bot
             .clone()
@@ -254,6 +291,8 @@ impl Router {
             waf,
             bot,
             bot_state,
+            access_log.clone(),
+            Arc::clone(&error_log),
         )
         .await?;
         router.dir = dir;
@@ -356,6 +395,8 @@ impl Router {
                     self.waf,
                     self.bot.clone(),
                     Arc::clone(&self.bot_state),
+                    self.access_log.clone(),
+                    Arc::clone(&self.error_log),
                 )
                 .await?;
                 router.snapshot().vhosts.clone()
@@ -391,6 +432,8 @@ impl Router {
                     self.waf,
                     self.bot.clone(),
                     Arc::clone(&self.bot_state),
+                    self.access_log.clone(),
+                    Arc::clone(&self.error_log),
                 )
                 .await?;
                 vhosts.extend(router.snapshot().vhosts.iter().cloned());
@@ -648,14 +691,54 @@ impl Router {
         waf: Option<Waf>,
         bot: Option<Arc<BotPolicy>>,
         bot_state: Arc<BotState>,
+        global_access_log: Option<Arc<crate::logging::AccessLog>>,
+        global_error_log: Arc<crate::logging::ErrorLog>,
     ) -> Result<Self, Box<dyn Error + Send + Sync>> {
         validate_vhost_declarations(&file.vhost)?;
         validate_vhost_waf_declarations(&file.vhost, waf.is_some())?;
         let main_entries = file.vhost.clone();
+        let process_dir = std::env::current_dir()?;
         let mut vhosts = Vec::with_capacity(file.vhost.len());
         let default = file.vhost.iter().position(|entry| entry.default);
 
         for mut entry in file.vhost {
+            let access_target = match entry.access_log.take() {
+                Some(path) => Some(crate::logging::open_log(
+                    &resolve_config_path(path, config_dir),
+                    "access",
+                )?),
+                None => global_access_log.as_ref().map(|log| log.target()),
+            };
+            let access_format = crate::logging::AccessFormat::parse(
+                entry
+                    .access_log_format
+                    .as_deref()
+                    .unwrap_or(&fallback.access_log_format),
+            )?;
+            let access_log = access_target
+                .map(|target| Arc::new(crate::logging::AccessLog::new(target, access_format)));
+            let default_error_log_file = fallback.error_log_file.as_ref().map(|path| {
+                if path.is_absolute() {
+                    path.clone()
+                } else {
+                    process_dir.join(path)
+                }
+            });
+            let error_log_file = entry
+                .error_log
+                .take()
+                .map(|path| resolve_config_path(path, config_dir))
+                .or(default_error_log_file);
+            let error_target = match error_log_file.as_deref() {
+                Some(path) => crate::logging::open_log(path, "error")?,
+                None => global_error_log.target(),
+            };
+            let error_log_format = entry
+                .error_log_format
+                .take()
+                .unwrap_or_else(|| fallback.error_log_format.clone());
+            let error_format = crate::logging::ErrorFormat::parse(&error_log_format)?;
+            let error_log = Arc::new(crate::logging::ErrorLog::new(error_target, error_format));
             let vhost_rate_limit = match entry.rate_limit.as_deref() {
                 None => VhostRateLimit::Inherit,
                 Some("off") => VhostRateLimit::Off,
@@ -735,6 +818,8 @@ impl Router {
                     waf: vhost_waf,
                     rate_limit: vhost_rate_limit,
                     bot: vhost_bot,
+                    access_log: access_log.clone(),
+                    error_log: Arc::clone(&error_log),
                     #[cfg(feature = "hosting")]
                     worker: None,
                     #[cfg(feature = "proxy")]
@@ -884,6 +969,8 @@ impl Router {
                     fastcgi,
                     fastcgi_timeout: Duration::from_secs(timeout_seconds),
                     threads,
+                    error_log_file,
+                    error_log_format,
                     process: Mutex::new(None),
                 });
                 let process = worker.spawn_process().await?;
@@ -897,6 +984,8 @@ impl Router {
                     waf: vhost_waf,
                     rate_limit: vhost_rate_limit,
                     bot: vhost_bot,
+                    access_log,
+                    error_log,
                     #[cfg(feature = "hosting")]
                     worker: Some(worker),
                     #[cfg(feature = "proxy")]
@@ -922,6 +1011,8 @@ impl Router {
             rate_limit,
             bot,
             bot_state,
+            access_log: global_access_log,
+            error_log: global_error_log,
             #[cfg(feature = "acme")]
             acme: None,
         })
@@ -998,43 +1089,66 @@ impl Router {
         {
             request.headers_mut().insert(HOST, value);
         }
-        let access_log = self.fallback.access_log.then(|| {
-            (
-                request.method().clone(),
-                request
-                    .uri()
-                    .path_and_query()
-                    .map_or("/", |path_and_query| path_and_query.as_str())
-                    .to_owned(),
-                request.version(),
-                request_host(&request).unwrap_or_default(),
-                request
-                    .headers()
-                    .get("user-agent")
-                    .and_then(|value| value.to_str().ok())
-                    .unwrap_or_default()
-                    .to_owned(),
-                request
-                    .extensions()
-                    .get::<TlsFingerprint>()
-                    .map_or_else(|| "-".to_owned(), |fingerprint| fingerprint.0.ja4.clone()),
-            )
+        let table = self.snapshot();
+        let host = request_host(&request);
+        let selected = host
+            .as_deref()
+            .and_then(|host| Self::select_vhost(&table, host))
+            .or(table.default);
+        let vhost = selected.map(|index| &table.vhosts[index]);
+        let server_name = vhost
+            .and_then(|vhost| vhost.names.first())
+            .cloned()
+            .or_else(|| host.clone())
+            .unwrap_or_default();
+        let error_log = vhost.map_or_else(
+            || Arc::clone(&self.error_log),
+            |vhost| Arc::clone(&vhost.error_log),
+        );
+        let access_log =
+            vhost.map_or_else(|| self.access_log.clone(), |vhost| vhost.access_log.clone());
+        let access_request = access_log.as_ref().map(|_| crate::logging::AccessRequest {
+            method: request.method().clone(),
+            path: request
+                .uri()
+                .path_and_query()
+                .map_or("/", |value| value.as_str())
+                .to_owned(),
+            version: request.version(),
+            client,
+            peer,
+            local,
+            server_name: server_name.clone(),
+            ja4: request
+                .extensions()
+                .get::<TlsFingerprint>()
+                .map_or_else(|| "-".to_owned(), |fingerprint| fingerprint.0.ja4.clone()),
+            headers: request.headers().clone(),
+            started: std::time::SystemTime::now(),
         });
-        let response = self.dispatch_inner(request, client, local).await;
-        if let Some((method, path, version, host, user_agent, ja4)) = access_log {
-            forwarded::log_access(
-                client,
-                peer,
-                &method,
-                &path,
-                version,
-                response.status().as_u16(),
-                &host,
-                &user_agent,
-                &ja4,
-            );
+        let context = crate::logging::RequestContext {
+            client: Some(client),
+            local: Some(local),
+            server_name,
+            error_log: Some(error_log),
+        };
+        let response = crate::logging::with_request_context(
+            context,
+            self.dispatch_inner(request, client, local, table, host, selected),
+        )
+        .await;
+        if let (Some(log), Some(access_request)) = (access_log, access_request) {
+            let (parts, body) = response.into_parts();
+            let access_response = crate::logging::AccessResponse {
+                status: parts.status.as_u16(),
+                headers: parts.headers.clone(),
+            };
+            let body = crate::logging::LoggedBody::new(body, log, access_request, access_response)
+                .boxed_unsync();
+            Response::from_parts(parts, body)
+        } else {
+            response
         }
-        response
     }
 
     async fn dispatch_inner<B>(
@@ -1042,16 +1156,14 @@ impl Router {
         request: Request<B>,
         peer: SocketAddr,
         local: SocketAddr,
+        table: Arc<VhostTable>,
+        host: Option<String>,
+        selected: Option<usize>,
     ) -> Response<ResponseBody>
     where
         B: Body<Data = Bytes> + Send + 'static,
         B::Error: Into<Box<dyn Error + Send + Sync>>,
     {
-        let request = request;
-        let table = self.snapshot();
-        // Nothing below changes the authority or `Host`, so the host is
-        // worked out once and shared by every step that routes on it.
-        let host = request_host(&request);
         let host = host.as_deref();
         #[cfg(feature = "acme")]
         if let Some(acme) = &self.acme {
@@ -1067,9 +1179,6 @@ impl Router {
                 acme.maybe_provision(host);
             }
         }
-        let selected = host
-            .and_then(|host| Self::select_vhost(&table, host))
-            .or(table.default);
         let rate_limit = match selected {
             Some(index) => match &table.vhosts[index].rate_limit {
                 VhostRateLimit::Inherit => self.rate_limit.as_ref(),
@@ -1112,9 +1221,11 @@ impl Router {
                 .map(|fingerprint| fingerprint.0.as_ref());
             let verdict = bot::evaluate(policy, &self.bot_state, &request, peer, fingerprint).await;
             if verdict.action != BotAction::Allow {
-                eprintln!(
+                crate::log_error!(
                     "bot detection: client={peer} score={} action={:?} reasons={:?}",
-                    verdict.score, verdict.action, verdict.reasons
+                    verdict.score,
+                    verdict.action,
+                    verdict.reasons
                 );
             }
             match verdict.action {
@@ -1823,6 +1934,10 @@ mod tests {
             proxy_preserve_host: None,
             proxy_timeout: None,
             proxy_ca_root: None,
+            access_log: None,
+            access_log_format: None,
+            error_log: None,
+            error_log_format: None,
         }
     }
 
@@ -2197,6 +2312,7 @@ mod tests {
             try_files: &["$uri".to_owned(), "=404".to_owned()],
             fastcgi: &backends,
             timeout: Duration::from_secs(12),
+            error_log_format: "[%l] %M",
         });
         let args = args
             .iter()
@@ -2257,6 +2373,7 @@ mod tests {
             try_files: &[],
             fastcgi: &backends,
             timeout: Duration::from_secs(30),
+            error_log_format: "[%l] %M",
         });
         let args = args
             .iter()
@@ -2383,6 +2500,11 @@ mod tests {
                 waf: None,
                 rate_limit: super::VhostRateLimit::Inherit,
                 bot: super::VhostBot::Inherit,
+                access_log: None,
+                error_log: Arc::new(crate::logging::ErrorLog::new(
+                    crate::logging::LogTarget::stderr(),
+                    crate::logging::ErrorFormat::parse("%M").expect("valid test format"),
+                )),
                 worker: Some(Arc::new(Worker {
                     uid: 0,
                     gid: 0,
@@ -2393,6 +2515,8 @@ mod tests {
                     fastcgi: Vec::new(),
                     fastcgi_timeout: Duration::from_secs(1),
                     threads: 1,
+                    error_log_file: None,
+                    error_log_format: "[%l] %M".to_owned(),
                     process: tokio::sync::Mutex::new(None),
                 })),
                 #[cfg(feature = "proxy")]
@@ -2633,6 +2757,7 @@ mod tests {
             try_files: &try_files,
             fastcgi: &backends,
             timeout: Duration::from_secs(timeout),
+            error_log_format: "[%l] %M",
         })
         .into_iter()
         .map(|arg| arg.into_string().expect("worker arguments are UTF-8"))

@@ -206,7 +206,7 @@ impl ReverseProxy {
         match tokio::time::timeout(self.timeout, self.client.request(request)).await {
             Err(_) => response::error_response(StatusCode::GATEWAY_TIMEOUT, "Upstream timed out\n"),
             Ok(Err(error)) => {
-                eprintln!("reverse proxy request failed: {error}");
+                crate::log_error!("reverse proxy request failed: {error}");
                 response::error_response(StatusCode::BAD_GATEWAY, "Upstream request failed\n")
             }
             Ok(Ok(mut response)) => {

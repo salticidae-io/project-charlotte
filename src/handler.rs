@@ -4,7 +4,7 @@ use std::{
     convert::Infallible,
     fmt::Write as _,
     fs as std_fs,
-    io::{self, Read, Seek, SeekFrom as StdSeekFrom, Write},
+    io::{self, Read, Seek, SeekFrom as StdSeekFrom},
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
@@ -63,7 +63,6 @@ where
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     let method = request.method().clone();
-    let uri = request.uri().clone();
     let is_head = method == Method::HEAD;
     let mut request = request;
     let mut try_files_response = if config.try_files.is_empty() {
@@ -104,13 +103,6 @@ where
     if is_head {
         *response.body_mut() = empty_body();
     }
-    let size = response
-        .headers()
-        .get(header::CONTENT_LENGTH)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("-");
-    let log_line = format!("{} {} {} {}\n", method, uri, response.status(), size);
-    let _ = io::stderr().lock().write_all(log_line.as_bytes());
     response
 }
 

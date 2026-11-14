@@ -31,7 +31,7 @@ pub(crate) fn drop_privileges(config: &Config) -> Result<(), Box<dyn Error + Sen
     } else if !getgroups()?.is_empty() {
         // A non-root process cannot clear inherited groups; retaining the current
         // user's groups is safe only when the worker keeps that same identity.
-        eprintln!("virtual host worker retains the server user's supplementary groups");
+        crate::log_error!("virtual host worker retains the server user's supplementary groups");
     }
     privileges::clear_all()?;
     Ok(())
@@ -76,14 +76,14 @@ async fn terminated() {
     let mut interrupt = match signal(SignalKind::interrupt()) {
         Ok(stream) => stream,
         Err(error) => {
-            eprintln!("virtual host worker could not listen for SIGINT: {error}");
+            crate::log_error!("virtual host worker could not listen for SIGINT: {error}");
             return std::future::pending().await;
         }
     };
     let mut terminate = match signal(SignalKind::terminate()) {
         Ok(stream) => stream,
         Err(error) => {
-            eprintln!("virtual host worker could not listen for SIGTERM: {error}");
+            crate::log_error!("virtual host worker could not listen for SIGTERM: {error}");
             return std::future::pending().await;
         }
     };
@@ -106,7 +106,22 @@ async fn dispatch(
             return handler::error_response(StatusCode::BAD_REQUEST, "Invalid URI\n");
         }
     };
-    handler::handle_request(request, config, peer, local).await
+    let server_name = request
+        .headers()
+        .get(http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    crate::logging::with_request_context(
+        crate::logging::RequestContext {
+            client: Some(peer),
+            local: Some(local),
+            server_name,
+            error_log: None,
+        },
+        handler::handle_request(request, config, peer, local),
+    )
+    .await
 }
 
 #[derive(Clone, Copy, Debug)]

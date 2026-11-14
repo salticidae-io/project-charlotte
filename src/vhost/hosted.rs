@@ -3,11 +3,12 @@
 use std::{
     error::Error,
     ffi::OsString,
+    fs::OpenOptions,
     io,
     net::SocketAddr,
     os::{
         fd::OwnedFd,
-        unix::{net::UnixStream as StdUnixStream, process::CommandExt},
+        unix::{fs::OpenOptionsExt, net::UnixStream as StdUnixStream, process::CommandExt},
     },
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -55,6 +56,8 @@ pub(super) struct Worker {
     pub(super) fastcgi: Vec<FastCgiBackend>,
     pub(super) fastcgi_timeout: Duration,
     pub(super) threads: usize,
+    pub(super) error_log_file: Option<PathBuf>,
+    pub(super) error_log_format: String,
     pub(super) process: Mutex<Option<WorkerProcess>>,
 }
 
@@ -112,6 +115,7 @@ impl Worker {
                 try_files: &self.try_files,
                 fastcgi: &self.fastcgi,
                 timeout: self.fastcgi_timeout,
+                error_log_format: &self.error_log_format,
             }))
             .arg("--worker-threads")
             .arg(self.threads.to_string())
@@ -123,6 +127,14 @@ impl Worker {
             )
             .stdin(Stdio::from(OwnedFd::from(child_socket)))
             .current_dir("/");
+        if let Some(path) = &self.error_log_file {
+            let stderr = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .mode(0o640)
+                .open(path)?;
+            command.stderr(Stdio::from(stderr));
+        }
         if let Some(app_env) = worker_app_env(&self.fastcgi) {
             command.env(crate::config::WORKER_APP_ENV, app_env);
         }
@@ -166,7 +178,7 @@ impl Worker {
         };
         tokio::spawn(async move {
             if let Err(error) = connection.await {
-                eprintln!("virtual host worker connection closed: {error}");
+                crate::log_error!("virtual host worker connection closed: {error}");
             }
         });
         Ok(WorkerProcess { sender, child })
@@ -201,7 +213,7 @@ impl Worker {
                 Response::from_parts(parts, body)
             }
             Err(error) => {
-                eprintln!("virtual host worker failed: {error}");
+                crate::log_error!("virtual host worker failed: {error}");
                 response::error_response(StatusCode::BAD_GATEWAY, "Virtual host worker failed\n")
             }
         }
@@ -330,6 +342,7 @@ pub(super) struct WorkerArgs<'a> {
     pub(super) try_files: &'a [String],
     pub(super) fastcgi: &'a [FastCgiBackend],
     pub(super) timeout: Duration,
+    pub(super) error_log_format: &'a str,
 }
 
 pub(super) fn build_worker_args(worker: WorkerArgs<'_>) -> Vec<OsString> {
@@ -342,6 +355,7 @@ pub(super) fn build_worker_args(worker: WorkerArgs<'_>) -> Vec<OsString> {
         try_files,
         fastcgi,
         timeout,
+        error_log_format,
     } = worker;
     let mut args = vec![
         "--worker".into(),
@@ -355,6 +369,8 @@ pub(super) fn build_worker_args(worker: WorkerArgs<'_>) -> Vec<OsString> {
         index.into(),
         "--fastcgi-timeout".into(),
         timeout.as_secs().to_string().into(),
+        "--error-log-format".into(),
+        error_log_format.into(),
     ];
     if !listing {
         args.push("--no-listing".into());

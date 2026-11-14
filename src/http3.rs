@@ -43,13 +43,13 @@ pub(crate) async fn serve(
                 let router = Arc::clone(&router);
                 connections.spawn(async move {
                     if let Err(error) = serve_connection(incoming, local, router).await {
-                        eprintln!("HTTP/3 connection failed: {error}");
+                        crate::log_error!("HTTP/3 connection failed: {error}");
                     }
                 });
             }
             result = connections.join_next(), if !connections.is_empty() => {
                 if let Some(Err(error)) = result {
-                    eprintln!("HTTP/3 connection task failed: {error}");
+                    crate::log_error!("HTTP/3 connection task failed: {error}");
                 }
             }
         }
@@ -59,7 +59,7 @@ pub(crate) async fn serve(
     endpoint.wait_idle().await;
     while let Some(result) = connections.join_next().await {
         if let Err(error) = result {
-            eprintln!("HTTP/3 connection task failed: {error}");
+            crate::log_error!("HTTP/3 connection task failed: {error}");
         }
     }
     Ok(())
@@ -93,7 +93,7 @@ async fn serve_connection(
                             if let Err(error) =
                                 serve_request(resolver, router, peer, local, sni).await
                             {
-                                eprintln!("HTTP/3 request failed: {error}");
+                                crate::log_error!("HTTP/3 request failed: {error}");
                             }
                         });
                     }
@@ -102,14 +102,14 @@ async fn serve_connection(
             }
             result = requests.join_next(), if !requests.is_empty() => {
                 if let Some(Err(error)) = result {
-                    eprintln!("HTTP/3 request task failed: {error}");
+                    crate::log_error!("HTTP/3 request task failed: {error}");
                 }
             }
         }
     }
     while let Some(result) = requests.join_next().await {
         if let Err(error) = result {
-            eprintln!("HTTP/3 request task failed: {error}");
+            crate::log_error!("HTTP/3 request task failed: {error}");
         }
     }
     Ok(())

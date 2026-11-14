@@ -287,7 +287,10 @@ jobs:
 
       - name: Install AFL and test-fuzz
         run: |
-          cargo install cargo-afl --locked
+          # rust-cache restores the cargo-afl binary from ~/.cargo/bin but not
+          # ~/.cargo/registry/src, where cargo-afl expects the AFL++ sources
+          # it builds from. Force the install so cargo re-extracts them.
+          cargo install cargo-afl --locked --force
           # The AFL runtime can be restored from the Rust cache; rebuild it so
           # it always matches the current toolchain.
           cargo afl config --build --force

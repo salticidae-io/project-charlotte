@@ -66,6 +66,10 @@ pub struct Config {
     pub(crate) rate_limit: Option<RateLimit>,
     pub(crate) trusted_proxies: Vec<TrustedProxy>,
     pub(crate) access_log: bool,
+    pub(crate) access_log_file: Option<PathBuf>,
+    pub(crate) access_log_format: String,
+    pub(crate) error_log_file: Option<PathBuf>,
+    pub(crate) error_log_format: String,
     pub(crate) bot: Option<BotPolicyFile>,
     pub modsecurity_rules: Vec<PathBuf>,
     pub modsecurity_block_status: Option<u16>,
@@ -183,6 +187,18 @@ struct Cli {
     /// Write access-log records to stdout
     #[arg(long)]
     access_log: bool,
+    /// Append access-log records to a file
+    #[arg(long, value_name = "FILE", allow_hyphen_values = true)]
+    access_log_file: Option<PathBuf>,
+    /// Apache-compatible access log format
+    #[arg(long, value_name = "FORMAT", allow_hyphen_values = true)]
+    access_log_format: Option<String>,
+    /// Append error-log records to a file
+    #[arg(long, value_name = "FILE", allow_hyphen_values = true)]
+    error_log_file: Option<PathBuf>,
+    /// Apache-compatible error log format
+    #[arg(long, value_name = "FORMAT", allow_hyphen_values = true)]
+    error_log_format: Option<String>,
     /// Enable the built-in bot-detection policy
     #[arg(long)]
     bot_detection: bool,
@@ -383,6 +399,10 @@ impl Config {
             rate_limit_burst,
             trusted_proxy,
             access_log,
+            access_log_file,
+            access_log_format,
+            error_log_file,
+            error_log_format,
             bot_detection,
             bot_config,
             modsecurity_rules,
@@ -415,6 +435,13 @@ impl Config {
             .iter()
             .map(|value| value.parse())
             .collect::<Result<Vec<TrustedProxy>, String>>()?;
+        let access_log_format = access_log_format.unwrap_or_else(|| {
+            "%a:%{remote}p %{c}a:%{remote}p [%{begin:%Y-%m-%dT%H:%M:%SZ}t] \"%m %U%q %H\" %>s \"%{Host}i\" \"%{User-Agent}i\" \"%{ja4}n\"".to_owned()
+        });
+        crate::logging::AccessFormat::parse(&access_log_format)?;
+        let error_log_format =
+            error_log_format.unwrap_or_else(|| "[%t] [%l] [pid %P] [module %m] %M".to_owned());
+        crate::logging::ErrorFormat::parse(&error_log_format)?;
         let bot = if let Some(path) = bot_config {
             let content = std::fs::read_to_string(&path).map_err(|error| {
                 format!("could not read bot policy {}: {error}", path.display())
@@ -550,6 +577,10 @@ impl Config {
             rate_limit,
             trusted_proxies,
             access_log,
+            access_log_file,
+            access_log_format,
+            error_log_file,
+            error_log_format,
             bot,
             modsecurity_rules,
             modsecurity_block_status,
