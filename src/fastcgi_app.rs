@@ -1,3 +1,5 @@
+//! Lifecycle management and pooling for server-managed FastCGI applications.
+
 use std::{
     error::Error,
     ffi::OsString,

@@ -1,3 +1,5 @@
+//! Gungraun benchmarks for date, routing, and static-file hot paths.
+
 use std::{hint::black_box, sync::OnceLock};
 
 use gungraun::prelude::*;

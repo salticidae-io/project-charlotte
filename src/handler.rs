@@ -1,3 +1,5 @@
+//! Request handling for static files, listings, ranges, and validators.
+
 use std::{
     convert::Infallible,
     fmt::Write as _,

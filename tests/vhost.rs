@@ -1,3 +1,5 @@
+//! Integration tests for virtual-host routing, configuration, and worker-backed requests.
+
 #![forbid(unsafe_code)]
 #![cfg(feature = "hosting")]
 

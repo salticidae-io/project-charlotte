@@ -1,3 +1,5 @@
+//! Integration tests for bot-detection policies, challenges, and crawler verification.
+
 #![forbid(unsafe_code)]
 #![cfg(feature = "hosting")]
 

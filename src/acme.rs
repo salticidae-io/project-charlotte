@@ -1,3 +1,5 @@
+//! ACME account management, HTTP-01 challenges, and certificate provisioning and renewal.
+
 use std::{
     collections::{HashMap, HashSet},
     error::Error,

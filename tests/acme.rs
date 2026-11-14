@@ -1,3 +1,5 @@
+//! Integration tests for ACME certificate provisioning, HTTP-01 challenges, and renewal.
+
 #![forbid(unsafe_code)]
 #![cfg(all(feature = "acme", any(feature = "hosting", feature = "proxy")))]
 

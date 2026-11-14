@@ -1,3 +1,5 @@
+//! Shared HTTP response construction, date headers, errors, and body coalescing.
+
 use std::{convert::Infallible, io, pin::Pin};
 
 use bytes::{Bytes, BytesMut};

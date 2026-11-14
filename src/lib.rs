@@ -1,3 +1,5 @@
+//! Library entry point that composes server services and coordinates listeners and shutdown.
+
 #![forbid(unsafe_code)]
 
 #[cfg(feature = "acme")]

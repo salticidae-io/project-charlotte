@@ -8,7 +8,6 @@
   * error and access
   * something akin to Apache's mod_log_forensic
   * Customizable log formats
-* Configuration API
 * Internal statistics tracking and display (ala apache-status or nginx's admin socket)
 * Connection limiting
 * Swarm mode

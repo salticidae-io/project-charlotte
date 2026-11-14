@@ -1,3 +1,5 @@
+//! Integration tests for the Unix-socket control API and virtual-host mutations.
+
 #![forbid(unsafe_code)]
 #![cfg(feature = "hosting")]
 

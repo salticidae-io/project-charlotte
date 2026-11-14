@@ -1,3 +1,5 @@
+//! Loads and validates virtual hosts, matches hosts, and dispatches requests.
+
 #[cfg(any(feature = "hosting", feature = "proxy"))]
 use std::time::Duration;
 use std::{

@@ -1,3 +1,5 @@
+//! Integration tests for classic CGI script execution and response handling.
+
 #![forbid(unsafe_code)]
 #![cfg(feature = "hosting")]
 

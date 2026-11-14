@@ -1,3 +1,5 @@
+//! Loads ModSecurity rules and inspects HTTP requests and responses.
+
 use std::{
     collections::VecDeque, error::Error, future::Future, io, net::SocketAddr, path::PathBuf,
     str::FromStr, time::Duration,

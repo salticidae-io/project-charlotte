@@ -1,3 +1,5 @@
+//! Pooled HTTP/HTTPS upstream clients and reverse-proxy request/response handling.
+
 use std::{error::Error, io, path::Path, time::Duration};
 
 use bytes::Bytes;

@@ -1,3 +1,5 @@
+//! Rustls configuration and static or ACME-backed SNI certificate selection.
+
 use std::{error::Error, sync::Arc};
 
 use rustls::{

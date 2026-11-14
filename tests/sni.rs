@@ -1,3 +1,5 @@
+//! Integration tests for TLS SNI and virtual-host certificate selection over TCP and HTTP/3.
+
 #![forbid(unsafe_code)]
 #![cfg(all(feature = "hosting", feature = "http3"))]
 

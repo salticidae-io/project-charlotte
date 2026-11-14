@@ -1,3 +1,5 @@
+//! Bot scoring, crawler verification, and challenge or block responses.
+
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},

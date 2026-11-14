@@ -1,3 +1,5 @@
+//! Watches virtual-host directory changes and refreshes routing and TLS/ACME state.
+
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use notify::{RecursiveMode, Watcher};
