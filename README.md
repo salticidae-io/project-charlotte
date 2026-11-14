@@ -371,6 +371,10 @@ built with, for example
 setup, seed tests, and target commands are documented in
 [FUZZING.md](FUZZING.md); the fuzz targets need the default features.
 
+Run coverage with `cargo tarpaulin` (install it with
+`cargo install cargo-tarpaulin --locked`); reports are written to
+`target/coverage`.
+
 Run the Gungraun callgrind benchmarks with `cargo bench`. They require Valgrind
 and the matching runner version:
 
