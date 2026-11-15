@@ -212,6 +212,25 @@ curl --unix-socket /run/charlotte/control.sock \
   -X DELETE http://localhost/vhosts/example
 ```
 
+The `charlotte-ctl` binary exposes the same operations without constructing
+HTTP requests manually. `--socket` selects the control socket and defaults to
+`CHARLOTTE_CONTROL_SOCKET` or `/run/charlotte/control.sock`; `--timeout` sets
+the socket read and write timeout in seconds (10 by default). For example:
+
+```sh
+charlotte-ctl list
+charlotte-ctl get example
+charlotte-ctl put example example.yaml
+cat example.yaml | charlotte-ctl create example -
+charlotte-ctl delete example
+```
+
+For `create` and `put` (also available as `apply`), the file argument is
+optional and defaults to standard input; pass `-` to select standard input
+explicitly. Request files may contain JSON or YAML. Successful JSON responses
+are printed to standard output as pretty-printed JSON; server errors are shown
+on standard error and return a nonzero exit status.
+
 The API uses `201` for a successful create, `200` for a successful get or
 replace, and `204` for delete. Invalid requests return `400`, missing vhosts
 `404`, create conflicts `409`, oversized bodies `413`, and unavailable mutation

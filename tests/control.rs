@@ -6,10 +6,11 @@
 mod common;
 
 use std::{
+    io::Write,
     net::SocketAddr,
     os::unix::fs::PermissionsExt,
-    path::PathBuf,
-    process::{Child, Command, Stdio},
+    path::{Path, PathBuf},
+    process::{Child, Command, Output, Stdio},
     sync::atomic::{AtomicUsize, Ordering},
     time::Duration,
 };
@@ -98,6 +99,34 @@ impl Drop for Fixture {
         );
         let _ = std::fs::remove_dir_all(&self.root);
     }
+}
+
+fn control_cli(socket: &Path, arguments: &[&str], input: Option<&[u8]>) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_charlotte-ctl"));
+    command
+        .arg("--socket")
+        .arg(socket)
+        .args(arguments)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if input.is_some() {
+        command.stdin(Stdio::piped());
+    } else {
+        command.stdin(Stdio::null());
+    }
+    let mut child = common::spawn(&mut command).unwrap();
+    if let Some(input) = input {
+        child.stdin.take().unwrap().write_all(input).unwrap();
+    }
+    child.wait_with_output().unwrap()
+}
+
+fn control_cli_from_environment(socket: &Path, arguments: &[&str]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_charlotte-ctl"));
+    command
+        .env("CHARLOTTE_CONTROL_SOCKET", socket)
+        .args(arguments);
+    common::output(&mut command).unwrap()
 }
 
 struct HttpResponse {
@@ -265,4 +294,104 @@ async fn control_socket_validates_persists_and_routes_vhost_crud() {
     let response = site_request(fixture.address, "control.example").await;
     assert_eq!(response.status, 200);
     assert_eq!(response.body, b"fallback");
+}
+
+#[tokio::test]
+async fn control_cli_supports_socket_operations() {
+    let fixture = Fixture::start().await;
+    let document_root = fixture.root.join("site");
+    std::fs::create_dir_all(&document_root).unwrap();
+    let user = User::from_uid(geteuid()).unwrap().unwrap().name;
+    let site_config = vhost_json("control.example", &document_root, &user);
+
+    let output = control_cli(&fixture.socket, &["put", "site"], Some(&site_config));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let put: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(put["name"], "site");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("\n  \"name\": \"site\""));
+
+    let output = control_cli(&fixture.socket, &["get", "site"], None);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let get: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(get["vhost"][0]["server_names"][0], "control.example");
+
+    let output = control_cli(&fixture.socket, &["apply", "site", "-"], Some(&site_config));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output = control_cli(&fixture.socket, &["list"], None);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let list: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        list.as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["name"] == "site")
+    );
+
+    let created_config = vhost_json("created.example", &document_root, &user);
+    let config_file = fixture.root.join("created.yaml");
+    std::fs::write(&config_file, &created_config).unwrap();
+    let output = control_cli(
+        &fixture.socket,
+        &["create", "-created", config_file.to_str().unwrap()],
+        None,
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let create: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(create["name"], "-created");
+
+    let output = control_cli(
+        &fixture.socket,
+        &["create", "site", "-"],
+        Some(&site_config),
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("virtual host already exists"));
+
+    let output = control_cli(&fixture.socket, &["delete", "-created"], None);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.is_empty());
+
+    let output = control_cli(&fixture.socket, &["status"], None);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(status["vhosts"], 1);
+    assert!(status["version"].is_string());
+
+    let output = control_cli_from_environment(&fixture.socket, &["status"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(status["vhosts"], 1);
 }
