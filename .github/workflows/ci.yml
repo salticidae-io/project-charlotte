@@ -204,11 +204,6 @@ jobs:
       - name: Install stable Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: project-charlotte -> target
-
       - name: Install Gungraun runner
         run: cargo install gungraun-runner --version 0.20.0 --locked
 
@@ -253,6 +248,11 @@ jobs:
     env:
       AFL_NO_UI: "1"
       AFL_SKIP_CPUFREQ: "1"
+      # cargo-afl builds everything, including proc-macros that rustc loads,
+      # with `-C target-cpu=native`. rust-cache then restores those artifacts
+      # on runners with different CPUs, and rustc dies with SIGILL. cargo-afl
+      # appends RUSTFLAGS after its own flags, so this portable target wins.
+      RUSTFLAGS: "-C target-cpu=x86-64-v2"
       FUZZ_SECONDS: ${{ github.event_name == 'schedule' && '300' || (github.event_name == 'workflow_dispatch' && inputs.seconds_per_target) || '20' }}
     steps:
       - name: Install system dependencies
@@ -295,7 +295,6 @@ jobs:
           # it always matches the current toolchain.
           cargo afl config --build --force
           cargo install cargo-test-fuzz --version 8.1.1 --locked
-          sudo /home/runner/.cargo/bin/cargo afl system-config
 
       - name: Fuzz every target
         working-directory: project-charlotte
