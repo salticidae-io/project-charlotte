@@ -79,6 +79,39 @@ other:
 The `Debian packages` GitHub workflow builds both for each supported Ubuntu
 release.
 
+### Apache configuration conversion
+
+`apache2charlotte` converts an Apache configuration file to Charlotte's
+virtual-host YAML. Relative `Include` paths use `ServerRoot` (or the input
+configuration's directory); included directories are traversed recursively,
+and `IncludeOptional` and file globs are supported. Directly supported
+directives are converted, while the rest are retained as comments with their
+source locations so they can be reviewed and migrated manually:
+
+```sh
+apache2charlotte /etc/apache2/apache2.conf --output charlotte-vhosts.yaml
+```
+
+Use `--server-root DIRECTORY` to override `ServerRoot`, and repeat `-D NAME`
+or `-D NAME=VALUE` to define Apache variables used by `Include` and
+`<IfDefine>`.
+
+### nginx configuration conversion
+
+`nginx2charlotte` converts nginx `http`/`server` configuration to Charlotte's
+virtual-host YAML. Relative `include` paths use the input file's directory by
+default; included directories are traversed recursively and file globs are
+supported. Recognized directives are converted, while unsupported directives
+are retained as source-located comments for manual review:
+
+```sh
+nginx2charlotte /etc/nginx/nginx.conf --output charlotte-vhosts.yaml
+```
+
+Use `--prefix DIRECTORY` to change the base directory for relative includes.
+Only `location /` and PHP regex locations have direct route mappings; other
+locations and nginx listener settings are retained as comments.
+
 ## Quick start
 
 Create a small document root and start the server using its default local
