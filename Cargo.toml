@@ -1,6 +1,6 @@
 [package]
 name = "project-charlotte"
-version = "0.8.0"
+version = "0.8.1"
 edition = "2024"
 default-run = "project-charlotte"
 description = "General-purpose webserver and reverse proxy meant for large-scale environments"
@@ -77,6 +77,8 @@ conflicts = "project-charlotte-proxy"
 assets = [
     ["target/release/project-charlotte", "usr/bin/", "755"],
     ["target/release/charlotte-ctl", "usr/bin/", "755"],
+    ["target/release/apache2charlotte", "usr/bin/", "755"],
+    ["target/release/nginx2charlotte", "usr/bin/", "755"],
     ["README.md", "usr/share/doc/project-charlotte/README.md", "644"],
 ]
 
@@ -90,6 +92,8 @@ features = ["acme", "http3", "proxy"]
 assets = [
     ["target/release/project-charlotte", "usr/bin/", "755"],
     ["target/release/charlotte-ctl", "usr/bin/", "755"],
+    ["target/release/apache2charlotte", "usr/bin/", "755"],
+    ["target/release/nginx2charlotte", "usr/bin/", "755"],
     ["README.md", "usr/share/doc/project-charlotte-proxy/README.md", "644"],
     ["examples/reverse-proxy-acme.yaml", "usr/share/doc/project-charlotte-proxy/examples/reverse-proxy-acme.yaml", "644"],
 ]
