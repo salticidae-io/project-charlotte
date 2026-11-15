@@ -295,7 +295,7 @@ jobs:
           # it always matches the current toolchain.
           cargo afl config --build --force
           cargo install cargo-test-fuzz --version 8.1.1 --locked
-          cargo afl system-config
+          sudo /home/runner/.cargo/bin/cargo afl system-config
 
       - name: Fuzz every target
         working-directory: project-charlotte
