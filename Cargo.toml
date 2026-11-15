@@ -2,6 +2,7 @@
 name = "project-charlotte"
 version = "0.8.0"
 edition = "2024"
+default-run = "project-charlotte"
 description = "General-purpose webserver and reverse proxy meant for large-scale environments"
 
 [features]
@@ -20,7 +21,7 @@ proxy = ["dep:hyper-rustls", "hyper/client", "hyper-util/client-legacy"]
 bytes = "1"
 caps = "0.5"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 dns-lookup = "4.0.2"
 fastcgi-client = { version = "0.12", features = ["tokio"], optional = true }
 futures-util = "0.3"
@@ -75,6 +76,7 @@ depends = "$auto"
 conflicts = "project-charlotte-proxy"
 assets = [
     ["target/release/project-charlotte", "usr/bin/", "755"],
+    ["target/release/charlotte-ctl", "usr/bin/", "755"],
     ["README.md", "usr/share/doc/project-charlotte/README.md", "644"],
 ]
 
@@ -87,6 +89,7 @@ default-features = false
 features = ["acme", "http3", "proxy"]
 assets = [
     ["target/release/project-charlotte", "usr/bin/", "755"],
+    ["target/release/charlotte-ctl", "usr/bin/", "755"],
     ["README.md", "usr/share/doc/project-charlotte-proxy/README.md", "644"],
     ["examples/reverse-proxy-acme.yaml", "usr/share/doc/project-charlotte-proxy/examples/reverse-proxy-acme.yaml", "644"],
 ]
