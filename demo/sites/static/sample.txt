@@ -1,0 +1,1 @@
+Charlotte serves this file directly from the static vhost document root.

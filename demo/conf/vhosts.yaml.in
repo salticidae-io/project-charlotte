@@ -1,0 +1,50 @@
+vhost:
+  - server_names: [charlotte.test]
+    root: @@FALLBACK_ROOT@@
+    user: @@WORKER@@
+    default: true
+    listing: true
+
+  - server_names: [static.charlotte.test]
+    root: @@STATIC_ROOT@@
+    user: @@WORKER@@
+    listing: false
+
+  - server_names: [cgi.charlotte.test]
+    root: @@CGI_ROOT@@
+    user: @@WORKER@@
+    cgi: [sh]
+    listing: false
+
+  - server_names: [proxy.charlotte.test]
+    proxy_pass: http://127.0.0.1:@@UPSTREAM_PORT@@
+
+  - server_names: [waf.charlotte.test]
+    root: @@STATIC_ROOT@@
+    user: @@WORKER@@
+    listing: false
+
+  - server_names: [rate.charlotte.test]
+    root: @@STATIC_ROOT@@
+    user: @@WORKER@@
+    rate_limit: "2/s"
+    rate_limit_burst: 2
+    listing: false
+
+  - server_names: [bot.charlotte.test]
+    root: @@STATIC_ROOT@@
+    user: @@WORKER@@
+    listing: false
+
+  - server_names: [h3.charlotte.test]
+    root: @@STATIC_ROOT@@
+    user: @@WORKER@@
+    listing: false
+
+  - server_names: [acme.charlotte.test]
+    root: @@STATIC_ROOT@@
+    user: @@WORKER@@
+    acme: @@ACME_ENABLED@@
+    listing: false
+
+@@PHP_VHOST@@

@@ -1,0 +1,5 @@
+# Options passed to project-charlotte by systemd.
+CHARLOTTE_OPTS="--config /etc/charlotte/charlotte.yaml --bind 0.0.0.0:80 --root /var/www/html --no-listing --control-socket /run/charlotte/control.sock"
+
+# For ACME and TLS, add the TLS listener and configure eligible virtual hosts.
+# Example: --tls-bind 0.0.0.0:443 --acme-directory https://acme-v02.api.letsencrypt.org/directory --acme-cache /var/lib/charlotte/acme

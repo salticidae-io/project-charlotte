@@ -9,6 +9,10 @@ For a deeper description of the runtime and request flow, see
 [ARCHITECTURE.md](ARCHITECTURE.md). Configuration examples are in
 [examples/](examples/), and fuzzing instructions are in [FUZZING.md](FUZZING.md).
 
+Run the browser-driven live feature demo with `demo/run.sh`; see
+[demo/README.md](demo/README.md) for prerequisites, controls, and the optional
+headless validation mode.
+
 ## Features
 
 - Static file serving with MIME types, index files, optional directory
@@ -77,7 +81,16 @@ other:
 | `project-charlotte-proxy` | `cargo deb --variant proxy` | `proxy`, `acme`, `http3` |
 
 The `Debian packages` GitHub workflow builds both for each supported Ubuntu
-release.
+release. Both packages install and enable the `project-charlotte.service`
+systemd unit. Before starting it, create `/etc/charlotte/charlotte.yaml` from
+the packaged example at
+`/usr/share/doc/project-charlotte/examples/charlotte.yaml` (or the matching
+`project-charlotte-proxy` documentation directory). The unit has a
+`ConditionPathExists` check for that file, so systemd skips the service until
+the configuration is present. After creating it, start the service with
+`sudo systemctl start project-charlotte`. Edit
+`/etc/default/project-charlotte` to change the command-line options passed to
+the server; this file is preserved as a conffile during package upgrades.
 
 ### Apache configuration conversion
 
