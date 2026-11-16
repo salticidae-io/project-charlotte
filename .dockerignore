@@ -1,0 +1,4 @@
+.git
+.idea
+target/
+fuzz/target/

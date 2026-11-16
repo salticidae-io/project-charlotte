@@ -74,12 +74,17 @@ copyright = "Copyright 2026, project-charlotte contributors"
 section = "web"
 depends = "$auto"
 conflicts = "project-charlotte-proxy"
+conf-files = ["/etc/default/project-charlotte"]
+maintainer-scripts = "packaging"
+systemd-units = { unit-scripts = "packaging/systemd", unit-name = "project-charlotte", enable = true }
 assets = [
     ["target/release/project-charlotte", "usr/bin/", "755"],
     ["target/release/charlotte-ctl", "usr/bin/", "755"],
     ["target/release/apache2charlotte", "usr/bin/", "755"],
     ["target/release/nginx2charlotte", "usr/bin/", "755"],
+    ["packaging/default/project-charlotte", "etc/default/project-charlotte", "644"],
     ["README.md", "usr/share/doc/project-charlotte/README.md", "644"],
+    ["examples/charlotte.yaml", "usr/share/doc/project-charlotte/examples/charlotte.yaml", "644"],
 ]
 
 # Reverse proxy only: TLS termination, ACME and HTTP/3, without static file
@@ -89,11 +94,16 @@ name = "project-charlotte-proxy"
 conflicts = "project-charlotte"
 default-features = false
 features = ["acme", "http3", "proxy"]
+conf-files = ["/etc/default/project-charlotte"]
+maintainer-scripts = "packaging"
+systemd-units = { unit-scripts = "packaging/systemd", unit-name = "project-charlotte", enable = true }
 assets = [
     ["target/release/project-charlotte", "usr/bin/", "755"],
     ["target/release/charlotte-ctl", "usr/bin/", "755"],
     ["target/release/apache2charlotte", "usr/bin/", "755"],
     ["target/release/nginx2charlotte", "usr/bin/", "755"],
+    ["packaging/default/project-charlotte-proxy", "etc/default/project-charlotte", "644"],
     ["README.md", "usr/share/doc/project-charlotte-proxy/README.md", "644"],
+    ["examples/charlotte.yaml", "usr/share/doc/project-charlotte-proxy/examples/charlotte.yaml", "644"],
     ["examples/reverse-proxy-acme.yaml", "usr/share/doc/project-charlotte-proxy/examples/reverse-proxy-acme.yaml", "644"],
 ]
