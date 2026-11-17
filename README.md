@@ -107,7 +107,18 @@ apache2charlotte /etc/apache2/apache2.conf --output charlotte-vhosts.yaml
 
 Use `--server-root DIRECTORY` to override `ServerRoot`, and repeat `-D NAME`
 or `-D NAME=VALUE` to define Apache variables used by `Include` and
-`<IfDefine>`.
+`<IfDefine>`. Add `--no-comments` to omit the generated review and explanation
+comments from the YAML output.
+
+Add `--user-from-root` to set each vhost's `user` and `group` to the owner of
+its document root, overriding configured values. Relative document roots are
+resolved from the converter's current working directory; if ownership cannot
+be determined, configured values are kept and a review comment is emitted.
+FastCGI apps are emitted only when their executable is an absolute path;
+commands such as `php-cgi` or relative paths are skipped with a review comment.
+Apache `DirectoryIndex` and nginx `index` entries are converted to an ordered
+`index` list; entries that are not bare file names are skipped with a review
+comment.
 
 ### nginx configuration conversion
 
@@ -123,7 +134,14 @@ nginx2charlotte /etc/nginx/nginx.conf --output charlotte-vhosts.yaml
 
 Use `--prefix DIRECTORY` to change the base directory for relative includes.
 Only `location /` and PHP regex locations have direct route mappings; other
-locations and nginx listener settings are retained as comments.
+locations and nginx listener settings are retained as comments. Add
+`--no-comments` to omit the generated review and explanation comments from the
+YAML output.
+
+Add `--user-from-root` to set each vhost's `user` and `group` to the owner of
+its root, overriding configured values. Relative roots are resolved from the
+converter's current working directory; if ownership cannot be determined,
+configured values are kept and a review comment is emitted.
 
 ## Quick start
 
@@ -158,11 +176,12 @@ see all command-line options. Common options include:
 | `--no-plain-http` | Disable the plain HTTP listener; incompatible with ACME HTTP-01. |
 | `--root DIRECTORY` | Fallback document root when no virtual host handles a request; defaults to `.`. |
 | `--user USER [--group GROUP]` | Drop the master process to this account before starting; requires root. |
-| `--index NAME` | Fallback index file name; defaults to `index.html`. |
+| `--index NAME` | Fallback index file name; repeat or comma-separate values to try them in order (default `index.html`). |
 | `--no-listing` | Disable directory listings, which are enabled by default. |
 | `--try-files ENTRY` | Add a candidate or fallback rule; may be specified more than once. |
 | `--config FILE` | Load virtual-host declarations from a YAML file. |
 | `--vhost-dir DIRECTORY` | Load and watch additional `.yaml` and `.yml` virtual-host files in a directory. |
+| `--check-config` | Validate the virtual-host YAML files and exit, reporting errors with source locations. |
 | `--control-socket PATH` | Serve the local HTTP configuration API on a Unix socket. |
 | `--tls-bind ADDRESS` | Listen for HTTPS; configure a certificate with `--tls-cert` and `--tls-key`, or use eligible ACME virtual hosts. |
 | `--http3-bind ADDRESS` | Enable the HTTP/3 listener; TLS configuration is required. |
@@ -422,11 +441,15 @@ vhost:
     root: /srv/www/example.com/public
     user: www-example
     group: www-data
-    index: index.html
+    index: [index.html, index.htm]
     listing: false
     rate_limit: "20/s"
     rate_limit_burst: 40
 ```
+
+Each vhost `index` may be a single filename or an ordered list. Charlotte serves
+the first matching file found in the requested directory, then falls back to a
+directory listing (if enabled).
 
 Virtual hosts without `rate_limit` inherit the global CLI limit. Set
 `rate_limit: off` to exempt a host, or give it a rate such as `20/s` to create

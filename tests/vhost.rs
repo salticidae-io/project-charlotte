@@ -511,3 +511,50 @@ async fn refuses_privilege_change_when_server_is_non_root() {
     );
     let _ = std::fs::remove_dir_all(root);
 }
+
+#[test]
+fn missing_vhost_root_reports_worker_startup_failure() {
+    let root = new_root();
+    let user = if geteuid().is_root() {
+        if User::from_name("nobody").unwrap().is_none() {
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
+        "nobody".to_owned()
+    } else {
+        current_user_name()
+    };
+    let missing_root = root.join("missing-site");
+    let config_path = root.join("vhosts.yaml");
+    let config = format!(
+        "vhost:\n{}",
+        vhost("[\"missing.test\"]", &missing_root, &user, "")
+    );
+    std::fs::write(&config_path, config).unwrap();
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_project-charlotte"));
+    command
+        .arg("--bind")
+        .arg("127.0.0.1:0")
+        .arg("--root")
+        .arg(&root)
+        .arg("--config")
+        .arg(config_path);
+    let output = common::output(&mut command).unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success());
+    assert!(
+        stderr.contains(&missing_root.display().to_string()),
+        "{stderr}"
+    );
+    assert!(stderr.contains("exited before becoming ready"), "{stderr}");
+    assert!(stderr.contains("exit status"), "{stderr}");
+    assert!(
+        stderr.contains("its error was written to stderr"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("virtual host worker failed:"), "{stderr}");
+    assert!(!stderr.contains("early eof"), "{stderr}");
+    let _ = std::fs::remove_dir_all(root);
+}

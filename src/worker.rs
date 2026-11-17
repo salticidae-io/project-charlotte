@@ -54,7 +54,15 @@ pub(crate) fn drop_privileges(config: &Config) -> Result<(), Box<dyn Error + Sen
     Ok(())
 }
 
-pub(crate) async fn run(mut config: Config) -> Result<(), Box<dyn Error + Send + Sync>> {
+pub(crate) async fn run(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let result = run_inner(config).await;
+    if let Err(error) = &result {
+        crate::log_error!("virtual host worker failed: {error}");
+    }
+    result
+}
+
+async fn run_inner(mut config: Config) -> Result<(), Box<dyn Error + Send + Sync>> {
     crate::log_debug!(
         "Starting virtual-host worker pid {} as uid {} gid {}",
         std::process::id(),

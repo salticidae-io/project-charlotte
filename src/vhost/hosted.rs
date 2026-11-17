@@ -49,7 +49,7 @@ pub(super) struct Worker {
     pub(super) uid: u32,
     pub(super) gid: u32,
     pub(super) root: PathBuf,
-    pub(super) index: String,
+    pub(super) index: Vec<String>,
     pub(super) listing: bool,
     pub(super) try_files: Vec<String>,
     pub(super) fastcgi: Vec<FastCgiBackend>,
@@ -199,19 +199,22 @@ impl Worker {
                 crate::log_debug!("Virtual-host worker {} is ready", child.id());
             }
             Ok(Ok(_)) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err("virtual host worker sent an invalid ready signal".into());
+                return Err(self
+                    .startup_failure(&mut child, "sent an invalid ready signal")
+                    .into());
             }
             Ok(Err(error)) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(error.into());
+                let reason = if error.kind() == io::ErrorKind::UnexpectedEof {
+                    "exited before becoming ready".to_owned()
+                } else {
+                    format!("failed while waiting for the ready signal: {error}")
+                };
+                return Err(self.startup_failure(&mut child, &reason).into());
             }
             Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err("virtual host worker did not become ready".into());
+                return Err(self
+                    .startup_failure(&mut child, "did not become ready before the timeout")
+                    .into());
             }
         }
         let handshake =
@@ -219,9 +222,8 @@ impl Worker {
         let (sender, connection) = match handshake {
             Ok(handshake) => handshake,
             Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(error.into());
+                let reason = format!("failed the HTTP/2 handshake: {error}");
+                return Err(self.startup_failure(&mut child, &reason).into());
             }
         };
         tokio::spawn(async move {
@@ -230,6 +232,42 @@ impl Worker {
             }
         });
         Ok(WorkerProcess { sender, child })
+    }
+
+    fn startup_failure(&self, child: &mut Child, reason: &str) -> String {
+        let kill_error = child.kill().err();
+        let deadline = Instant::now() + WORKER_SHUTDOWN_GRACE;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break format!("exit status {status}"),
+                Ok(None) if Instant::now() >= deadline => {
+                    let termination_error = kill_error
+                        .as_ref()
+                        .map_or_else(String::new, |error| format!("; kill failed: {error}"));
+                    break format!(
+                        "exit status unavailable (worker did not exit{termination_error})"
+                    );
+                }
+                Ok(None) => thread::sleep(WORKER_SHUTDOWN_POLL),
+                Err(error) => {
+                    let termination_error =
+                        kill_error.as_ref().map_or_else(String::new, |kill_error| {
+                            format!("; kill failed: {kill_error}")
+                        });
+                    break format!("exit status unavailable ({error}{termination_error})");
+                }
+            }
+        };
+        let error_target = self
+            .error_log_file
+            .as_deref()
+            .map_or_else(|| "stderr".to_owned(), |path| path.display().to_string());
+        format!(
+            "virtual host worker for root {} (uid {}, gid {}) {reason}: {status}; its error was written to {error_target}",
+            self.root.display(),
+            self.uid,
+            self.gid
+        )
     }
 
     /// Sends a client's request to the worker and returns its response.
@@ -385,7 +423,7 @@ pub(super) struct WorkerArgs<'a> {
     pub(super) uid: u32,
     pub(super) gid: u32,
     pub(super) root: &'a Path,
-    pub(super) index: &'a str,
+    pub(super) index: &'a [String],
     pub(super) listing: bool,
     pub(super) try_files: &'a [String],
     pub(super) fastcgi: &'a [FastCgiBackend],
@@ -413,13 +451,15 @@ pub(super) fn build_worker_args(worker: WorkerArgs<'_>) -> Vec<OsString> {
         gid.to_string().into(),
         "--root".into(),
         root.as_os_str().to_owned(),
-        "--index".into(),
-        index.into(),
         "--fastcgi-timeout".into(),
         timeout.as_secs().to_string().into(),
         "--error-log-format".into(),
         error_log_format.into(),
     ];
+    for name in index {
+        args.push("--index".into());
+        args.push(name.into());
+    }
     if !listing {
         args.push("--no-listing".into());
     }

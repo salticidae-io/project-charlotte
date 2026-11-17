@@ -215,7 +215,7 @@ pub(crate) fn fuzz_config(root: PathBuf) -> Config {
         config_file: None,
         vhost_dir: None,
         control_socket: None,
-        index: "index.html".to_owned(),
+        index: vec!["index.html".to_owned()],
         listing: true,
         try_files: Vec::new(),
         fastcgi: vec![FastCgiBackend {
@@ -239,6 +239,7 @@ pub(crate) fn fuzz_config(root: PathBuf) -> Config {
         modsecurity_response_body_limit: 1024 * 1024,
         tls: None,
         acme: None,
+        check_config: false,
         worker: false,
         worker_uid: None,
         worker_gid: None,

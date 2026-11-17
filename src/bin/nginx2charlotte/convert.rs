@@ -1,4 +1,9 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    os::unix::fs::MetadataExt,
+};
+
+use nix::unistd::{Gid, Group, Uid, User};
 
 use super::parse::{Block, Directive, Node};
 
@@ -25,7 +30,7 @@ struct HttpSettings {
     upstreams: HashMap<String, String>,
 }
 
-pub(super) fn convert(nodes: &[Node]) -> String {
+pub(super) fn convert(nodes: &[Node], include_comments: bool, user_from_root: bool) -> String {
     let mut comments = vec![
         "# Converted from nginx configuration. Review all TODO and unmapped directives.".to_owned(),
         "# Global nginx settings are retained below as comments; configure listener and process settings with Charlotte's command-line options.".to_owned(),
@@ -83,6 +88,9 @@ pub(super) fn convert(nodes: &[Node]) -> String {
             "server_names".to_owned(),
             Value::Strings(host.names.clone()),
         );
+        if user_from_root {
+            apply_root_owner(&mut host);
+        }
         if !host.fields.contains_key("proxy_pass") {
             if !host.fields.contains_key("root") {
                 host.comments.push(
@@ -101,9 +109,11 @@ pub(super) fn convert(nodes: &[Node]) -> String {
     }
 
     let mut output = String::new();
-    for comment in comments {
-        output.push_str(&comment);
-        output.push('\n');
+    if include_comments {
+        for comment in comments {
+            output.push_str(&comment);
+            output.push('\n');
+        }
     }
     if output_hosts.is_empty() {
         output.push_str("vhost: []\n");
@@ -111,10 +121,12 @@ pub(super) fn convert(nodes: &[Node]) -> String {
     }
     output.push_str("vhost:\n");
     for host in output_hosts {
-        for comment in host.comments {
-            output.push_str("  ");
-            output.push_str(&comment);
-            output.push('\n');
+        if include_comments {
+            for comment in host.comments {
+                output.push_str("  ");
+                output.push_str(&comment);
+                output.push('\n');
+            }
         }
         output.push_str("  - server_names: ");
         if let Some(Value::Strings(names)) = host.fields.get("server_names") {
@@ -138,6 +150,41 @@ pub(super) fn convert(nodes: &[Node]) -> String {
         }
     }
     output
+}
+
+fn apply_root_owner(host: &mut VirtualHost) {
+    let Some(Value::String(root)) = host.fields.get("root") else {
+        return;
+    };
+    let Ok(metadata) = std::fs::metadata(root) else {
+        comment_root_owner_unavailable(host);
+        return;
+    };
+    let owner = User::from_uid(Uid::from_raw(metadata.uid()));
+    let group = Group::from_gid(Gid::from_raw(metadata.gid()));
+    let (Ok(Some(owner)), Ok(Some(group))) = (owner, group) else {
+        comment_root_owner_unavailable(host);
+        return;
+    };
+    set_root_identity(host, "user", owner.name);
+    set_root_identity(host, "group", group.name);
+}
+
+fn set_root_identity(host: &mut VirtualHost, field: &str, value: String) {
+    if let Some(Value::String(previous)) =
+        host.fields.insert(field.to_owned(), Value::String(value))
+    {
+        host.comments.push(format!(
+            "# --user-from-root replaced configured {field} value {previous:?} with the root directory owner."
+        ));
+    }
+}
+
+fn comment_root_owner_unavailable(host: &mut VirtualHost) {
+    host.comments.push(
+        "# --user-from-root could not determine owner/group for the root; existing user and group values were kept."
+            .to_owned(),
+    );
 }
 
 fn collect_main_user(nodes: &[Node]) -> (Option<String>, Option<String>) {
@@ -307,16 +354,7 @@ fn convert_server_directive(
             &mut host.comments,
         ),
         "root" => set_string(host, "root", value),
-        "index" => {
-            set_string(host, "index", value);
-            if args.len() > 1 {
-                comment_directive_with_reason(
-                    directive,
-                    "Charlotte supports one index file; only the first nginx entry was converted",
-                    &mut host.comments,
-                );
-            }
-        }
+        "index" => convert_index(directive, args, host),
         "autoindex" => match parse_on_off(value) {
             Some(value) => {
                 host.fields.insert("listing".to_owned(), Value::Bool(value));
@@ -370,16 +408,7 @@ fn convert_location(block: &Block, host: &mut VirtualHost, settings: &HttpSettin
                 };
                 match directive.name.to_ascii_lowercase().as_str() {
                     "root" if path_location => set_string(host, "root", value),
-                    "index" if path_location => {
-                        set_string(host, "index", value);
-                        if args.len() > 1 {
-                            comment_directive_with_reason(
-                                directive,
-                                "Charlotte supports one index file; only the first nginx entry was converted",
-                                &mut host.comments,
-                            );
-                        }
-                    }
+                    "index" if path_location => convert_index(directive, args, host),
                     "autoindex" if path_location => match parse_on_off(value) {
                         Some(value) => {
                             host.fields.insert("listing".to_owned(), Value::Bool(value));
@@ -675,6 +704,39 @@ fn parse_on_off(value: &str) -> Option<bool> {
 fn set_string(host: &mut VirtualHost, key: &str, value: &str) {
     host.fields
         .insert(key.to_owned(), Value::String(value.to_owned()));
+}
+
+fn convert_index(directive: &Directive, names: &[String], host: &mut VirtualHost) {
+    let mut indexes = Vec::new();
+    let mut skipped = Vec::new();
+    for name in names {
+        if is_index_name(name) {
+            indexes.push(name.clone());
+        } else {
+            skipped.push(name.clone());
+        }
+    }
+    if !indexes.is_empty() {
+        host.fields
+            .insert("index".to_owned(), Value::Strings(indexes));
+    }
+    if !skipped.is_empty() {
+        comment_directive_with_reason(
+            directive,
+            "Charlotte supports bare index file names; unsupported nginx index entries were skipped",
+            &mut host.comments,
+        );
+    }
+}
+
+fn is_index_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains('/')
+        && !name.contains('\\')
+        && name != "."
+        && name != ".."
+        && !name.eq_ignore_ascii_case("off")
+        && !name.eq_ignore_ascii_case("disabled")
 }
 
 fn append_string(host: &mut VirtualHost, key: &str, value: String) {

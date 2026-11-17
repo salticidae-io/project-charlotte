@@ -3,7 +3,7 @@
 #[cfg(any(feature = "hosting", feature = "proxy"))]
 use std::time::Duration;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     error::Error,
     fs::OpenOptions,
     io::{self, Write},
@@ -68,7 +68,8 @@ struct VhostFile {
     root: Option<PathBuf>,
     user: Option<String>,
     group: Option<String>,
-    index: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_index")]
+    index: Option<Vec<String>>,
     listing: Option<bool>,
     try_files: Option<Vec<String>>,
     #[serde(default)]
@@ -134,6 +135,25 @@ struct FastCgiAppFile {
     #[serde(default, alias = "workers")]
     max_workers: Option<usize>,
     idle_timeout: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum IndexFile {
+    String(String),
+    List(Vec<String>),
+}
+
+fn deserialize_index<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(
+        Option::<IndexFile>::deserialize(deserializer)?.map(|index| match index {
+            IndexFile::String(name) => vec![name],
+            IndexFile::List(names) => names,
+        }),
+    )
 }
 
 struct Vhost {
@@ -851,8 +871,8 @@ impl Router {
                     // account; one running as root confines nothing.
                     return Err(format!("virtual host user must not be root: {user}").into());
                 }
-                let index_name = entry.index.unwrap_or_else(|| fallback.index.clone());
-                validate_index(&index_name)?;
+                let index_names = entry.index.unwrap_or_else(|| fallback.index.clone());
+                validate_index(&index_names)?;
                 let listing = entry.listing.unwrap_or(fallback.listing);
                 let try_files = entry
                     .try_files
@@ -974,7 +994,7 @@ impl Router {
                     uid,
                     gid,
                     root,
-                    index: index_name,
+                    index: index_names,
                     listing,
                     try_files,
                     fastcgi,
@@ -1468,16 +1488,9 @@ pub(crate) fn match_score(pattern: &str, host: &str) -> Option<usize> {
 }
 
 #[cfg(feature = "hosting")]
-fn validate_index(index: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
-    if index.is_empty()
-        || index.contains('/')
-        || index.contains('\\')
-        || index == "."
-        || index == ".."
-    {
-        return Err("vhost index must be a non-empty file name".into());
-    }
-    Ok(())
+fn validate_index(index: &[String]) -> Result<(), Box<dyn Error + Send + Sync>> {
+    crate::config::validate_index_names(index)
+        .map_err(|_| "vhost index must be a non-empty list of file names".into())
 }
 
 fn validate_vhost_declarations<'a>(
@@ -1764,6 +1777,338 @@ fn scan_vhost_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
     }
     files.sort();
     Ok(files)
+}
+
+struct LocatedVhost {
+    path: PathBuf,
+    line: Option<usize>,
+    index: usize,
+    config_dir: PathBuf,
+    entry: VhostFile,
+}
+
+/// Checks the configured virtual-host files without opening logs or starting
+/// any of the server's runtime services.
+pub(crate) fn check_config(fallback: &Config) -> Vec<String> {
+    let mut diagnostics = Vec::new();
+    let current_dir = match std::env::current_dir() {
+        Ok(current_dir) => current_dir,
+        Err(error) => {
+            diagnostics.push(format!("could not determine current directory: {error}"));
+            PathBuf::from(".")
+        }
+    };
+    let config_dir = fallback
+        .config_file
+        .as_ref()
+        .and_then(|path| path.parent())
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map_or_else(
+            || current_dir.clone(),
+            |parent| {
+                if parent.is_absolute() {
+                    parent.to_path_buf()
+                } else {
+                    current_dir.join(parent)
+                }
+            },
+        );
+    let mut entries = Vec::new();
+    let main_vhost_dir = fallback.config_file.as_ref().and_then(|path| {
+        read_config_file_for_check(path, &mut diagnostics).and_then(|(content, file)| {
+            append_located_entries(path, &content, file.vhost, &config_dir, &mut entries);
+            file.vhost_dir
+        })
+    });
+    let dir = fallback
+        .vhost_dir
+        .clone()
+        .map(|dir| resolve_config_path(dir, &current_dir))
+        .or_else(|| main_vhost_dir.map(|dir| resolve_config_path(dir, &config_dir)));
+
+    if let Some(dir) = dir {
+        if let Err(error) = ensure_trusted_config(&dir) {
+            diagnostics.push(format!("{}: {error}", dir.display()));
+        }
+        match scan_vhost_files(&dir) {
+            Ok(paths) => {
+                for path in paths {
+                    let Some((content, file)) = read_config_file_for_check(&path, &mut diagnostics)
+                    else {
+                        continue;
+                    };
+                    let entry_config_dir = path.parent().unwrap_or(&dir);
+                    append_located_entries(
+                        &path,
+                        &content,
+                        file.vhost,
+                        entry_config_dir,
+                        &mut entries,
+                    );
+                }
+            }
+            Err(error) => diagnostics.push(format!("{}: {error}", dir.display())),
+        }
+    }
+
+    let has_waf = !fallback.modsecurity_rules.is_empty();
+    let mut names: HashMap<String, (PathBuf, Option<usize>, usize)> = HashMap::new();
+    let mut default: Option<(PathBuf, Option<usize>, usize)> = None;
+    for located in &entries {
+        let location = source_location(&located.path, located.line, located.index);
+        if let Err(error) =
+            validate_vhost_entry(&located.entry, fallback, &located.config_dir, has_waf)
+        {
+            diagnostics.push(format!("{location}: {error}"));
+        }
+
+        if located.entry.default {
+            if let Some((first_path, first_line, first_index)) = &default {
+                let first = source_location(first_path, *first_line, *first_index);
+                diagnostics.push(format!(
+                    "{location}: only one vhost may be marked default; first declared at {first}"
+                ));
+            } else {
+                default = Some((located.path.clone(), located.line, located.index));
+            }
+        }
+        for name in &located.entry.server_names {
+            if let Some(normalized) = normalize_server_name(name) {
+                if let Some((first_path, first_line, first_index)) = names.get(&normalized) {
+                    let first = source_location(first_path, *first_line, *first_index);
+                    diagnostics.push(format!(
+                        "{location}: duplicate virtual host name: {normalized}; first declared at {first}"
+                    ));
+                } else {
+                    names.insert(
+                        normalized,
+                        (located.path.clone(), located.line, located.index),
+                    );
+                }
+            }
+        }
+    }
+    diagnostics
+}
+
+fn read_config_file_for_check(
+    path: &Path,
+    diagnostics: &mut Vec<String>,
+) -> Option<(String, FileConfig)> {
+    if let Err(error) = ensure_trusted_config(path) {
+        diagnostics.push(format!("{}: {error}", path.display()));
+        return None;
+    }
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) => {
+            diagnostics.push(format!("{}: {error}", path.display()));
+            return None;
+        }
+    };
+    match parse_file_config(&content) {
+        Ok(file) => Some((content, file)),
+        Err(error) => {
+            if let Some(location) = error.location() {
+                diagnostics.push(format!(
+                    "{}:{}:{}: {error}",
+                    path.display(),
+                    location.line(),
+                    location.column()
+                ));
+            } else {
+                diagnostics.push(format!("{}: {error}", path.display()));
+            }
+            None
+        }
+    }
+}
+
+fn append_located_entries(
+    path: &Path,
+    content: &str,
+    file_entries: Vec<VhostFile>,
+    config_dir: &Path,
+    entries: &mut Vec<LocatedVhost>,
+) {
+    let lines = vhost_entry_lines(content);
+    let locations = if lines.len() == file_entries.len() {
+        lines.into_iter().map(Some).collect::<Vec<_>>()
+    } else {
+        let key_line = vhost_key_line(content);
+        vec![key_line; file_entries.len()]
+    };
+    for (index, (entry, line)) in file_entries.into_iter().zip(locations).enumerate() {
+        entries.push(LocatedVhost {
+            path: path.to_path_buf(),
+            line,
+            index: index + 1,
+            config_dir: config_dir.to_path_buf(),
+            entry,
+        });
+    }
+}
+
+fn vhost_key_line(content: &str) -> Option<usize> {
+    content.lines().enumerate().find_map(|(index, line)| {
+        let trimmed = line.trim_start();
+        (line.len() == trimmed.len()
+            && trimmed
+                .strip_prefix("vhost:")
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace)))
+        .then_some(index + 1)
+    })
+}
+
+fn vhost_entry_lines(content: &str) -> Vec<usize> {
+    let Some(key_line) = vhost_key_line(content) else {
+        return Vec::new();
+    };
+    let mut lines = Vec::new();
+    let mut item_indent = None;
+    for (index, line) in content.lines().enumerate().skip(key_line) {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let indent = line.len() - trimmed.len();
+        let is_item = trimmed == "-" || trimmed.starts_with("- ") || trimmed.starts_with("-\t");
+        if is_item {
+            match item_indent {
+                Some(item_indent) if indent == item_indent => lines.push(index + 1),
+                Some(item_indent) if indent > item_indent => {}
+                Some(_) => break,
+                None => {
+                    item_indent = Some(indent);
+                    lines.push(index + 1);
+                }
+            }
+        } else if item_indent.is_some_and(|item_indent| indent <= item_indent) {
+            break;
+        }
+    }
+    lines
+}
+
+fn source_location(path: &Path, line: Option<usize>, index: usize) -> String {
+    match line {
+        Some(line) => format!("{}:{line}", path.display()),
+        None => format!("{}:entry {index}", path.display()),
+    }
+}
+
+#[cfg_attr(not(feature = "proxy"), allow(unused_variables))]
+fn validate_vhost_entry(
+    entry: &VhostFile,
+    fallback: &Config,
+    config_dir: &Path,
+    has_waf: bool,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    validate_vhost_declarations(std::iter::once(entry))?;
+    validate_vhost_waf_declarations(std::iter::once(entry), has_waf)?;
+    crate::logging::AccessFormat::parse(
+        entry
+            .access_log_format
+            .as_deref()
+            .unwrap_or(&fallback.access_log_format),
+    )?;
+    crate::logging::ErrorFormat::parse(
+        entry
+            .error_log_format
+            .as_deref()
+            .unwrap_or(&fallback.error_log_format),
+    )?;
+
+    #[cfg(feature = "proxy")]
+    if let Some(upstream) = &entry.proxy_pass {
+        let ca_root = entry
+            .proxy_ca_root
+            .clone()
+            .map(|path| resolve_config_path(path, config_dir));
+        ReverseProxy::new(
+            upstream,
+            entry.proxy_preserve_host.unwrap_or(true),
+            Duration::from_secs(entry.proxy_timeout.unwrap_or(60)),
+            ca_root.as_deref(),
+        )?;
+    }
+
+    #[cfg(feature = "hosting")]
+    if entry.proxy_pass.is_none() {
+        let user = entry
+            .user
+            .as_deref()
+            .ok_or("vhost user is required unless proxy_pass is configured")?;
+        let (uid, _) = resolve_identity(user, entry.group.as_deref())?;
+        if uid == 0 {
+            return Err(format!("virtual host user must not be root: {user}").into());
+        }
+        validate_index(entry.index.as_deref().unwrap_or(&fallback.index))?;
+        crate::config::validate_try_files(
+            entry.try_files.as_deref().unwrap_or(&fallback.try_files),
+        )?;
+
+        let mut extensions = std::collections::HashSet::new();
+        for value in &entry.fastcgi {
+            let backend = crate::config::parse_fastcgi_backend(value)?;
+            if !extensions.insert(backend.extension.clone()) {
+                return Err(format!(
+                    "duplicate backend extension in vhost: {}",
+                    backend.extension
+                )
+                .into());
+            }
+        }
+        for value in &entry.cgi {
+            let backend = crate::config::parse_cgi_backend(value)?;
+            if !extensions.insert(backend.extension.clone()) {
+                return Err(format!(
+                    "duplicate backend extension in vhost: {}",
+                    backend.extension
+                )
+                .into());
+            }
+        }
+        for app in &entry.fastcgi_app {
+            let Some(program) = app.command.first() else {
+                return Err(format!(
+                    "vhost FastCGI app .{} command must not be empty",
+                    app.extension
+                )
+                .into());
+            };
+            let extension = crate::config::normalize_extension(&app.extension)?;
+            if !extensions.insert(extension.clone()) {
+                return Err(format!("duplicate backend extension in vhost: {extension}").into());
+            }
+            if app.command.iter().any(|part| part.contains('\0')) {
+                return Err("vhost FastCGI app command cannot contain NUL".into());
+            }
+            crate::config::parse_fastcgi_app(&format!("{extension}={program}"))?;
+            crate::config::parse_fastcgi_app_max_workers(
+                &app.max_workers.unwrap_or(1).to_string(),
+            )?;
+            crate::config::parse_fastcgi_app_idle_timeout(
+                &app.idle_timeout
+                    .unwrap_or(crate::config::DEFAULT_FASTCGI_APP_IDLE_TIMEOUT_SECS)
+                    .to_string(),
+            )?;
+            for (key, value) in &app.env {
+                crate::config::validate_env_key(key)?;
+                if value.contains('\0') {
+                    return Err("vhost FastCGI app environment value cannot contain NUL".into());
+                }
+            }
+        }
+        if entry
+            .fastcgi_timeout
+            .unwrap_or(fallback.fastcgi_timeout.as_secs())
+            == 0
+        {
+            return Err("vhost FastCGI timeout must be greater than zero".into());
+        }
+    }
+    Ok(())
 }
 
 fn control_reload_error(error: Box<dyn Error + Send + Sync>) -> ControlError {
@@ -2289,6 +2634,30 @@ mod tests {
     }
 
     #[test]
+    fn parses_single_and_list_directory_indexes_and_rejects_empty_list() {
+        let single = parse_file_config(
+            "vhost:\n  - server_names: [single.example]\n    root: /srv/single\n    user: site\n    index: index.htm\n",
+        )
+        .unwrap();
+        assert_eq!(single.vhost[0].index.as_deref().unwrap(), ["index.htm"]);
+
+        let list = parse_file_config(
+            "vhost:\n  - server_names: [list.example]\n    root: /srv/list\n    user: site\n    index: [index.htm, index.html]\n",
+        )
+        .unwrap();
+        let indexes = list.vhost[0].index.as_deref().unwrap();
+        assert_eq!(indexes, ["index.htm", "index.html"]);
+        validate_index(indexes).unwrap();
+        assert!(validate_index(&[]).is_err());
+
+        let empty = parse_file_config(
+            "vhost:\n  - server_names: [empty.example]\n    root: /srv/empty\n    user: site\n    index: []\n",
+        )
+        .unwrap();
+        assert!(validate_index(empty.vhost[0].index.as_deref().unwrap()).is_err());
+    }
+
+    #[test]
     fn scans_visible_yaml_files_in_sorted_order() {
         let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
         let directory = std::env::temp_dir().join(format!(
@@ -2355,7 +2724,7 @@ mod tests {
             uid: 1001,
             gid: 1002,
             root: Path::new("/srv/example"),
-            index: "home.php",
+            index: &["home.php".to_owned(), "index.php".to_owned()],
             listing: false,
             try_files: &["$uri".to_owned(), "=404".to_owned()],
             fastcgi: &backends,
@@ -2416,7 +2785,7 @@ mod tests {
             uid: 1001,
             gid: 1002,
             root: Path::new("/srv/cgi"),
-            index: "index.html",
+            index: &["index.html".to_owned()],
             listing: true,
             try_files: &[],
             fastcgi: &backends,
@@ -2557,7 +2926,7 @@ mod tests {
                     uid: 0,
                     gid: 0,
                     root: PathBuf::from("/"),
-                    index: "index.html".to_owned(),
+                    index: vec!["index.html".to_owned()],
                     listing: false,
                     try_files: Vec::new(),
                     fastcgi: Vec::new(),
@@ -2755,7 +3124,7 @@ mod tests {
     /// unchanged.
     #[test_fuzz::test_fuzz]
     fn worker_args(
-        index: String,
+        index: Vec<String>,
         listing: bool,
         try_files: Vec<String>,
         fastcgi: Vec<String>,
@@ -2850,7 +3219,7 @@ mod tests {
     #[test]
     fn fuzz_seed_worker_args() {
         worker_args(
-            "index.php".to_owned(),
+            vec!["index.php".to_owned()],
             false,
             vec!["$uri".to_owned(), "/index.php?$args".to_owned()],
             vec![
@@ -2870,7 +3239,7 @@ mod tests {
             "/srv/site".to_owned(),
         );
         worker_args(
-            "--no-listing".to_owned(),
+            vec!["--no-listing".to_owned()],
             true,
             Vec::new(),
             Vec::new(),
@@ -2879,7 +3248,7 @@ mod tests {
             "--help".to_owned(),
         );
         worker_args(
-            "index.php".to_owned(),
+            vec!["index.php".to_owned()],
             false,
             Vec::new(),
             Vec::new(),
@@ -2894,7 +3263,37 @@ mod tests {
 /// which need a hosted site to route to.
 #[cfg(test)]
 mod feature_tests {
-    use super::{missing_feature, parse_file_config, validate_vhost_declarations};
+    use super::{
+        check_config, missing_feature, parse_file_config, validate_vhost_declarations,
+        vhost_entry_lines,
+    };
+    use crate::config::{Config, ParseResult};
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
+
+    fn temp_dir() -> PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "project-charlotte-check-config-{}-{}",
+            std::process::id(),
+            NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        directory
+    }
+
+    fn check_file(path: &Path) -> Vec<String> {
+        let ParseResult::Config(config) =
+            Config::parse(["--config".to_owned(), path.to_string_lossy().into_owned()]).unwrap()
+        else {
+            panic!("expected a configuration");
+        };
+        check_config(&config)
+    }
 
     fn declaration(yaml: &str) -> super::VhostFile {
         parse_file_config(yaml).unwrap().vhost.remove(0)
@@ -2963,6 +3362,114 @@ mod feature_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn maps_block_sequence_entries_without_matching_nested_lists() {
+        let content = concat!(
+            "vhost:\n",
+            "  - server_names: [first.test]\n",
+            "    fastcgi_app:\n",
+            "      - extension: php\n",
+            "        command: [/usr/bin/php-cgi]\n",
+            "  - server_names: [second.test]\n",
+            "vhost_dir: ./sites\n",
+        );
+        assert_eq!(vhost_entry_lines(content), [2, 6]);
+        assert_eq!(
+            vhost_entry_lines("vhost:\n- server_names: [root.test]\n"),
+            [2]
+        );
+    }
+
+    #[test]
+    fn check_config_reports_yaml_and_semantic_errors_with_entry_lines() {
+        let directory = temp_dir();
+        let syntax_path = directory.join("syntax.yaml");
+        fs::write(&syntax_path, "vhost:\n  - server_names: [broken.test\n").unwrap();
+        let syntax_errors = check_file(&syntax_path);
+        assert!(
+            syntax_errors
+                .iter()
+                .any(|error| error.starts_with(&format!("{}:3:", syntax_path.display()))),
+            "{syntax_errors:?}"
+        );
+
+        let semantic_path = directory.join("semantic.yaml");
+        fs::write(
+            &semantic_path,
+            concat!(
+                "vhost:\n",
+                "  - server_names: [rate.test]\n",
+                "    proxy_pass: http://127.0.0.1:8080\n",
+                "    rate_limit: invalid\n",
+                "  - server_names: [second-rate.test]\n",
+                "    proxy_pass: http://127.0.0.1:8080\n",
+                "    rate_limit: invalid\n",
+            ),
+        )
+        .unwrap();
+        let semantic_errors = check_file(&semantic_path);
+        for line in [2, 5] {
+            assert!(
+                semantic_errors.iter().any(|error| {
+                    error.starts_with(&format!("{}:{line}:", semantic_path.display()))
+                        && error.contains("rate_limit")
+                }),
+                "{semantic_errors:?}"
+            );
+        }
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[cfg(feature = "proxy")]
+    #[test]
+    fn check_config_reports_duplicate_names_across_main_and_directory_files() {
+        let directory = temp_dir();
+        let vhost_dir = directory.join("sites");
+        fs::create_dir_all(&vhost_dir).unwrap();
+        let main_path = directory.join("main.yaml");
+        fs::write(
+            &main_path,
+            concat!(
+                "vhost_dir: sites\n",
+                "vhost:\n",
+                "  - server_names: [duplicate.test]\n",
+                "    proxy_pass: http://127.0.0.1:8080\n",
+                "    default: true\n",
+            ),
+        )
+        .unwrap();
+        let dir_path = vhost_dir.join("site.yaml");
+        fs::write(
+            &dir_path,
+            concat!(
+                "vhost:\n",
+                "  - server_names: [duplicate.test]\n",
+                "    proxy_pass: http://127.0.0.1:8080\n",
+                "    default: true\n",
+            ),
+        )
+        .unwrap();
+
+        let errors = check_file(&main_path);
+        assert!(
+            errors.iter().any(|error| {
+                error.starts_with(&format!("{}:2:", dir_path.display()))
+                    && error.contains("duplicate virtual host name")
+                    && error.contains(&format!("{}:3", main_path.display()))
+            }),
+            "{errors:?}"
+        );
+        assert!(
+            errors.iter().any(|error| {
+                error.starts_with(&format!("{}:2:", dir_path.display()))
+                    && error.contains("only one vhost may be marked default")
+                    && error.contains(&format!("{}:3", main_path.display()))
+            }),
+            "{errors:?}"
+        );
+        let _ = fs::remove_dir_all(directory);
     }
 
     #[cfg(feature = "proxy")]

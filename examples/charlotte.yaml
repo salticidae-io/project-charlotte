@@ -66,9 +66,10 @@ vhost:
 # Optional. Defaults to the user's primary group.
     group: www-data
 
-# Optional. Falls back to the --index value (default "index.html").
-# Must be a bare file name: no "/", no "\", not "." or "..".
-    index: index.html
+# Optional. Falls back to the --index value (default ["index.html"]).
+# A single bare file name or ordered list; first existing file wins. Names must
+# not contain "/" or "\", and cannot be "." or "..".
+    index: [index.html]
 
 # Optional. Falls back to --no-listing / the default of true.
     listing: false

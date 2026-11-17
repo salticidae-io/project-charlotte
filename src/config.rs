@@ -57,7 +57,7 @@ pub struct Config {
     pub config_file: Option<PathBuf>,
     pub vhost_dir: Option<PathBuf>,
     pub control_socket: Option<PathBuf>,
-    pub index: String,
+    pub index: Vec<String>,
     pub listing: bool,
     pub try_files: Vec<String>,
     pub fastcgi: Vec<FastCgiBackend>,
@@ -78,6 +78,7 @@ pub struct Config {
     pub modsecurity_response_body_limit: usize,
     pub tls: Option<TlsFiles>,
     pub acme: Option<AcmeSettings>,
+    pub check_config: bool,
     pub worker: bool,
     pub worker_uid: Option<u32>,
     pub worker_gid: Option<u32>,
@@ -140,9 +141,9 @@ struct Cli {
     /// Document root of the fallback site
     #[arg(long, value_name = "DIRECTORY", default_value = ".", hide = !HOSTING, allow_hyphen_values = true)]
     root: PathBuf,
-    /// Directory index file name
-    #[arg(long, value_name = "NAME", default_value = "index.html", hide = !HOSTING, allow_hyphen_values = true)]
-    index: String,
+    /// Directory index file name (may be repeated or comma-separated, in lookup order)
+    #[arg(long, value_name = "NAME", value_delimiter = ',', default_value = "index.html", hide = !HOSTING, allow_hyphen_values = true)]
+    index: Vec<String>,
     /// Disable directory listings
     #[arg(long, hide = !HOSTING)]
     no_listing: bool,
@@ -227,6 +228,9 @@ struct Cli {
     /// Unix socket for managing virtual hosts
     #[arg(long, value_name = "PATH", allow_hyphen_values = true)]
     control_socket: Option<PathBuf>,
+    /// Validate virtual-host configuration and exit
+    #[arg(long)]
+    check_config: bool,
     /// Fallback TLS certificate chain (PEM)
     #[arg(long, value_name = "PATH", allow_hyphen_values = true)]
     tls_cert: Option<PathBuf>,
@@ -416,6 +420,7 @@ impl Config {
             config_file,
             vhost_dir,
             control_socket,
+            check_config,
             tls_cert,
             tls_key,
             acme_directory,
@@ -463,14 +468,7 @@ impl Config {
         let modsecurity_body_limit = body_limit.unwrap_or(16 * 1024 * 1024);
         let modsecurity_response_body_limit = body_limit.unwrap_or(1024 * 1024);
 
-        if index.is_empty()
-            || index.contains('/')
-            || index.contains('\\')
-            || index == "."
-            || index == ".."
-        {
-            return Err("--index must be a non-empty file name".to_owned());
-        }
+        validate_index_names(&index).map_err(|error| format!("--index {error}"))?;
         validate_try_files(&try_files)?;
 
         for (extension, arg) in fastcgi_app_args {
@@ -562,6 +560,9 @@ impl Config {
         if worker && worker_uid.is_none() {
             return Err("--worker requires worker uid/gid options".to_owned());
         }
+        if worker && check_config {
+            return Err("--check-config cannot be used with --worker".to_owned());
+        }
 
         Ok(ParseResult::Config(Box::new(Self {
             debug,
@@ -594,6 +595,7 @@ impl Config {
             modsecurity_response_body_limit,
             tls,
             acme,
+            check_config,
             worker,
             worker_uid,
             worker_gid,
@@ -814,6 +816,18 @@ pub(crate) fn validate_try_files(entries: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+pub(crate) fn validate_index_names(names: &[String]) -> Result<(), String> {
+    if names.is_empty() {
+        return Err("must contain at least one file name".to_owned());
+    }
+    if names.iter().any(|name| {
+        name.is_empty() || name.contains('/') || name.contains('\\') || name == "." || name == ".."
+    }) {
+        return Err("entries must be non-empty file names without path separators".to_owned());
+    }
+    Ok(())
+}
+
 fn validate_try_files_variables(entry: &str) -> Result<(), String> {
     let bytes = entry.as_bytes();
     let mut index = 0;
@@ -1017,9 +1031,28 @@ mod tests {
         assert_eq!(config.root.as_path(), std::path::Path::new("public"));
         assert_eq!(config.config_file, None);
         assert_eq!(config.control_socket, None);
-        assert_eq!(config.index, "home.htm");
+        assert_eq!(config.index, ["home.htm"]);
         assert!(!config.listing);
         assert!(config.try_files.is_empty());
+    }
+
+    #[cfg(feature = "hosting")]
+    #[test]
+    fn parses_multiple_directory_indexes_in_order() {
+        let parsed = Config::parse([
+            "--index".to_owned(),
+            "home.htm,index.html".to_owned(),
+            "--index".to_owned(),
+            "default.php".to_owned(),
+        ])
+        .unwrap();
+        let ParseResult::Config(config) = parsed else {
+            panic!("expected config")
+        };
+        assert_eq!(config.index, ["home.htm", "index.html", "default.php"]);
+
+        assert!(Config::parse(["--index".to_owned(), "../index.html".to_owned()]).is_err());
+        assert!(Config::parse(["--index".to_owned(), "".to_owned()]).is_err());
     }
 
     #[test]
@@ -1805,6 +1838,36 @@ mod tests {
             panic!("expected config")
         };
         assert!(!config.plain_http);
+    }
+
+    #[test]
+    fn check_config_is_an_option_and_is_rejected_for_workers() {
+        let Ok(ParseResult::Config(default_config)) = Config::parse(Vec::<String>::new()) else {
+            panic!("expected config");
+        };
+        assert!(!default_config.check_config);
+        let Ok(ParseResult::Config(config)) = Config::parse(["--check-config".to_owned()]) else {
+            panic!("expected config");
+        };
+        assert!(config.check_config);
+
+        #[cfg(feature = "hosting")]
+        {
+            let error = Config::parse(
+                [
+                    "--check-config",
+                    "--worker",
+                    "--worker-uid",
+                    "1000",
+                    "--worker-gid",
+                    "1000",
+                ]
+                .map(str::to_owned),
+            )
+            .err()
+            .expect("worker mode must reject config validation");
+            assert!(error.contains("--check-config cannot be used with --worker"));
+        }
     }
 
     #[cfg(feature = "acme")]

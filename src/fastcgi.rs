@@ -52,6 +52,7 @@ pub struct ResolvedScript {
 enum ScriptCandidate {
     DirectoryIndex {
         directory: PathBuf,
+        index: String,
         script_name: String,
         backend: usize,
     },
@@ -77,17 +78,21 @@ pub async fn resolve_script(
         .collect::<Option<Vec<_>>>()?;
 
     let mut candidates = Vec::new();
-    if raw_path.ends_with('/')
-        && let Some(backend) = backend_for_name(&config.index, config)
-    {
-        let mut script_name = uri_path(&segments);
-        script_name.push('/');
-        handler::percent_encode_into(&mut script_name, &config.index);
-        candidates.push(ScriptCandidate::DirectoryIndex {
-            directory: config.root.join(relative_path),
-            script_name,
-            backend,
-        });
+    if raw_path.ends_with('/') {
+        for index in &config.index {
+            let Some(backend) = backend_for_name(index, config) else {
+                continue;
+            };
+            let mut script_name = uri_path(&segments);
+            script_name.push('/');
+            handler::percent_encode_into(&mut script_name, index);
+            candidates.push(ScriptCandidate::DirectoryIndex {
+                directory: config.root.join(relative_path),
+                index: index.clone(),
+                script_name,
+                backend,
+            });
+        }
     }
 
     for script_length in 1..=segments.len() {
@@ -132,6 +137,7 @@ pub async fn resolve_script(
             .find_map(|candidate| match candidate {
                 ScriptCandidate::DirectoryIndex {
                     directory,
+                    index,
                     script_name,
                     backend,
                 } => {
@@ -141,7 +147,7 @@ pub async fn resolve_script(
                     {
                         return None;
                     }
-                    let path = std::fs::canonicalize(directory.join(&config.index)).ok()?;
+                    let path = std::fs::canonicalize(directory.join(index)).ok()?;
                     if !path.starts_with(root)
                         || !std::fs::metadata(&path).is_ok_and(|metadata| metadata.is_file())
                     {
@@ -1058,7 +1064,7 @@ mod tests {
             config_file: None,
             vhost_dir: None,
             control_socket: None,
-            index: "index.php".to_owned(),
+            index: vec!["index.php".to_owned()],
             listing: true,
             try_files: Vec::new(),
             fastcgi: vec![FastCgiBackend {
@@ -1082,6 +1088,7 @@ mod tests {
             modsecurity_response_body_limit: 1024 * 1024,
             tls: None,
             acme: None,
+            check_config: false,
             worker: false,
             worker_uid: None,
             worker_gid: None,
@@ -1145,10 +1152,12 @@ mod tests {
         tokio::fs::write(root.join("app.php"), "<?php")
             .await
             .unwrap();
-        tokio::fs::write(root.join("folder/index.php"), "<?php")
+        tokio::fs::write(root.join("folder/index-fallback.php"), "<?php")
             .await
             .unwrap();
-        let config = Arc::new(test_config(tokio::fs::canonicalize(&root).await.unwrap()));
+        let mut test_config = test_config(tokio::fs::canonicalize(&root).await.unwrap());
+        test_config.index = vec!["index.php".to_owned(), "index-fallback.php".to_owned()];
+        let config = Arc::new(test_config);
 
         let relative = decode_request_path("/app.php/extra/path").unwrap();
         let script = resolve_script(&relative, "/app.php/extra/path", &config)
@@ -1161,7 +1170,7 @@ mod tests {
         let script = resolve_script(&relative, "/folder/", &config)
             .await
             .unwrap();
-        assert_eq!(script.script_name, "/folder/index.php");
+        assert_eq!(script.script_name, "/folder/index-fallback.php");
         assert!(script.path_info.is_empty());
         assert!(decode_request_path("/%2e%2e/secret.php").is_none());
 
@@ -1319,7 +1328,7 @@ mod tests {
         };
         let mut config = fuzz_support::fuzz_config(root.clone());
         // Makes `scripts/index.php` reachable as a directory index.
-        config.index = "index.php".to_owned();
+        config.index = vec!["index.php".to_owned()];
         let config = Arc::new(config);
         let uri = request.uri().clone();
         let Some(relative) = decode_request_path(uri.path()) else {

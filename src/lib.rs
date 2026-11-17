@@ -188,6 +188,14 @@ pub fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         }
         ParseResult::Config(config) => *config,
     };
+    if config.check_config {
+        let diagnostics = vhost::check_config(&config);
+        if diagnostics.is_empty() {
+            println!("Configuration OK");
+            return Ok(());
+        }
+        return Err(diagnostics.join("\n").into());
+    }
     #[cfg(feature = "hosting")]
     let mut config = config;
     #[cfg(not(feature = "hosting"))]
