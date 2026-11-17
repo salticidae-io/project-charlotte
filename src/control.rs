@@ -3,7 +3,7 @@
 use std::{
     io,
     os::unix::{
-        fs::{FileTypeExt, PermissionsExt},
+        fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt},
         net::UnixStream as StdUnixStream,
     },
     path::{Path, PathBuf},
@@ -24,6 +24,7 @@ use tokio::{
 
 use crate::{
     config::Config,
+    pathctx::PathContext,
     reload,
     tls::SniHandle,
     vhost::{ControlError, Router},
@@ -48,9 +49,12 @@ pub(crate) async fn spawn(
     started: Instant,
     mut shutdown: watch::Receiver<bool>,
 ) -> io::Result<JoinHandle<()>> {
+    prepare_socket_directory(&path, None)?;
     remove_stale_socket(&path)?;
-    let listener = UnixListener::bind(&path)?;
-    if let Err(error) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)) {
+    let listener = UnixListener::bind(&path).path_context("bind control socket", &path)?;
+    if let Err(error) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        .path_context("set permissions on control socket", &path)
+    {
         drop(listener);
         let _ = std::fs::remove_file(&path);
         return Err(error);
@@ -106,8 +110,135 @@ pub(crate) async fn spawn(
     }))
 }
 
+const SOCKET_DIRECTORY_MODE: u32 = 0o750;
+
+/// Ensures the control socket's parent directory exists and is usable by the
+/// account that binds the socket. With `owner`, a missing directory (or a
+/// dedicated one that is empty or holds only the old socket) is assigned to
+/// that uid/gid; shared directories are never re-owned.
+pub(crate) fn prepare_socket_directory(socket: &Path, owner: Option<(u32, u32)>) -> io::Result<()> {
+    let Some(directory) = socket
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    else {
+        return Ok(());
+    };
+    let link = match std::fs::symlink_metadata(directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            // Intermediate directories stay traversable so the socket owner
+            // can reach its own directory.
+            if let Some(ancestor) = directory
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                std::fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o755)
+                    .create(ancestor)
+                    .path_context("create control socket directory", ancestor)?;
+            }
+            std::fs::DirBuilder::new()
+                .mode(SOCKET_DIRECTORY_MODE)
+                .create(directory)
+                .path_context("create control socket directory", directory)?;
+            secure_socket_directory(directory, owner)?;
+            crate::log_debug!("Created control socket directory {}", directory.display());
+            return Ok(());
+        }
+        Err(error) => {
+            return Err(error).path_context("inspect control socket directory", directory);
+        }
+    };
+    let metadata = if link.file_type().is_symlink() {
+        std::fs::metadata(directory).path_context("inspect control socket directory", directory)?
+    } else {
+        link.clone()
+    };
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "control socket directory {} is not a directory",
+                directory.display()
+            ),
+        ));
+    }
+    let Some((uid, gid)) = owner else {
+        return Ok(());
+    };
+    let mode = metadata.mode();
+    if link.file_type().is_symlink() {
+        if directory_writable(&metadata, uid, gid) {
+            return Ok(());
+        }
+    } else if metadata.uid() == uid {
+        if metadata.gid() == gid && mode & 0o300 == 0o300 && mode & 0o022 == 0 {
+            return Ok(());
+        }
+        return secure_socket_directory(directory, owner);
+    } else if directory_writable(&metadata, uid, gid) {
+        return Ok(());
+    } else if is_dedicated_socket_directory(directory, socket)? {
+        return secure_socket_directory(directory, owner);
+    }
+    Err(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!(
+            "control socket directory {} is not writable by uid {uid} gid {gid}; \
+             change its ownership or choose a dedicated directory",
+            directory.display()
+        ),
+    ))
+}
+
+fn directory_writable(metadata: &std::fs::Metadata, uid: u32, gid: u32) -> bool {
+    let mode = metadata.mode();
+    if uid == 0 {
+        true
+    } else if metadata.uid() == uid {
+        mode & 0o300 == 0o300
+    } else if metadata.gid() == gid {
+        mode & 0o030 == 0o030
+    } else {
+        mode & 0o003 == 0o003
+    }
+}
+
+fn is_dedicated_socket_directory(directory: &Path, socket: &Path) -> io::Result<bool> {
+    let socket_name = socket.file_name();
+    for entry in
+        std::fs::read_dir(directory).path_context("read control socket directory", directory)?
+    {
+        let entry = entry.path_context("read control socket directory entry", directory)?;
+        if Some(entry.file_name().as_os_str()) != socket_name {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn secure_socket_directory(directory: &Path, owner: Option<(u32, u32)>) -> io::Result<()> {
+    if let Some((uid, gid)) = owner {
+        std::os::unix::fs::lchown(directory, Some(uid), Some(gid))
+            .path_context("change ownership of control socket directory", directory)?;
+    }
+    std::fs::set_permissions(
+        directory,
+        std::fs::Permissions::from_mode(SOCKET_DIRECTORY_MODE),
+    )
+    .path_context("set permissions on control socket directory", directory)?;
+    if let Some((uid, gid)) = owner {
+        crate::log_debug!(
+            "Prepared control socket directory {} for uid {uid} and gid {gid}",
+            directory.display()
+        );
+    }
+    Ok(())
+}
+
 fn remove_stale_socket(path: &Path) -> io::Result<()> {
-    match std::fs::symlink_metadata(path) {
+    match std::fs::symlink_metadata(path).path_context("inspect control socket", path) {
         Ok(metadata) if metadata.file_type().is_socket() => match StdUnixStream::connect(path) {
             Ok(_) => Err(io::Error::new(
                 io::ErrorKind::AddrInUse,
@@ -122,9 +253,9 @@ fn remove_stale_socket(path: &Path) -> io::Result<()> {
                     io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
                 ) =>
             {
-                std::fs::remove_file(path)
+                std::fs::remove_file(path).path_context("remove stale control socket", path)
             }
-            Err(error) => Err(error),
+            Err(error) => Err(error).path_context("connect to control socket", path),
         },
         Ok(_) => Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
@@ -306,9 +437,89 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
     };
 
-    use super::remove_stale_socket;
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::{prepare_socket_directory, remove_stale_socket};
 
     static NEXT_PATH: AtomicU64 = AtomicU64::new(0);
+
+    fn temporary_path(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "project-charlotte-{label}-{}-{}",
+            std::process::id(),
+            NEXT_PATH.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    fn current_owner() -> (u32, u32) {
+        (
+            nix::unistd::geteuid().as_raw(),
+            nix::unistd::getegid().as_raw(),
+        )
+    }
+
+    #[test]
+    fn creates_missing_control_socket_directory_with_private_mode() {
+        let base = temporary_path("control-dir");
+        let directory = base.join("nested").join("run");
+        let socket = directory.join("control.sock");
+
+        prepare_socket_directory(&socket, Some(current_owner())).unwrap();
+
+        let metadata = fs::metadata(&directory).unwrap();
+        assert!(metadata.is_dir());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o750);
+        assert_eq!(
+            fs::metadata(base.join("nested"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o005,
+            0o005
+        );
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn tightens_owned_control_socket_directory() {
+        let directory = temporary_path("control-dir-owned");
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o777)).unwrap();
+
+        prepare_socket_directory(&directory.join("control.sock"), Some(current_owner())).unwrap();
+
+        assert_eq!(
+            fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+            0o750
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn leaves_existing_directory_alone_without_owner() {
+        let directory = temporary_path("control-dir-plain");
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).unwrap();
+
+        prepare_socket_directory(&directory.join("control.sock"), None).unwrap();
+
+        assert_eq!(
+            fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn rejects_non_directory_control_socket_parent() {
+        let parent = temporary_path("control-dir-file");
+        fs::write(&parent, "").unwrap();
+
+        let error = prepare_socket_directory(&parent.join("control.sock"), None).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        fs::remove_file(parent).unwrap();
+    }
 
     #[test]
     fn refuses_to_remove_non_socket_control_paths() {

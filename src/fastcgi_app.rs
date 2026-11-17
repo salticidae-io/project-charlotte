@@ -35,7 +35,10 @@ use tokio::{
     time::sleep,
 };
 
-use crate::config::{Config, FastCgiAddress, FastCgiApp};
+use crate::{
+    config::{Config, FastCgiAddress, FastCgiApp},
+    pathctx::PathContext,
+};
 
 static NEXT_SOCKET_ID: AtomicU64 = AtomicU64::new(0);
 const RESTART_DELAY: Duration = Duration::from_secs(1);
@@ -323,7 +326,7 @@ fn validate_app_program(app: &FastCgiApp, root: &Path) -> io::Result<()> {
     };
 
     for candidate in candidates {
-        match fs::metadata(candidate) {
+        match fs::metadata(&candidate).path_context("inspect FastCGI app candidate", &candidate) {
             Ok(metadata) if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 => {
                 return Ok(());
             }
@@ -349,6 +352,16 @@ fn spawn_app(
     pid: &AtomicU32,
 ) -> io::Result<(Child, Instant)> {
     let path = std::env::var_os("PATH").unwrap_or_default();
+    let socket = listener
+        .local_addr()
+        .ok()
+        .and_then(|address| address.as_pathname().map(|path| path.display().to_string()))
+        .unwrap_or_else(|| "<unnamed>".to_owned());
+    crate::log_debug!(
+        "Starting FastCGI app {} on socket {}",
+        app.program.display(),
+        socket
+    );
     let listener_fd = listener.as_fd().try_clone_to_owned()?;
     let mut command = Command::new(&app.program);
     command
@@ -365,7 +378,14 @@ fn spawn_app(
     command.as_std_mut().process_group(0);
     let child = command.spawn()?;
     // Recorded without an intervening await so shutdown can't see a stale pid.
-    pid.store(child.id().unwrap_or(0), Ordering::SeqCst);
+    let child_pid = child.id().unwrap_or(0);
+    pid.store(child_pid, Ordering::SeqCst);
+    crate::log_debug!(
+        "Started FastCGI app {} with pid {} on socket {}",
+        app.program.display(),
+        child_pid,
+        socket
+    );
     Ok((child, Instant::now()))
 }
 

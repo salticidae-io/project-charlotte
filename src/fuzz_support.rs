@@ -206,6 +206,7 @@ pub(crate) fn fixture() -> &'static FuzzFixture {
 
 pub(crate) fn fuzz_config(root: PathBuf) -> Config {
     Config {
+        debug: false,
         plain_http: true,
         bind: "127.0.0.1:8080".parse().expect("valid fuzz bind"),
         tls_bind: None,

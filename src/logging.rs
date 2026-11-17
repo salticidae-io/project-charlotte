@@ -7,7 +7,10 @@ use std::{
     net::SocketAddr,
     os::unix::fs::OpenOptionsExt,
     path::Path,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     time::{Instant, SystemTime},
 };
 
@@ -19,11 +22,7 @@ pub(crate) struct LogTarget(Arc<Mutex<Box<dyn Write + Send>>>);
 
 impl LogTarget {
     pub(crate) fn file(path: &Path) -> io::Result<Self> {
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o640)
-            .open(path)?;
+        let file = open_log_file(path)?;
         Ok(Self(Arc::new(Mutex::new(Box::new(file)))))
     }
 
@@ -114,7 +113,7 @@ impl AccessFormat {
             };
             index += 1;
             let code = code as char;
-            if !"aAbBDhHilmnopPqrstTuvVUC".contains(code) {
+            if !"aAbBDhHilmnopPqrstTuvVUCIOS".contains(code) {
                 return Err(format!("unsupported access log format directive: %{code}"));
             }
             if code == 'n' && argument.as_deref().is_some_and(|arg| arg != "ja4") {
@@ -273,12 +272,14 @@ pub(crate) struct AccessRequest {
     pub server_name: String,
     pub ja4: String,
     pub headers: HeaderMap,
+    pub received: Arc<AtomicU64>,
     pub started: SystemTime,
 }
 
 #[derive(Clone)]
 pub(crate) struct AccessResponse {
     pub status: u16,
+    pub version: Version,
     pub headers: HeaderMap,
 }
 
@@ -313,6 +314,7 @@ fn access_value(
         'D' => elapsed.elapsed().as_micros().to_string(),
         'h' => request.client.ip().to_string(),
         'H' => version_name(request.version).to_owned(),
+        'I' => request_bytes(request).to_string(),
         'i' => header_value(&request.headers, argument),
         'l' => "-".to_owned(),
         'm' => request.method.to_string(),
@@ -323,6 +325,7 @@ fn access_value(
                 "-".to_owned()
             }
         }
+        'O' => response_bytes(response, bytes).to_string(),
         'p' => match argument.unwrap_or("canonical") {
             "local" => request.local.port().to_string(),
             "remote" => request.peer.port().to_string(),
@@ -343,6 +346,9 @@ fn access_value(
             version_name(request.version)
         ),
         's' => response.status.to_string(),
+        'S' => request_bytes(request)
+            .saturating_add(response_bytes(response, bytes))
+            .to_string(),
         't' => access_time(argument, request.started, finished),
         'T' => match argument.unwrap_or("s") {
             "ms" => elapsed.elapsed().as_millis().to_string(),
@@ -371,6 +377,43 @@ fn access_value(
             "-".to_owned()
         }
     }
+}
+
+fn request_bytes(request: &AccessRequest) -> u64 {
+    let request_line = (request.method.as_str().len() as u64)
+        .saturating_add(1)
+        .saturating_add(request.path.len() as u64)
+        .saturating_add(1)
+        .saturating_add(version_name(request.version).len() as u64)
+        .saturating_add(2);
+    request_line
+        .saturating_add(header_bytes(&request.headers))
+        .saturating_add(request.received.load(Ordering::Relaxed))
+}
+
+fn response_bytes(response: &AccessResponse, body: u64) -> u64 {
+    let status = response.status.to_string();
+    let reason = http::StatusCode::from_u16(response.status)
+        .map_or("", |status| status.canonical_reason().unwrap_or(""));
+    let status_line = (version_name(response.version).len() as u64)
+        .saturating_add(1)
+        .saturating_add(status.len() as u64)
+        .saturating_add(1)
+        .saturating_add(reason.len() as u64)
+        .saturating_add(2);
+    status_line
+        .saturating_add(header_bytes(&response.headers))
+        .saturating_add(body)
+}
+
+fn header_bytes(headers: &HeaderMap) -> u64 {
+    headers.iter().fold(2u64, |total, (name, value)| {
+        total
+            .saturating_add(name.as_str().len() as u64)
+            .saturating_add(2)
+            .saturating_add(value.as_bytes().len() as u64)
+            .saturating_add(2)
+    })
 }
 
 fn header_value(headers: &HeaderMap, name: Option<&str>) -> String {
@@ -649,6 +692,15 @@ pub(crate) fn captured_context() -> RequestContext {
 
 static GLOBAL_ERROR_LOG: OnceLock<Arc<ErrorLog>> = OnceLock::new();
 static GLOBAL_ACCESS_LOG: OnceLock<Option<Arc<AccessLog>>> = OnceLock::new();
+static DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn set_debug(enabled: bool) {
+    DEBUG_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+pub(crate) fn debug_enabled() -> bool {
+    DEBUG_ENABLED.load(Ordering::Relaxed)
+}
 
 pub(crate) fn set_global_error_log(log: Arc<ErrorLog>) {
     let _ = GLOBAL_ERROR_LOG.set(log);
@@ -683,6 +735,8 @@ macro_rules! log_error { ($($arg:tt)*) => { $crate::logging::log("error", module
 macro_rules! log_warn { ($($arg:tt)*) => { $crate::logging::log("warn", module_path!(), &format!($($arg)*)) }; }
 #[macro_export]
 macro_rules! log_notice { ($($arg:tt)*) => { $crate::logging::log("notice", module_path!(), &format!($($arg)*)) }; }
+#[macro_export]
+macro_rules! log_debug { ($($arg:tt)*) => { if $crate::logging::debug_enabled() { $crate::logging::log("debug", module_path!(), &format!($($arg)*)) } }; }
 
 pub(crate) struct LoggedBody<B> {
     inner: std::pin::Pin<Box<B>>,
@@ -691,6 +745,52 @@ pub(crate) struct LoggedBody<B> {
     response: AccessResponse,
     started: Instant,
     bytes: u64,
+}
+
+pub(crate) struct CountedBody<B> {
+    inner: std::pin::Pin<Box<B>>,
+    received: Option<Arc<AtomicU64>>,
+}
+
+impl<B> CountedBody<B> {
+    pub(crate) fn new(inner: B, received: Option<Arc<AtomicU64>>) -> Self {
+        Self {
+            inner: Box::pin(inner),
+            received,
+        }
+    }
+}
+
+impl<B> Body for CountedBody<B>
+where
+    B: Body<Data = bytes::Bytes>,
+{
+    type Data = bytes::Bytes;
+    type Error = B::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let result = self.inner.as_mut().poll_frame(cx);
+        if let (std::task::Poll::Ready(Some(Ok(frame))), Some(received)) = (&result, &self.received)
+            && let Some(data) = frame.data_ref()
+        {
+            let bytes = u64::try_from(data.len()).unwrap_or(u64::MAX);
+            let _ = received.try_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
+                Some(total.saturating_add(bytes))
+            });
+        }
+        result
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
 }
 
 impl<B> LoggedBody<B> {
@@ -747,8 +847,21 @@ impl<B> Drop for LoggedBody<B> {
 }
 
 pub(crate) fn open_log(path: &Path, kind: &str) -> Result<LogTarget, Box<dyn Error + Send + Sync>> {
-    LogTarget::file(path)
-        .map_err(|error| format!("could not open {kind} log {}: {error}", path.display()).into())
+    LogTarget::file(path).map_err(|error| format!("could not open {kind} log: {error}").into())
+}
+
+pub(crate) fn open_log_file(path: &Path) -> io::Result<std::fs::File> {
+    use crate::pathctx::PathContext;
+
+    if let Some(file) = crate::logopener::open(path)? {
+        return Ok(file);
+    }
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o640)
+        .open(path)
+        .path_context("open log file", path)
 }
 
 #[cfg(test)]
@@ -760,6 +873,35 @@ mod tests {
         assert!(AccessFormat::parse("common").is_ok());
         assert!(AccessFormat::parse("combined").is_ok());
         assert!(AccessFormat::parse("%h %l %u %t \"%r\" %>s %b").is_ok());
+    }
+
+    #[test]
+    fn debug_flag_can_be_toggled() {
+        set_debug(true);
+        assert!(debug_enabled());
+        set_debug(false);
+        assert!(!debug_enabled());
+    }
+
+    #[test]
+    fn parses_mod_logio_directives() {
+        assert!(AccessFormat::parse("%I %O %S").is_ok());
+    }
+
+    #[test]
+    fn counts_request_body_data_frames() {
+        let received = Arc::new(AtomicU64::new(0));
+        let mut body = Box::pin(CountedBody::new(
+            http_body_util::Full::new(bytes::Bytes::from_static(b"payload")),
+            Some(Arc::clone(&received)),
+        ));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+
+        assert!(matches!(
+            body.as_mut().poll_frame(&mut context),
+            std::task::Poll::Ready(Some(Ok(_)))
+        ));
+        assert_eq!(received.load(Ordering::Relaxed), 7);
     }
 
     #[test]
@@ -792,6 +934,7 @@ mod tests {
             server_name: "example.test".to_owned(),
             ja4: "-".to_owned(),
             headers,
+            received: Arc::new(AtomicU64::new(5)),
             started: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(17_280_000),
         }
     }
@@ -799,6 +942,7 @@ mod tests {
     fn render(format: &str, status: u16, bytes: u64) -> String {
         let response = AccessResponse {
             status,
+            version: Version::HTTP_11,
             headers: HeaderMap::new(),
         };
         AccessFormat::parse(format).unwrap().render(
@@ -818,6 +962,30 @@ mod tests {
         );
         assert_eq!(render("%{User-Agent}i", 200, 5), "agent \\\"x\\\"\\x09");
         assert_eq!(render("%{sec}t %{begin:%Y}t", 200, 0), "17280000 1970");
+    }
+
+    #[test]
+    fn renders_mod_logio_byte_totals() {
+        let request = sample_request();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-test", "value".parse().unwrap());
+        let response = AccessResponse {
+            status: 200,
+            version: Version::HTTP_11,
+            headers,
+        };
+        let format = AccessFormat::parse("%I %O %S").unwrap();
+
+        assert_eq!(
+            format.render(
+                &request,
+                &response,
+                Instant::now(),
+                5,
+                SystemTime::UNIX_EPOCH,
+            ),
+            "52 39 91"
+        );
     }
 
     #[test]

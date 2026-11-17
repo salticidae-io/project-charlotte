@@ -1,6 +1,6 @@
 //! Rustls configuration and static or ACME-backed SNI certificate selection.
 
-use std::{error::Error, sync::Arc};
+use std::{error::Error, io, path::Path, sync::Arc};
 
 use rustls::{
     pki_types::{
@@ -61,9 +61,16 @@ impl TlsSetup {
             && !has_acme
             && !(config.tls_bind.is_some() && router.vhost_dir().is_some())
         {
+            crate::log_debug!("TLS initialization skipped: no certificate source is configured");
             return Ok(None);
         }
 
+        crate::log_debug!(
+            "Initializing TLS with {} named certificate(s), fallback certificate: {}, ACME: {}",
+            certificate_entries.len(),
+            fallback_files.is_some(),
+            has_acme
+        );
         let static_certificates = load_static_certificates(certificate_entries, fallback_files)?;
         let resolver = Arc::new(SniResolver {
             static_entries: std::sync::RwLock::new(static_certificates),
@@ -75,12 +82,17 @@ impl TlsSetup {
             &[b"h2".to_vec(), b"http/1.1".to_vec()],
             &[&rustls::version::TLS13, &rustls::version::TLS12],
         )?;
+        crate::log_debug!(
+            "Built TCP TLS configuration with ALPN h2, http/1.1 and versions TLS 1.3, TLS 1.2"
+        );
         #[cfg(feature = "http3")]
         let http3 = server_config(
             resolver.clone(),
             &[b"h3".to_vec()],
             &[&rustls::version::TLS13],
         )?;
+        #[cfg(feature = "http3")]
+        crate::log_debug!("Built HTTP/3 TLS configuration with ALPN h3 and version TLS 1.3");
         Ok(Some(Self {
             tcp,
             #[cfg(feature = "http3")]
@@ -142,9 +154,29 @@ fn load_static_certificates(
 ) -> Result<StaticCertificates, Box<dyn Error + Send + Sync>> {
     let entries = certificate_entries
         .into_iter()
-        .map(|(name, files)| Ok((name, load_certified_key(&files)?)))
+        .map(|(name, files)| {
+            let key = load_certified_key(&files)?;
+            crate::log_debug!(
+                "Loaded TLS certificate for {name}: cert {}, key {}, chain length {}",
+                files.cert.display(),
+                files.key.display(),
+                key.cert.len()
+            );
+            Ok((name, key))
+        })
         .collect::<Result<Vec<_>, Box<dyn Error + Send + Sync>>>()?;
-    let fallback = fallback_files.map(load_certified_key).transpose()?;
+    let fallback = fallback_files
+        .map(|files| {
+            let key = load_certified_key(files)?;
+            crate::log_debug!(
+                "Loaded fallback TLS certificate: cert {}, key {}, chain length {}",
+                files.cert.display(),
+                files.key.display(),
+                key.cert.len()
+            );
+            Ok::<_, Box<dyn Error + Send + Sync>>(key)
+        })
+        .transpose()?;
     Ok(StaticCertificates { entries, fallback })
 }
 
@@ -172,8 +204,18 @@ pub(crate) fn select_key<'a, T>(
 pub(crate) fn load_certified_key(
     files: &TlsFiles,
 ) -> Result<Arc<CertifiedKey>, Box<dyn Error + Send + Sync>> {
-    let certs = CertificateDer::pem_file_iter(&files.cert)?
-        .collect::<Result<Vec<CertificateDer<'static>>, _>>()?;
+    let cert_sections = read_pem_sections(&files.cert).map_err(|error| {
+        format!(
+            "could not read TLS certificate {}: {error}",
+            files.cert.display()
+        )
+    })?;
+    let certs = cert_sections
+        .into_iter()
+        .filter_map(|(kind, der)| {
+            (kind == pem::SectionKind::Certificate).then(|| CertificateDer::from(der))
+        })
+        .collect::<Vec<_>>();
     if certs.is_empty() {
         return Err(format!(
             "TLS certificate file contains no certificates: {}",
@@ -182,20 +224,30 @@ pub(crate) fn load_certified_key(
         .into());
     }
 
-    let key: PrivateKeyDer<'static> = PrivateKeyDer::from_pem_file(&files.key).map_err(
-        |error| -> Box<dyn Error + Send + Sync> {
-            match error {
-                pem::Error::NoItemsFound => format!(
-                    "TLS private-key file contains no private key: {}",
-                    files.key.display()
-                )
-                .into(),
-                other => Box::new(other),
-            }
-        },
-    )?;
+    let key_sections = read_pem_sections(&files.key).map_err(|error| {
+        format!(
+            "could not read TLS private key {}: {error}",
+            files.key.display()
+        )
+    })?;
+    let key: PrivateKeyDer<'static> = key_sections
+        .into_iter()
+        .find_map(|(kind, der)| PrivateKeyDer::from_pem(kind, der))
+        .ok_or_else(|| {
+            format!(
+                "TLS private-key file contains no private key: {}",
+                files.key.display()
+            )
+        })?;
     let signing_key = rustls::crypto::ring::sign::any_supported_type(&key)?;
     Ok(Arc::new(CertifiedKey::new(certs, signing_key)))
+}
+
+fn read_pem_sections(path: &Path) -> io::Result<Vec<(pem::SectionKind, Vec<u8>)>> {
+    if let Some(sections) = crate::logopener::read_tls_pem(path)? {
+        return Ok(sections);
+    }
+    crate::logopener::tls_pem_sections(std::fs::File::open(path)?)
 }
 
 fn server_config(

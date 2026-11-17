@@ -154,6 +154,7 @@ see all command-line options. Common options include:
 | Option | Purpose |
 | --- | --- |
 | `--bind ADDRESS` | Plain HTTP listener; defaults to `127.0.0.1:8080`. |
+| `--debug` | Log verbose startup details, including listener binding, workers, and TLS initialization. |
 | `--no-plain-http` | Disable the plain HTTP listener; incompatible with ACME HTTP-01. |
 | `--root DIRECTORY` | Fallback document root when no virtual host handles a request; defaults to `.`. |
 | `--user USER [--group GROUP]` | Drop the master process to this account before starting; requires root. |
@@ -205,19 +206,36 @@ Access and error logs can be written directly to files for the whole server
 the `access_log`, `access_log_format`, `error_log`, and `error_log_format` YAML
 keys. A vhost without its own setting inherits the server's file and format.
 Files are opened in append mode with mode `0640`; vhost log paths are relative
-to the YAML file and are reopened when virtual hosts are reloaded. Vhost log
-files are opened after the server drops privileges, so they must be writable
-by the server user.
+to the YAML file and are reopened when virtual hosts are reloaded. When the
+server starts as root with `--user`, a small root helper opens log files,
+including worker stderr logs, and reads TLS certificate and key files so they
+need not be accessible to the website account. The master and website workers
+still perform website operations under their configured users and groups. The
+master retains `CAP_KILL` when permitted so it can stop workers and FastCGI apps
+running under other UIDs; this also allows it to signal other processes. The
+server sends error output to stderr when no error log is configured, including
+output from the root helper and worker processes. The helper only handles
+regular files, refuses a final-component symlink, and
+returns write-only descriptors for logs and only parsed certificate/key DER
+sections for TLS. A compromised master can still write to or truncate any
+regular file it can persuade the helper to open, and read PEM certificate or
+private-key sections from any file it can persuade the helper to read, so
+protect the binary and configuration files.
 
 Access formats follow Apache `mod_log_config`: `%%`, `%a`, `%{c}a`, `%A`, `%b`,
-`%B`, `%D`, `%h`, `%H`, `%{Name}i`, `%{Name}o`, `%{Name}C`, `%l`, `%m`,
-`%{ja4}n`, `%p`, `%{local|remote|canonical}p`, `%P`, `%q`, `%r`, `%s`, `%>s`,
-`%t`, `%{strftime}t` (with `begin:`/`end:` and `sec`, `msec`, `usec`,
-`msec_frac`, `usec_frac`), `%T`, `%{s|ms|us}T`, `%u`, `%U`, `%v`, and `%V`, plus
+`%B`, `%D`, `%h`, `%H`, `%I`, `%{Name}i`, `%{Name}o`, `%{Name}C`, `%l`, `%m`,
+`%{ja4}n`, `%O`, `%p`, `%{local|remote|canonical}p`, `%P`, `%q`, `%r`,
+`%s`, `%S`, `%>s`, `%t`, `%{strftime}t` (including `begin:`/`end:` and
+`sec`, `msec`, `usec`, `msec_frac`, `usec_frac`), `%T`, `%{s|ms|us}T`, `%u`,
+`%U`, `%v`, and `%V`, plus
 status conditions such as `%400,501{User-Agent}i` and `%!200{Referer}i`.
 Unsupported directives are rejected at startup. The default format keeps the
 previous stdout layout. Records are written when the response body finishes,
 so `%b`, `%D`, and `%T` reflect what was sent.
+`%I`, `%O`, and `%S` include request bytes received, response bytes sent, and
+their total, respectively. Header sizes are estimates based on HTTP/1.x request
+and response lines and header fields; they may differ from actual wire bytes,
+especially with HTTP/2 compression or headers added by Hyper after dispatch.
 
 Error formats follow Apache `ErrorLogFormat`: `%%`, `%a`, `%A`, `%t`, `%{u}t`,
 `%{c}t`, `%{cu}t`, `%l`, `%m`, `%M`, `%P`, `%T`, and `%v`. As in Apache, a
@@ -231,9 +249,15 @@ stderr, so their raw output is appended to the same file unformatted.
 ### Configuration socket
 
 `--control-socket /run/charlotte/control.sock` enables a local HTTP/1.1 JSON
-API for the vhost directory. The socket is created with mode `0600`; its parent
-directory must already exist, be writable by the server's effective account
-(after any privilege drop), and not be writable by untrusted users. `GET /vhosts`
+API for the vhost directory. The socket is created with mode `0600`. A missing
+parent directory is created with mode `0750` (missing ancestors get `0755`);
+with `--user`, this happens before privileges are dropped and the directory is
+owned by the `--user`/`--group` account. An existing directory owned by that
+account is tightened to `0750`. An existing directory owned by someone else is
+handed over only if it is empty or contains just the old socket; otherwise it
+must already be writable by the server's effective account, and startup fails
+with an explanatory error rather than re-owning a shared directory such as
+`/run`. Keep the directory unwritable by untrusted users. `GET /vhosts`
 lists directory-backed vhosts and read-only vhosts from the main config, while
 `GET /vhosts/{name}` returns the YAML entries as JSON.
 Names are limited to 64 ASCII letters, digits, dots, underscores, and hyphens,
@@ -365,10 +389,18 @@ status with a `Status: CODE` header or a leading NPH `HTTP/1.0`, `HTTP/1.1`,
 
 The master normally keeps the identity of the account that starts it. To start
 as root and run the master as an unprivileged account, use `--user` and
-optionally override its primary group with `--group`. The master clears
-supplementary groups and retains only the capabilities needed to launch
-virtual-host workers as their configured users and groups (plus
+optionally override its primary group with `--group`. The master initializes
+supplementary groups from the account's group database entry, using `--group`
+as the primary group when supplied. Hosted workers likewise receive the
+configured user's supplementary groups. This grants access available through
+those groups to website operations, so configure group membership accordingly.
+The master retains only the capabilities needed to launch virtual-host workers
+as their configured users and groups (plus
 `CAP_NET_BIND_SERVICE` if it had that capability before dropping privileges).
+Log files are opened and TLS certificate/key PEM sections are read by a
+separate root helper; the master continues to handle requests and website
+operations under `--user`/`--group`, and hosted workers continue under their
+configured identities.
 
 Alternatively, an unprivileged account can run the binary with file
 capabilities:
@@ -459,7 +491,9 @@ configuration file.
 
 For ACME HTTP-01 provisioning, configure eligible virtual hosts and ensure the
 ACME service can reach the server over plaintext HTTP. Keep the ACME cache
-outside all served document roots. See
+outside all served document roots. When started with `--user`, the server
+creates the cache directory if needed and assigns it and its existing regular
+files to that account before dropping privileges. See
 [`examples/reverse-proxy-acme.yaml`](examples/reverse-proxy-acme.yaml) for an
 SSL-terminating reverse proxy configuration with automated certificate
 provisioning, or [`examples/charlotte.yaml`](examples/charlotte.yaml) for the

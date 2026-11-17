@@ -3,12 +3,11 @@
 use std::{
     error::Error,
     ffi::OsString,
-    fs::OpenOptions,
     io,
     net::SocketAddr,
     os::{
         fd::OwnedFd,
-        unix::{fs::OpenOptionsExt, net::UnixStream as StdUnixStream, process::CommandExt},
+        unix::{net::UnixStream as StdUnixStream, process::CommandExt},
     },
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -24,7 +23,7 @@ use hyper::{body::Incoming, client::conn::http2::SendRequest};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use nix::{
     sys::signal::{Signal, kill},
-    unistd::{Group, Pid, User},
+    unistd::{Gid, Group, Pid, Uid, User, setgid, setgroups, setuid},
 };
 use tokio::{io::AsyncReadExt, net::UnixStream, sync::Mutex, time::timeout};
 
@@ -90,8 +89,36 @@ impl Drop for WorkerProcess {
                 thread::sleep(WORKER_SHUTDOWN_POLL);
             }
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Err(error) = self.child.kill() {
+            crate::log_error!(
+                "Could not kill virtual-host worker {}: {error}",
+                self.child.id()
+            );
+            return;
+        }
+
+        let deadline = Instant::now() + WORKER_SHUTDOWN_GRACE;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => {}
+                Err(error) => {
+                    crate::log_error!(
+                        "Could not reap virtual-host worker {} after SIGKILL: {error}",
+                        self.child.id()
+                    );
+                    return;
+                }
+            }
+            if Instant::now() >= deadline {
+                crate::log_error!(
+                    "Timed out waiting for virtual-host worker {} after SIGKILL",
+                    self.child.id()
+                );
+                return;
+            }
+            thread::sleep(WORKER_SHUTDOWN_POLL);
+        }
     }
 }
 
@@ -99,11 +126,30 @@ impl Worker {
     pub(super) async fn spawn_process(
         &self,
     ) -> Result<WorkerProcess, Box<dyn Error + Send + Sync>> {
+        crate::log_debug!(
+            "Spawning virtual-host worker for root {} as uid {} gid {}",
+            self.root.display(),
+            self.uid,
+            self.gid
+        );
         let (parent, child_socket) = StdUnixStream::pair()?;
         parent.set_nonblocking(true)?;
         let mut command = Command::new(std::env::current_exe()?);
         if crate::privileges::can_set_ids()? {
-            command.uid(self.uid).gid(self.gid);
+            let uid = Uid::from_raw(self.uid);
+            let gid = Gid::from_raw(self.gid);
+            let groups = crate::privileges::supplementary_groups(uid, gid)?;
+            // SAFETY: this pre-exec callback uses only credential syscalls and
+            // data prepared before fork; it does not allocate or access shared state.
+            #[allow(unsafe_code)]
+            unsafe {
+                command.pre_exec(move || {
+                    setgroups(&groups).map_err(io::Error::from)?;
+                    setgid(gid).map_err(io::Error::from)?;
+                    setuid(uid).map_err(io::Error::from)?;
+                    Ok(())
+                });
+            }
         }
         command
             .args(build_worker_args(WorkerArgs {
@@ -127,12 +173,11 @@ impl Worker {
             )
             .stdin(Stdio::from(OwnedFd::from(child_socket)))
             .current_dir("/");
+        if crate::logging::debug_enabled() {
+            command.arg("--debug");
+        }
         if let Some(path) = &self.error_log_file {
-            let stderr = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .mode(0o640)
-                .open(path)?;
+            let stderr = crate::logging::open_log_file(path)?;
             command.stderr(Stdio::from(stderr));
         }
         if let Some(app_env) = worker_app_env(&self.fastcgi) {
@@ -140,6 +185,7 @@ impl Worker {
         }
 
         let mut child = command.spawn()?;
+        crate::log_debug!("Started virtual-host worker with pid {}", child.id());
         drop(command);
         let mut stream = UnixStream::from_std(parent)?;
         let ready_result = timeout(WORKER_READY_TIMEOUT, async {
@@ -149,7 +195,9 @@ impl Worker {
         })
         .await;
         match ready_result {
-            Ok(Ok(1)) => {}
+            Ok(Ok(1)) => {
+                crate::log_debug!("Virtual-host worker {} is ready", child.id());
+            }
             Ok(Ok(_)) => {
                 let _ = child.kill();
                 let _ = child.wait();

@@ -186,7 +186,9 @@ An available ACME certificate is preferred; otherwise the resolver selects a
 matching virtual-host certificate or the configured fallback certificate. The
 same resolver supports TCP TLS and HTTP/3 TLS. After the handshake, the router
 compares the normalized SNI host with the request authority's selected host to
-prevent cross-host routing on a TLS connection.
+prevent cross-host routing on a TLS connection. When the master drops to
+`--user`, the root helper reads static certificate and key PEM files and
+returns only parsed certificate and private-key DER sections to the master.
 
 `acme` manages the ACME account, HTTP-01 challenge responses, certificate
 cache, and renewal/provisioning work. Challenge responses are served by the
@@ -225,13 +227,14 @@ cleanup is handled when their router-owned handles are dropped.
 | `ratelimit` | Bounded per-client GCRA request buckets and `429` responses. |
 | `forwarded` | Trusted-proxy CIDR matching and XFF resolution/sanitization. |
 | `logging` | Apache-compatible access/error log formats, file targets, request context, and logging macros. |
+| `logopener` | Opens regular log files and reads TLS PEM sections in a root helper for a master that drops to `--user`. |
 | `tls` | Rustls configuration, static certificates, and SNI certificate selection. |
 | `acme` | ACME account, HTTP-01 challenges, certificate cache, and renewal. |
 | `http3` | QUIC and HTTP/3 connection handling, forwarding requests to the router. |
 | `reload` | Virtual-host directory watcher and coordinated routing/TLS/ACME refresh. |
 | `httpdate` | HTTP-date formatting and parsing for protocol headers and validators. |
 | `mime` | File-extension to content-type mapping. |
-| `privileges` | Dropping the master to `--user`/`--group` and narrowing its capabilities. |
+| `privileges` | Dropping the master to `--user`/`--group` and narrowing its capabilities; website operations remain under the selected account. |
 | `fuzz_support` | Shared request fixtures and helpers used by fuzz-oriented unit tests. |
 
 ## Security and testing boundaries
@@ -263,9 +266,12 @@ are inspected only up to that limit.
 The master accepts at most 4096 concurrent TCP connections, closes a
 connection that has not produced a complete request head within 30 seconds,
 and bounds the time a client may take to deliver a request body. A failed
-`accept` is logged rather than fatal. The master itself keeps the privileges
-it was started with; it terminates TLS, parses requests, serves the fallback
-site, runs ModSecurity, and forwards reverse-proxy traffic in that one process.
+`accept` is logged rather than fatal. Unless `--user` is supplied, the master
+keeps the identity it was started with; with `--user`/`--group`, it drops to
+that account before serving requests. It terminates TLS, parses requests,
+serves the fallback site, runs ModSecurity, and forwards reverse-proxy traffic
+in that process; the separate root helper opens log files and returns only
+parsed TLS certificate/key sections, never raw PEM file contents.
 
 Unit and integration tests cover routing, handlers, TLS, ACME, FastCGI, CGI,
 reverse proxying, and ModSecurity. Fuzz targets exercise parsed inputs and

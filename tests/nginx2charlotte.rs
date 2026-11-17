@@ -27,7 +27,7 @@ fn converts_recursive_includes_and_supported_server_directives() {
         r#"user charlotte web;
 events {}
 http {
-    log_format charlotte '$remote_addr - "$request" $status';
+    log_format charlotte '$remote_addr - "$request" $status $bytes_sent $request_length';
     upstream backend {
         server 127.0.0.1:8080;
         server 127.0.0.1:8081;
@@ -126,7 +126,7 @@ http {
     assert_eq!(static_host["tls_cert"], "/etc/ssl/example.pem");
     assert_eq!(static_host["tls_key"], "/etc/ssl/example.key");
     assert_eq!(static_host["access_log"], "/var/log/nginx/access.log");
-    assert_eq!(static_host["access_log_format"], "%a - \"%r\" %s");
+    assert_eq!(static_host["access_log_format"], "%a - \"%r\" %s %O %I");
     assert_eq!(static_host["error_log"], "/var/log/nginx/error.log");
     assert_eq!(
         static_host["try_files"],

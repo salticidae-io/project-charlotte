@@ -22,7 +22,7 @@ use rustls::sign::CertifiedKey;
 use serde::{Deserialize, Serialize};
 use tokio::{io::AsyncWriteExt, sync::Mutex, time::timeout};
 
-use crate::{config::AcmeSettings, tls, vhost::normalize_host};
+use crate::{config::AcmeSettings, log_debug, pathctx::PathContext, tls, vhost::normalize_host};
 
 const CHALLENGE_PREFIX: &str = "/.well-known/acme-challenge/";
 const RENEW_BEFORE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
@@ -130,6 +130,7 @@ impl AcmeManager {
             .collect();
         let store = AcmeCertificateStore::new();
         for name in &eligible {
+            log_debug!("Initializing ACME manager for {name}");
             let files = cache_files(&settings.cache, name);
             let cert_exists = secure_existing_cache_file(&files.cert, 0o644).await?;
             let key_exists = secure_existing_cache_file(&files.key, 0o600).await?;
@@ -351,7 +352,9 @@ async fn account(inner: &AcmeInner) -> Result<Account, Box<dyn Error + Send + Sy
 
     let path = inner.settings.cache.join("account.json");
     let loaded = if secure_existing_cache_file(&path, 0o600).await? {
-        let bytes = tokio::fs::read(&path).await?;
+        let bytes = tokio::fs::read(&path)
+            .await
+            .path_context("read ACME account cache", &path)?;
         let stored: StoredAccount = serde_json::from_slice(&bytes)?;
         if stored.directory != inner.settings.directory {
             return Err("ACME account cache belongs to a different directory URL".into());
@@ -398,27 +401,42 @@ async fn account(inner: &AcmeInner) -> Result<Account, Box<dyn Error + Send + Sy
 }
 
 async fn ensure_private_directory(path: &Path) -> io::Result<()> {
-    match tokio::fs::symlink_metadata(path).await {
+    match tokio::fs::symlink_metadata(path)
+        .await
+        .path_context("inspect ACME cache directory", path)
+    {
         Ok(metadata) if !metadata.file_type().is_dir() => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "ACME cache path must be a real directory, not a symlink",
+                format!(
+                    "ACME cache path {} must be a real directory, not a symlink",
+                    path.display()
+                ),
             ));
         }
         Ok(_) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            tokio::fs::create_dir_all(path).await?;
+            tokio::fs::create_dir_all(path)
+                .await
+                .path_context("create ACME cache directory", path)?;
         }
         Err(error) => return Err(error),
     }
-    let metadata = tokio::fs::symlink_metadata(path).await?;
+    let metadata = tokio::fs::symlink_metadata(path)
+        .await
+        .path_context("inspect ACME cache directory", path)?;
     if !metadata.file_type().is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "ACME cache path must be a real directory",
+            format!(
+                "ACME cache path {} must be a real directory",
+                path.display()
+            ),
         ));
     }
-    tokio::fs::set_permissions(path, fs::Permissions::from_mode(0o700)).await
+    tokio::fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .await
+        .path_context("set permissions on ACME cache directory", path)
 }
 
 async fn write_cache_file(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
@@ -433,17 +451,27 @@ async fn write_cache_file(path: &Path, contents: &[u8], mode: u32) -> io::Result
         .write(true)
         .mode(mode)
         .open(&temporary_path)
-        .await?;
+        .await
+        .path_context("create ACME cache file", &temporary_path)?;
     let write_result = async {
-        file.write_all(contents).await?;
-        file.sync_all().await?;
+        file.write_all(contents)
+            .await
+            .path_context("write ACME cache file", &temporary_path)?;
+        file.sync_all()
+            .await
+            .path_context("sync ACME cache file", &temporary_path)?;
         Ok::<(), io::Error>(())
     }
     .await;
     drop(file);
     let result = match write_result {
-        Ok(()) => match tokio::fs::rename(&temporary_path, path).await {
-            Ok(()) => tokio::fs::set_permissions(path, fs::Permissions::from_mode(mode)).await,
+        Ok(()) => match tokio::fs::rename(&temporary_path, path)
+            .await
+            .path_context("replace ACME cache file", path)
+        {
+            Ok(()) => tokio::fs::set_permissions(path, fs::Permissions::from_mode(mode))
+                .await
+                .path_context("set permissions on ACME cache file", path),
             Err(error) => Err(error),
         },
         Err(error) => Err(error),
@@ -455,14 +483,22 @@ async fn write_cache_file(path: &Path, contents: &[u8], mode: u32) -> io::Result
 }
 
 async fn secure_existing_cache_file(path: &Path, mode: u32) -> io::Result<bool> {
-    match tokio::fs::symlink_metadata(path).await {
+    match tokio::fs::symlink_metadata(path)
+        .await
+        .path_context("inspect ACME cache file", path)
+    {
         Ok(metadata) if metadata.file_type().is_file() => {
-            tokio::fs::set_permissions(path, fs::Permissions::from_mode(mode)).await?;
+            tokio::fs::set_permissions(path, fs::Permissions::from_mode(mode))
+                .await
+                .path_context("set permissions on ACME cache file", path)?;
             Ok(true)
         }
         Ok(_) => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "ACME cache entries must be regular files, not symlinks",
+            format!(
+                "ACME cache entry {} must be a regular file, not a symlink",
+                path.display()
+            ),
         )),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error),

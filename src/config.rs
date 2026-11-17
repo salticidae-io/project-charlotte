@@ -48,6 +48,7 @@ pub struct FastCgiApp {
 
 #[derive(Clone, Debug)]
 pub struct Config {
+    pub debug: bool,
     pub plain_http: bool,
     pub bind: SocketAddr,
     pub tls_bind: Option<SocketAddr>,
@@ -118,6 +119,9 @@ const HTTP3: bool = cfg!(feature = "http3");
     color = ColorChoice::Never
 )]
 struct Cli {
+    /// Log verbose startup details
+    #[arg(long)]
+    debug: bool,
     /// Drop privileges to this user after binding the listeners
     #[arg(long, value_name = "USER", value_parser = parse_cli_name("--user", "user"), allow_hyphen_values = true)]
     user: Option<String>,
@@ -385,6 +389,7 @@ impl Config {
         let Cli {
             user: master_user,
             group: master_group,
+            debug,
             bind,
             no_plain_http,
             tls_bind,
@@ -559,6 +564,7 @@ impl Config {
         }
 
         Ok(ParseResult::Config(Box::new(Self {
+            debug,
             plain_http: !no_plain_http,
             bind,
             tls_bind,
@@ -1532,6 +1538,7 @@ mod tests {
         let parsed = Config::parse([
             "--config".to_owned(),
             "sites.yaml".to_owned(),
+            "--debug".to_owned(),
             "--worker".to_owned(),
             "--worker-uid".to_owned(),
             "1000".to_owned(),
@@ -1543,9 +1550,23 @@ mod tests {
             panic!("expected config")
         };
         assert_eq!(config.config_file, Some(PathBuf::from("sites.yaml")));
+        assert!(config.debug);
         assert!(config.worker);
         assert_eq!(config.worker_uid, Some(1000));
         assert_eq!(config.worker_gid, Some(1001));
+    }
+
+    #[test]
+    fn debug_flag_defaults_off_and_can_be_enabled() {
+        let ParseResult::Config(defaults) = Config::parse(Vec::<String>::new()).unwrap() else {
+            panic!("expected config")
+        };
+        assert!(!defaults.debug);
+
+        let ParseResult::Config(config) = Config::parse(["--debug".to_owned()]).unwrap() else {
+            panic!("expected config")
+        };
+        assert!(config.debug);
     }
 
     #[test]

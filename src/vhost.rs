@@ -37,6 +37,7 @@ use crate::{
     config::{Config, TlsFiles},
     forwarded,
     ja4::TlsFingerprint,
+    pathctx::PathContext,
     ratelimit::{RateLimit, RateLimiter},
     response::{self, ResponseBody},
     waf::{RuleIdSpec, Waf},
@@ -266,7 +267,8 @@ impl Router {
         };
         let file = if let Some(path) = path {
             ensure_trusted_config(path)?;
-            let content = std::fs::read_to_string(path)?;
+            let content =
+                std::fs::read_to_string(path).path_context("read virtual-host config", path)?;
             parse_file_config(&content)?
         } else {
             FileConfig {
@@ -353,7 +355,7 @@ impl Router {
                 content.clone()
             } else {
                 ensure_trusted_config(&path)?;
-                std::fs::read_to_string(&path)?
+                std::fs::read_to_string(&path).path_context("read virtual-host config", &path)?
             };
             let old = sources.files.get(&path);
             let entries = if old.is_some_and(|source| source.content == content) {
@@ -464,11 +466,20 @@ impl Router {
         if let Some((path, content)) = &override_file {
             match content {
                 Some(content) => persist_vhost_file(dir, path, content)?,
-                None if path.exists() => {
-                    std::fs::remove_file(path)?;
-                    std::fs::File::open(dir)?.sync_all()?;
-                }
-                None => {}
+                None => match std::fs::metadata(path)
+                    .path_context("inspect virtual-host config", path)
+                {
+                    Ok(_) => {
+                        std::fs::remove_file(path)
+                            .path_context("remove virtual-host config", path)?;
+                        std::fs::File::open(dir)
+                            .path_context("open virtual-host directory", dir)?
+                            .sync_all()
+                            .path_context("sync virtual-host directory", dir)?;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                },
             }
         }
         sources.main_vhosts = Some(main_vhosts);
@@ -1107,25 +1118,32 @@ impl Router {
         );
         let access_log =
             vhost.map_or_else(|| self.access_log.clone(), |vhost| vhost.access_log.clone());
-        let access_request = access_log.as_ref().map(|_| crate::logging::AccessRequest {
-            method: request.method().clone(),
-            path: request
-                .uri()
-                .path_and_query()
-                .map_or("/", |value| value.as_str())
-                .to_owned(),
-            version: request.version(),
-            client,
-            peer,
-            local,
-            server_name: server_name.clone(),
-            ja4: request
-                .extensions()
-                .get::<TlsFingerprint>()
-                .map_or_else(|| "-".to_owned(), |fingerprint| fingerprint.0.ja4.clone()),
-            headers: request.headers().clone(),
-            started: std::time::SystemTime::now(),
-        });
+        let received = access_log
+            .as_ref()
+            .map(|_| Arc::new(std::sync::atomic::AtomicU64::new(0)));
+        let access_request = received
+            .as_ref()
+            .map(|received| crate::logging::AccessRequest {
+                method: request.method().clone(),
+                path: request
+                    .uri()
+                    .path_and_query()
+                    .map_or("/", |value| value.as_str())
+                    .to_owned(),
+                version: request.version(),
+                client,
+                peer,
+                local,
+                server_name: server_name.clone(),
+                ja4: request
+                    .extensions()
+                    .get::<TlsFingerprint>()
+                    .map_or_else(|| "-".to_owned(), |fingerprint| fingerprint.0.ja4.clone()),
+                headers: request.headers().clone(),
+                received: Arc::clone(received),
+                started: std::time::SystemTime::now(),
+            });
+        let request = request.map(|body| crate::logging::CountedBody::new(body, received));
         let context = crate::logging::RequestContext {
             client: Some(client),
             local: Some(local),
@@ -1141,6 +1159,7 @@ impl Router {
             let (parts, body) = response.into_parts();
             let access_response = crate::logging::AccessResponse {
                 status: parts.status.as_u16(),
+                version: parts.version,
                 headers: parts.headers.clone(),
             };
             let body = crate::logging::LoggedBody::new(body, log, access_request, access_response)
@@ -1661,7 +1680,7 @@ fn validate_vhost_waf_declarations<'a>(
 fn ensure_trusted_config(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::MetadataExt;
 
-    let metadata = std::fs::metadata(path)?;
+    let metadata = std::fs::metadata(path).path_context("inspect virtual-host config", path)?;
     let owner = metadata.uid();
     if owner != 0 && owner != nix::unistd::geteuid().as_raw() {
         return Err(io::Error::new(
@@ -1685,21 +1704,30 @@ fn ensure_trusted_config(path: &Path) -> io::Result<()> {
 /// ACME cache, which holds private keys.
 #[cfg(all(feature = "acme", feature = "hosting"))]
 fn ensure_acme_cache_is_private(cache: &Path, vhosts: &[Arc<Vhost>]) -> io::Result<()> {
-    let Ok(cache) = std::fs::canonicalize(cache) else {
-        return Ok(());
-    };
+    let cache =
+        match std::fs::canonicalize(cache).path_context("resolve ACME cache directory", cache) {
+            Ok(cache) => cache,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
     for vhost in vhosts {
-        if let Some(worker) = &vhost.worker
-            && let Ok(root) = std::fs::canonicalize(&worker.root)
-            && cache.starts_with(&root)
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "ACME cache must be outside every served document root: {}",
-                    root.display()
-                ),
-            ));
+        if let Some(worker) = &vhost.worker {
+            let root = match std::fs::canonicalize(&worker.root)
+                .path_context("resolve document root", &worker.root)
+            {
+                Ok(root) => root,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            if cache.starts_with(&root) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "ACME cache must be outside every served document root: {}",
+                        root.display()
+                    ),
+                ));
+            }
         }
     }
     Ok(())
@@ -1715,17 +1743,23 @@ fn resolve_config_path(path: PathBuf, config_dir: &Path) -> PathBuf {
 
 fn scan_vhost_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
     let mut files = Vec::new();
-    for entry in std::fs::read_dir(dir)? {
-        let path = entry?.path();
+    for entry in std::fs::read_dir(dir).path_context("read virtual-host directory", dir)? {
+        let path = entry
+            .path_context("read virtual-host directory entry", dir)?
+            .path();
         if path
             .file_name()
             .is_some_and(|name| !name.to_string_lossy().starts_with('.'))
             && path
                 .extension()
                 .is_some_and(|extension| extension == "yaml" || extension == "yml")
-            && path.is_file()
         {
-            files.push(path);
+            match std::fs::metadata(&path).path_context("inspect virtual-host config", &path) {
+                Ok(metadata) if metadata.is_file() => files.push(path),
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
         }
     }
     files.sort();
@@ -1795,9 +1829,16 @@ fn persist_vhost_file(dir: &Path, path: &Path, content: &str) -> io::Result<()> 
             .create_new(true)
             .mode(0o640)
             .open(&candidate)
+            .path_context("create temporary virtual-host config", &candidate)
         {
             Ok(file) => {
-                if let Err(error) = file.set_permissions(std::fs::Permissions::from_mode(0o640)) {
+                if let Err(error) = file
+                    .set_permissions(std::fs::Permissions::from_mode(0o640))
+                    .path_context(
+                        "set permissions on temporary virtual-host config",
+                        &candidate,
+                    )
+                {
                     drop(file);
                     let _ = std::fs::remove_file(&candidate);
                     return Err(error);
@@ -1818,11 +1859,18 @@ fn persist_vhost_file(dir: &Path, path: &Path, content: &str) -> io::Result<()> 
     })?;
     let mut temp_file = temp_file.expect("temporary path and file are created together");
     let result = (|| {
-        temp_file.write_all(content.as_bytes())?;
-        temp_file.sync_all()?;
+        temp_file
+            .write_all(content.as_bytes())
+            .path_context("write temporary virtual-host config", &temp_path)?;
+        temp_file
+            .sync_all()
+            .path_context("sync temporary virtual-host config", &temp_path)?;
         drop(temp_file);
-        std::fs::rename(&temp_path, path)?;
-        std::fs::File::open(dir)?.sync_all()
+        std::fs::rename(&temp_path, path).path_context("replace virtual-host config", path)?;
+        std::fs::File::open(dir)
+            .path_context("open virtual-host directory", dir)?
+            .sync_all()
+            .path_context("sync virtual-host directory", dir)
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(temp_path);
@@ -2662,6 +2710,20 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
         assert!(ensure_trusted_config(&path).is_err());
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn missing_configuration_error_includes_path() {
+        let path = std::env::temp_dir().join(format!(
+            "project-charlotte-missing-config-{}-{}.yaml",
+            std::process::id(),
+            NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+        ));
+
+        let error = ensure_trusted_config(&path).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(error.to_string().contains(&path.display().to_string()));
     }
 
     #[test]
