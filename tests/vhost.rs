@@ -460,6 +460,30 @@ fn decode_length(input: &mut &[u8]) -> usize {
     }
 }
 
+fn worker_process_ids(server_pid: u32) -> Vec<u32> {
+    let task_path = format!("/proc/{server_pid}/task");
+    let Ok(tasks) = std::fs::read_dir(task_path) else {
+        return Vec::new();
+    };
+    tasks
+        .flatten()
+        .filter_map(|task| std::fs::read_to_string(task.path().join("children")).ok())
+        .flat_map(|children| {
+            children
+                .split_whitespace()
+                .filter_map(|pid| pid.parse::<u32>().ok())
+                .collect::<Vec<_>>()
+        })
+        .filter(|pid| {
+            std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|command_line| {
+                command_line
+                    .split(|byte| *byte == 0)
+                    .any(|argument| argument == b"--worker")
+            })
+        })
+        .collect()
+}
+
 async fn write_fastcgi_record<S>(
     stream: &mut S,
     record_type: u8,
@@ -513,7 +537,7 @@ async fn refuses_privilege_change_when_server_is_non_root() {
 }
 
 #[test]
-fn missing_vhost_root_reports_worker_startup_failure() {
+fn missing_vhost_root_fails_validation_before_worker_startup() {
     let root = new_root();
     let user = if geteuid().is_root() {
         if User::from_name("nobody").unwrap().is_none() {
@@ -548,13 +572,56 @@ fn missing_vhost_root_reports_worker_startup_failure() {
         stderr.contains(&missing_root.display().to_string()),
         "{stderr}"
     );
-    assert!(stderr.contains("exited before becoming ready"), "{stderr}");
-    assert!(stderr.contains("exit status"), "{stderr}");
-    assert!(
-        stderr.contains("its error was written to stderr"),
-        "{stderr}"
-    );
-    assert!(stderr.contains("virtual host worker failed:"), "{stderr}");
-    assert!(!stderr.contains("early eof"), "{stderr}");
+    assert!(stderr.contains("does not exist"), "{stderr}");
+    assert!(!stderr.contains("exited before becoming ready"), "{stderr}");
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn hosted_worker_starts_on_demand_and_stops_after_idle_timeout() {
+    let root = new_root();
+    let site_root = root.join("site");
+    std::fs::create_dir(&site_root).unwrap();
+    std::fs::write(site_root.join("index.html"), "lazy worker response").unwrap();
+    let user = if geteuid().is_root() {
+        if User::from_name("nobody").unwrap().is_none() {
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
+        "nobody".to_owned()
+    } else {
+        current_user_name()
+    };
+    let config = format!(
+        "vhost:\n{}",
+        vhost(
+            "[\"lazy.test\"]",
+            &site_root,
+            &user,
+            "    worker_idle_timeout: 1\n"
+        )
+    );
+    let fixture = Fixture::start(root, config, None).await;
+    let server_pid = fixture.server.id();
+
+    assert!(worker_process_ids(server_pid).is_empty());
+
+    let response = request(fixture.address, "lazy.test", "GET", "/", &[], b"").await;
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, b"lazy worker response");
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while worker_process_ids(server_pid).is_empty() {
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("worker should be spawned for the first request");
+    sleep(Duration::from_secs(3)).await;
+    assert!(worker_process_ids(server_pid).is_empty());
+
+    let response = request(fixture.address, "lazy.test", "GET", "/", &[], b"").await;
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, b"lazy worker response");
+    assert!(!worker_process_ids(server_pid).is_empty());
 }

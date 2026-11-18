@@ -1074,6 +1074,7 @@ mod tests {
             fastcgi_timeout: Duration::from_secs(60),
             threads: None,
             worker_threads: 2,
+            worker_idle_timeout: Duration::from_secs(300),
             rate_limit: None,
             trusted_proxies: Vec::new(),
             access_log: false,

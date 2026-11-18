@@ -11,6 +11,10 @@ use std::{
     },
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
+    sync::{
+        Arc, Mutex as StdMutex, Weak,
+        atomic::{AtomicUsize, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -49,6 +53,9 @@ pub(super) struct Worker {
     pub(super) uid: u32,
     pub(super) gid: u32,
     pub(super) root: PathBuf,
+    pub(super) idle_timeout: Option<Duration>,
+    pub(super) active: Arc<AtomicUsize>,
+    pub(super) last_used: Arc<StdMutex<Instant>>,
     pub(super) index: Vec<String>,
     pub(super) listing: bool,
     pub(super) try_files: Vec<String>,
@@ -123,6 +130,42 @@ impl Drop for WorkerProcess {
 }
 
 impl Worker {
+    pub(super) fn spawn_idle_reaper(worker: &Arc<Self>, timeout: Duration) {
+        let worker: Weak<Self> = Arc::downgrade(worker);
+        let interval = timeout.min(Duration::from_millis(250));
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                let Some(worker) = worker.upgrade() else {
+                    break;
+                };
+                worker.reap_idle(timeout).await;
+            }
+        });
+    }
+
+    async fn reap_idle(&self, timeout: Duration) {
+        let mut process = self.process.lock().await;
+        if process.is_none() || self.active.load(Ordering::Acquire) != 0 {
+            return;
+        }
+        let is_idle = {
+            let last_used = self
+                .last_used
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            Instant::now().saturating_duration_since(*last_used) >= timeout
+        };
+        if is_idle && let Some(process) = process.take() {
+            crate::log_debug!(
+                "Stopping idle virtual-host worker for root {} after {} seconds",
+                self.root.display(),
+                timeout.as_secs()
+            );
+            drop(process);
+        }
+    }
+
     pub(super) async fn spawn_process(
         &self,
     ) -> Result<WorkerProcess, Box<dyn Error + Send + Sync>> {
@@ -291,11 +334,18 @@ impl Worker {
             body.map_err(|error| io::Error::other(error.into()))
                 .boxed_unsync()
         });
+        let activity = ActivityGuard::new(self);
         match self.dispatch(request).await {
             Ok(response) => {
                 let (parts, body) = response.into_parts();
                 let body =
                     response::coalesce_ready_body(body.map_err(io::Error::other).boxed_unsync());
+                let body = body
+                    .map_frame(move |frame| {
+                        let _activity = &activity;
+                        frame
+                    })
+                    .boxed_unsync();
                 Response::from_parts(parts, body)
             }
             Err(error) => {
@@ -342,6 +392,31 @@ impl Worker {
                 Err(error.into())
             }
         }
+    }
+}
+
+struct ActivityGuard {
+    active: Arc<AtomicUsize>,
+    last_used: Arc<StdMutex<Instant>>,
+}
+
+impl ActivityGuard {
+    fn new(worker: &Worker) -> Self {
+        worker.active.fetch_add(1, Ordering::AcqRel);
+        Self {
+            active: Arc::clone(&worker.active),
+            last_used: Arc::clone(&worker.last_used),
+        }
+    }
+}
+
+impl Drop for ActivityGuard {
+    fn drop(&mut self) {
+        *self
+            .last_used
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Instant::now();
+        self.active.fetch_sub(1, Ordering::AcqRel);
     }
 }
 

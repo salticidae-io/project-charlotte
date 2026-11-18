@@ -204,6 +204,23 @@ see all command-line options. Common options include:
 | `--modsecurity-block-status CODE` | Override the status for ModSecurity blocking interventions (400–599; defaults to the rule status or 403). |
 | `--acme-directory URL --acme-cache DIR` | Configure ACME certificate provisioning and its cache. |
 
+Any command-line option can also be set as a global default in the main
+configuration file's top-level `options` mapping. Use the long option name with
+hyphens or underscores; flags take YAML booleans, single-value options take a
+scalar, and repeatable options take a scalar or sequence. Command-line values
+override file defaults, and an explicitly supplied repeatable option replaces
+the corresponding file sequence. Relative path options are resolved against
+the directory containing the config file. The `config`, `check-config`, `help`,
+and internal worker options cannot be set this way. For example:
+
+```yaml
+options:
+  bind: 0.0.0.0:8080
+  debug: true
+  index: [index.html, index.htm]
+  access-log-file: logs/access.log
+```
+
 Rate limits return `429 Too Many Requests` with a `Retry-After` header. The
 client key is the socket peer IP unless that peer matches a configured
 `--trusted-proxy` address or CIDR; in that case Charlotte resolves the client
@@ -458,8 +475,16 @@ the rate rounded up per second.
 
 Worker-backed hosts require a document root and worker user. A host configured
 with `proxy_pass` is served directly by the master and does not need `root` or
-`user`. A proxy vhost can forward requests arriving over
-HTTP/1.1, HTTP/2, or HTTP/3 to an HTTP or HTTPS upstream:
+`user`. Worker-backed vhost configuration and document-root existence are
+validated at startup, but the worker process is started only when that host
+receives its first request. Workers are stopped after 300 seconds without
+active requests by default; set `--worker-idle-timeout SECS` to change the
+default, or use `worker_idle_timeout: SECS` on a vhost. Set either value to `0`
+to keep workers alive indefinitely. If the master cannot inspect a root because
+of filesystem permissions, it defers that access check to the worker user.
+
+A proxy vhost can forward requests arriving over HTTP/1.1, HTTP/2, or HTTP/3 to
+an HTTP or HTTPS upstream:
 
 ```yaml
 vhost:

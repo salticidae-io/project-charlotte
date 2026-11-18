@@ -14,12 +14,17 @@ use crate::{
     ratelimit::RateLimit,
 };
 use clap::{
-    ArgMatches, ColorChoice, CommandFactory, FromArgMatches, Parser, error::ErrorKind,
+    ArgAction, ArgMatches, ColorChoice, CommandFactory, FromArgMatches, Parser, error::ErrorKind,
     parser::ValueSource,
 };
 #[cfg(feature = "hosting")]
 use std::sync::Arc;
-use std::{collections::BTreeMap, net::SocketAddr, path::PathBuf, time::Duration};
+use std::{
+    collections::BTreeMap,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 #[derive(Clone, Debug)]
 pub struct FastCgiBackend {
@@ -64,6 +69,7 @@ pub struct Config {
     pub fastcgi_timeout: Duration,
     pub threads: Option<usize>,
     pub worker_threads: usize,
+    pub worker_idle_timeout: Duration,
     pub(crate) rate_limit: Option<RateLimit>,
     pub(crate) trusted_proxies: Vec<TrustedProxy>,
     pub(crate) access_log: bool,
@@ -180,6 +186,9 @@ struct Cli {
     /// Runtime threads of each vhost worker
     #[arg(long, value_name = "N", default_value_t = DEFAULT_WORKER_THREADS, value_parser = parse_thread_count, hide = !HOSTING, allow_hyphen_values = true)]
     worker_threads: usize,
+    /// Seconds a hosted worker is kept alive without requests; 0 disables reaping
+    #[arg(long, value_name = "SECS", default_value = "300", hide = !HOSTING, allow_hyphen_values = true)]
+    worker_idle_timeout: u64,
     /// Per-client request rate (N/s, N/m, or N/h)
     #[arg(long, value_name = "RATE", allow_hyphen_values = true)]
     rate_limit: Option<String>,
@@ -283,6 +292,7 @@ const FEATURE_OPTIONS: &[(&str, bool, &[&str])] = &[
             "fastcgi_app_env",
             "fastcgi_timeout",
             "worker_threads",
+            "worker_idle_timeout",
         ],
     ),
     (
@@ -300,12 +310,67 @@ const FEATURE_OPTIONS: &[(&str, bool, &[&str])] = &[
 
 impl Config {
     pub fn parse(args: impl IntoIterator<Item = String>) -> Result<ParseResult, String> {
-        let matches = match Cli::command()
-            .try_get_matches_from(std::iter::once("project-charlotte".to_owned()).chain(args))
-        {
+        let args = args.into_iter().collect::<Vec<_>>();
+        let matches = match Cli::command().try_get_matches_from(
+            std::iter::once("project-charlotte".to_owned()).chain(args.iter().cloned()),
+        ) {
             Ok(matches) => matches,
             Err(error) if error.kind() == ErrorKind::DisplayHelp => return Ok(ParseResult::Help),
             Err(error) => return Err(error.to_string().trim_end().to_owned()),
+        };
+        let matches = if let Some(config_path) = matches.get_one::<PathBuf>("config_file") {
+            let config_path = config_path.clone();
+            crate::vhost::ensure_trusted_config(&config_path)
+                .map_err(|error| format!("{}: {error}", config_path.display()))?;
+            let content = std::fs::read_to_string(&config_path)
+                .map_err(|error| format!("{}: {error}", config_path.display()))?;
+            let value: serde_yaml_ng::Value = match serde_yaml_ng::from_str(&content) {
+                Ok(value) => value,
+                Err(_) if matches.get_flag("check_config") => serde_yaml_ng::Value::Null,
+                Err(error) => {
+                    return Err(if let Some(location) = error.location() {
+                        format!(
+                            "{}:{}:{}: {error}",
+                            config_path.display(),
+                            location.line(),
+                            location.column()
+                        )
+                    } else {
+                        format!("{}: {error}", config_path.display())
+                    });
+                }
+            };
+            let options = value.as_mapping().and_then(|mapping| {
+                mapping.get(serde_yaml_ng::Value::String("options".to_owned()))
+            });
+            if let Some(options) = options {
+                let file_args = options_to_args(options, &matches, &config_path)?;
+                if file_args.is_empty() {
+                    matches
+                } else {
+                    match Cli::command().try_get_matches_from(
+                        std::iter::once("project-charlotte".to_owned())
+                            .chain(file_args)
+                            .chain(args.iter().cloned()),
+                    ) {
+                        Ok(matches) => matches,
+                        Err(error) if error.kind() == ErrorKind::DisplayHelp => {
+                            return Ok(ParseResult::Help);
+                        }
+                        Err(error) => {
+                            return Err(format!(
+                                "{}: {}",
+                                config_path.display(),
+                                error.to_string().trim_end()
+                            ));
+                        }
+                    }
+                }
+            } else {
+                matches
+            }
+        } else {
+            matches
         };
         reject_compiled_out_options(&matches)?;
         let cli = Cli::from_arg_matches(&matches).map_err(|error| error.to_string())?;
@@ -404,6 +469,7 @@ impl Config {
             fastcgi_timeout,
             threads,
             worker_threads,
+            worker_idle_timeout,
             rate_limit,
             rate_limit_burst,
             trusted_proxy,
@@ -581,6 +647,7 @@ impl Config {
             fastcgi_timeout,
             threads,
             worker_threads,
+            worker_idle_timeout: Duration::from_secs(worker_idle_timeout),
             rate_limit,
             trusted_proxies,
             access_log,
@@ -628,6 +695,142 @@ impl Config {
             compiled_features()
         )
     }
+}
+
+fn options_to_args(
+    options: &serde_yaml_ng::Value,
+    cli_matches: &ArgMatches,
+    config_path: &Path,
+) -> Result<Vec<String>, String> {
+    let mapping = options
+        .as_mapping()
+        .ok_or_else(|| format!("{}: options must be a mapping", config_path.display()))?;
+    let command = Cli::command();
+    let mut args = Vec::new();
+    for (key, value) in mapping {
+        let key = key.as_str().ok_or_else(|| {
+            format!(
+                "{}: option names in options must be strings",
+                config_path.display()
+            )
+        })?;
+        let normalized_key = key.replace('-', "_");
+        if matches!(
+            normalized_key.as_str(),
+            "config" | "check_config" | "help" | "worker" | "worker_uid" | "worker_gid"
+        ) {
+            return Err(format!(
+                "{}: option {key} is not allowed in options",
+                config_path.display()
+            ));
+        }
+        let Some(arg) = command.get_arguments().find(|arg| {
+            arg.get_long()
+                .is_some_and(|long| long.replace('-', "_") == normalized_key)
+        }) else {
+            return Err(format!(
+                "{}: unknown option in options: {key}",
+                config_path.display()
+            ));
+        };
+        if cli_matches.value_source(arg.get_id().as_str()) == Some(ValueSource::CommandLine) {
+            continue;
+        }
+        let long = arg
+            .get_long()
+            .expect("matched an argument with a long name");
+        if matches!(arg.get_action(), ArgAction::SetTrue) {
+            match value.as_bool() {
+                Some(true) => args.push(format!("--{long}")),
+                Some(false) => {}
+                None => {
+                    return Err(format!(
+                        "{}: option {key} must be a boolean",
+                        config_path.display()
+                    ));
+                }
+            }
+            continue;
+        }
+
+        let values = if matches!(arg.get_action(), ArgAction::Append) {
+            match value {
+                serde_yaml_ng::Value::Sequence(values) => values.iter().collect::<Vec<_>>(),
+                value => vec![value],
+            }
+        } else {
+            vec![value]
+        };
+        if values.is_empty() {
+            return Err(format!(
+                "{}: option {key} must not be an empty sequence",
+                config_path.display()
+            ));
+        }
+        for value in values {
+            let value = option_scalar(value).ok_or_else(|| {
+                format!(
+                    "{}: option {key} must have a scalar value",
+                    config_path.display()
+                )
+            })?;
+            let value = if is_path_option(&normalized_key) {
+                resolve_option_path(&value, config_path)
+                    .map_err(|error| format!("{}: {error}", config_path.display()))?
+            } else {
+                value
+            };
+            args.push(format!("--{long}"));
+            args.push(value);
+        }
+    }
+    Ok(args)
+}
+
+fn option_scalar(value: &serde_yaml_ng::Value) -> Option<String> {
+    match value {
+        serde_yaml_ng::Value::String(value) => Some(value.clone()),
+        serde_yaml_ng::Value::Number(value) => Some(value.to_string()),
+        serde_yaml_ng::Value::Bool(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn is_path_option(key: &str) -> bool {
+    matches!(
+        key,
+        "root"
+            | "vhost_dir"
+            | "control_socket"
+            | "access_log_file"
+            | "error_log_file"
+            | "bot_config"
+            | "modsecurity_rules"
+            | "tls_cert"
+            | "tls_key"
+            | "acme_cache"
+            | "acme_ca_root"
+    )
+}
+
+fn resolve_option_path(value: &str, config_path: &Path) -> Result<String, String> {
+    let path = Path::new(value);
+    if path.is_absolute() {
+        return Ok(value.to_owned());
+    }
+    let path = config_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .join(path);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()
+            .map_err(|error| format!("could not resolve relative option path: {error}"))?
+            .join(path)
+    };
+    Ok(path.to_string_lossy().into_owned())
 }
 
 /// Environment variable through which the master hands a worker the
@@ -1006,9 +1209,25 @@ mod tests {
     use super::{DEFAULT_FASTCGI_APP_IDLE_TIMEOUT_SECS, FastCgiAddress, validate_try_files};
     use crate::forwarded::TrustedProxy;
     use crate::ratelimit::RateLimit;
-    use std::path::PathBuf;
     #[cfg(feature = "hosting")]
     use std::time::Duration;
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    static NEXT_CONFIG_FILE: AtomicUsize = AtomicUsize::new(0);
+
+    fn write_config_file(content: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "project-charlotte-cli-config-{}-{}.yaml",
+            std::process::id(),
+            NEXT_CONFIG_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(&path, content).unwrap();
+        path
+    }
 
     #[cfg(feature = "hosting")]
     #[test]
@@ -1530,12 +1749,15 @@ mod tests {
         };
         assert_eq!(defaults.threads, None);
         assert_eq!(defaults.worker_threads, 2);
+        assert_eq!(defaults.worker_idle_timeout, Duration::from_secs(300));
 
         let parsed = Config::parse([
             "--threads".to_owned(),
             "8".to_owned(),
             "--worker-threads".to_owned(),
             "3".to_owned(),
+            "--worker-idle-timeout".to_owned(),
+            "0".to_owned(),
         ])
         .unwrap();
         let ParseResult::Config(config) = parsed else {
@@ -1543,10 +1765,12 @@ mod tests {
         };
         assert_eq!(config.threads, Some(8));
         assert_eq!(config.worker_threads, 3);
+        assert_eq!(config.worker_idle_timeout, Duration::ZERO);
         for invalid in ["0", "-1", "abc", "1025"] {
             assert!(Config::parse(["--threads".to_owned(), invalid.to_owned()]).is_err());
             assert!(Config::parse(["--worker-threads".to_owned(), invalid.to_owned()]).is_err());
         }
+        assert!(Config::parse(["--worker-idle-timeout".to_owned(), "-1".to_owned()]).is_err());
     }
 
     #[test]
@@ -1567,10 +1791,76 @@ mod tests {
 
     #[cfg(feature = "hosting")]
     #[test]
-    fn parses_config_file_and_worker_identity() {
+    fn parses_global_options_from_config_file_and_resolves_relative_paths() {
+        let path = write_config_file(
+            "options:\n  bind: 127.0.0.1:8123\n  debug: true\n  index: [home.htm, index.html]\n  user: charlotte\n  threads: 4\n  access-log-file: logs/access.log\n",
+        );
+        let parsed =
+            Config::parse(["--config".to_owned(), path.to_string_lossy().into_owned()]).unwrap();
+        let ParseResult::Config(config) = parsed else {
+            panic!("expected config")
+        };
+
+        assert_eq!(config.bind.to_string(), "127.0.0.1:8123");
+        assert!(config.debug);
+        assert_eq!(config.index, ["home.htm", "index.html"]);
+        assert_eq!(config.master_user.as_deref(), Some("charlotte"));
+        assert_eq!(config.threads, Some(4));
+        assert_eq!(
+            config.access_log_file,
+            Some(path.parent().unwrap().join("logs/access.log"))
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(feature = "hosting")]
+    #[test]
+    fn command_line_values_override_global_file_defaults() {
+        let path = write_config_file(
+            "options:\n  bind: 127.0.0.1:8123\n  index: [home.htm, index.html]\n",
+        );
         let parsed = Config::parse([
             "--config".to_owned(),
-            "sites.yaml".to_owned(),
+            path.to_string_lossy().into_owned(),
+            "--bind".to_owned(),
+            "127.0.0.1:9123".to_owned(),
+            "--index".to_owned(),
+            "cli.html".to_owned(),
+        ])
+        .unwrap();
+        let ParseResult::Config(config) = parsed else {
+            panic!("expected config")
+        };
+
+        assert_eq!(config.bind.to_string(), "127.0.0.1:9123");
+        assert_eq!(config.index, ["cli.html"]);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rejects_unknown_reserved_and_mistyped_global_options() {
+        for (contents, expected) in [
+            ("options:\n  not-a-real-option: true\n", "unknown option"),
+            ("options:\n  worker: true\n", "not allowed"),
+            ("options:\n  debug: \"true\"\n", "must be a boolean"),
+        ] {
+            let path = write_config_file(contents);
+            let error = Config::parse(["--config".to_owned(), path.to_string_lossy().into_owned()])
+                .err()
+                .expect("invalid options should be rejected");
+            assert!(error.contains(&path.display().to_string()), "{error}");
+            assert!(error.contains(expected), "{error}");
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[cfg(feature = "hosting")]
+    #[test]
+    fn parses_config_file_and_worker_identity() {
+        let path = write_config_file("");
+        let parsed = Config::parse([
+            "--config".to_owned(),
+            path.to_string_lossy().into_owned(),
             "--debug".to_owned(),
             "--worker".to_owned(),
             "--worker-uid".to_owned(),
@@ -1582,11 +1872,12 @@ mod tests {
         let ParseResult::Config(config) = parsed else {
             panic!("expected config")
         };
-        assert_eq!(config.config_file, Some(PathBuf::from("sites.yaml")));
+        assert_eq!(config.config_file, Some(path.clone()));
         assert!(config.debug);
         assert!(config.worker);
         assert_eq!(config.worker_uid, Some(1000));
         assert_eq!(config.worker_gid, Some(1001));
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -1754,24 +2045,23 @@ mod tests {
         }
 
         // Options that belong to no feature are accepted by every build.
+        let path = write_config_file("");
         assert!(
-            Config::parse(
-                [
-                    "--bind",
-                    "127.0.0.1:8080",
-                    "--tls-bind",
-                    "127.0.0.1:8443",
-                    "--user",
-                    "nobody",
-                    "--config",
-                    "sites.yaml",
-                    "--threads",
-                    "4",
-                ]
-                .map(str::to_owned)
-            )
+            Config::parse([
+                "--bind".to_owned(),
+                "127.0.0.1:8080".to_owned(),
+                "--tls-bind".to_owned(),
+                "127.0.0.1:8443".to_owned(),
+                "--user".to_owned(),
+                "nobody".to_owned(),
+                "--config".to_owned(),
+                path.to_string_lossy().into_owned(),
+                "--threads".to_owned(),
+                "4".to_owned(),
+            ])
             .is_ok()
         );
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

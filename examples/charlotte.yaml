@@ -14,11 +14,17 @@
 # triggered by plaintext requests when a cached certificate is within 30 days
 # of expiry. Use `letsencrypt-staging` or a custom directory URL for testing.
 #
-# The file only describes virtual hosts. Listening sockets, the fallback
-# document root, the fallback TLS certificate and the ModSecurity rule set are
-# command-line options; see `project-charlotte --help`. Set the global blocking
-# response status with `--modsecurity-block-status CODE` (400-599); a vhost may
-# override it with `modsecurity_block_status` below.
+# This file describes virtual hosts and can set global command-line defaults in
+# a top-level `options` mapping. See `project-charlotte --help` for all options;
+# command-line values take precedence, and explicit repeatable CLI options
+# replace values from this file. For example:
+# options:
+#   bind: 0.0.0.0:80
+#   debug: true
+#   index: [index.html, index.htm]
+# Relative option paths are resolved against this file's directory.
+# Set the global blocking response status with `modsecurity-block-status`;
+# a vhost may override it with `modsecurity_block_status` below.
 # Bot detection is enabled with `--bot-detection` or `--bot-config FILE`; a
 # vhost can override it with `bot: off` or a policy map.
 #

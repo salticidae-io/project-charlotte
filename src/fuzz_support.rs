@@ -225,6 +225,7 @@ pub(crate) fn fuzz_config(root: PathBuf) -> Config {
         fastcgi_timeout: std::time::Duration::from_secs(1),
         threads: None,
         worker_threads: 2,
+        worker_idle_timeout: std::time::Duration::from_secs(300),
         rate_limit: None,
         trusted_proxies: Vec::new(),
         access_log: false,

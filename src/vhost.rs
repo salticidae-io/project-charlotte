@@ -56,6 +56,8 @@ struct FileConfig {
     vhost: Vec<VhostFile>,
     #[serde(default)]
     vhost_dir: Option<PathBuf>,
+    #[serde(default)]
+    options: Option<serde_yaml_ng::Value>,
 }
 
 // Every build accepts the same declarations, so that one built without a
@@ -80,6 +82,7 @@ struct VhostFile {
     fastcgi_app: Vec<FastCgiAppFile>,
     fastcgi_timeout: Option<u64>,
     worker_threads: Option<usize>,
+    worker_idle_timeout: Option<u64>,
     rate_limit: Option<String>,
     rate_limit_burst: Option<u32>,
     bot: Option<BotPolicyDeclarationFile>,
@@ -294,6 +297,7 @@ impl Router {
             FileConfig {
                 vhost: Vec::new(),
                 vhost_dir: None,
+                options: None,
             }
         };
         let dir = fallback
@@ -382,6 +386,13 @@ impl Router {
                 old.expect("checked source exists").entries.clone()
             } else {
                 let file = parse_file_config(&content)?;
+                if file.options.is_some() {
+                    return Err(format!(
+                        "{}: options are only allowed in the main config file",
+                        path.display()
+                    )
+                    .into());
+                }
                 file.vhost
             };
             candidates.push((path, content, entries));
@@ -408,6 +419,7 @@ impl Router {
                 let file = FileConfig {
                     vhost: sources.main_entries.clone(),
                     vhost_dir: None,
+                    options: None,
                 };
                 let router = Self::from_file(
                     Arc::clone(&self.fallback),
@@ -448,6 +460,7 @@ impl Router {
                     FileConfig {
                         vhost: vec![entry.clone()],
                         vhost_dir: None,
+                        options: None,
                     },
                     config_dir,
                     self.rate_limit.clone(),
@@ -871,6 +884,7 @@ impl Router {
                     // account; one running as root confines nothing.
                     return Err(format!("virtual host user must not be root: {user}").into());
                 }
+                validate_worker_identity(uid, gid)?;
                 let index_names = entry.index.unwrap_or_else(|| fallback.index.clone());
                 validate_index(&index_names)?;
                 let listing = entry.listing.unwrap_or(fallback.listing);
@@ -990,10 +1004,17 @@ impl Router {
                 } else {
                     config_dir.join(root)
                 };
+                check_vhost_root(&root)?;
+                let idle_timeout = entry
+                    .worker_idle_timeout
+                    .map_or(fallback.worker_idle_timeout, Duration::from_secs);
                 let worker = Arc::new(Worker {
                     uid,
                     gid,
                     root,
+                    idle_timeout: (idle_timeout != Duration::ZERO).then_some(idle_timeout),
+                    active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    last_used: Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
                     index: index_names,
                     listing,
                     try_files,
@@ -1004,8 +1025,9 @@ impl Router {
                     error_log_format,
                     process: Mutex::new(None),
                 });
-                let process = worker.spawn_process().await?;
-                *worker.process.lock().await = Some(process);
+                if let Some(timeout) = worker.idle_timeout {
+                    Worker::spawn_idle_reaper(&worker, timeout);
+                }
                 vhosts.push(Vhost {
                     names: normalized_names,
                     tls,
@@ -1690,7 +1712,7 @@ fn validate_vhost_waf_declarations<'a>(
 ///
 /// Virtual host declarations choose the account a worker runs as and the
 /// programs it starts, so whoever can write them controls the server.
-fn ensure_trusted_config(path: &Path) -> io::Result<()> {
+pub(crate) fn ensure_trusted_config(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::MetadataExt;
 
     let metadata = std::fs::metadata(path).path_context("inspect virtual-host config", path)?;
@@ -1837,6 +1859,13 @@ pub(crate) fn check_config(fallback: &Config) -> Vec<String> {
                     else {
                         continue;
                     };
+                    if file.options.is_some() {
+                        diagnostics.push(format!(
+                            "{}: options are only allowed in the main config file",
+                            path.display()
+                        ));
+                        continue;
+                    }
                     let entry_config_dir = path.parent().unwrap_or(&dir);
                     append_located_entries(
                         &path,
@@ -2039,11 +2068,17 @@ fn validate_vhost_entry(
             .user
             .as_deref()
             .ok_or("vhost user is required unless proxy_pass is configured")?;
-        let (uid, _) = resolve_identity(user, entry.group.as_deref())?;
+        let (uid, gid) = resolve_identity(user, entry.group.as_deref())?;
         if uid == 0 {
             return Err(format!("virtual host user must not be root: {user}").into());
         }
+        validate_worker_identity(uid, gid)?;
         validate_index(entry.index.as_deref().unwrap_or(&fallback.index))?;
+        let root = entry
+            .root
+            .as_ref()
+            .ok_or("vhost root is required unless proxy_pass is configured")?;
+        check_vhost_root(&resolve_config_path(root.clone(), config_dir))?;
         crate::config::validate_try_files(
             entry.try_files.as_deref().unwrap_or(&fallback.try_files),
         )?;
@@ -2107,6 +2142,46 @@ fn validate_vhost_entry(
         {
             return Err("vhost FastCGI timeout must be greater than zero".into());
         }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "hosting")]
+fn check_vhost_root(root: &Path) -> io::Result<()> {
+    match std::fs::metadata(root) {
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            format!("vhost root {} is not a directory", root.display()),
+        )),
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            crate::log_debug!(
+                "Could not inspect vhost root {} as the master; the worker will check access",
+                root.display()
+            );
+            Ok(())
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("vhost root {} does not exist", root.display()),
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotADirectory => Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            format!("vhost root {} is not a directory", root.display()),
+        )),
+        Err(error) => Err(io::Error::new(
+            error.kind(),
+            format!("could not inspect vhost root {}: {error}", root.display()),
+        )),
+    }
+}
+
+#[cfg(feature = "hosting")]
+fn validate_worker_identity(uid: u32, gid: u32) -> Result<(), Box<dyn Error + Send + Sync>> {
+    if !crate::privileges::can_set_ids()?
+        && (nix::unistd::geteuid().as_raw() != uid || nix::unistd::getegid().as_raw() != gid)
+    {
+        return Err("a non-root server can only run workers as its current uid and gid".into());
     }
     Ok(())
 }
@@ -2314,6 +2389,7 @@ mod tests {
             fastcgi_app: Vec::new(),
             fastcgi_timeout: None,
             worker_threads: None,
+            worker_idle_timeout: None,
             rate_limit: None,
             rate_limit_burst: None,
             bot: None,
@@ -2926,6 +3002,9 @@ mod tests {
                     uid: 0,
                     gid: 0,
                     root: PathBuf::from("/"),
+                    idle_timeout: None,
+                    active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    last_used: Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
                     index: vec!["index.html".to_owned()],
                     listing: false,
                     try_files: Vec::new(),
@@ -3287,9 +3366,12 @@ mod feature_tests {
     }
 
     fn check_file(path: &Path) -> Vec<String> {
-        let ParseResult::Config(config) =
-            Config::parse(["--config".to_owned(), path.to_string_lossy().into_owned()]).unwrap()
-        else {
+        let ParseResult::Config(config) = Config::parse([
+            "--check-config".to_owned(),
+            "--config".to_owned(),
+            path.to_string_lossy().into_owned(),
+        ])
+        .unwrap() else {
             panic!("expected a configuration");
         };
         check_config(&config)
@@ -3419,6 +3501,31 @@ mod feature_tests {
                 "{semantic_errors:?}"
             );
         }
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn check_config_rejects_global_options_in_vhost_directory_files() {
+        let directory = temp_dir();
+        let vhost_dir = directory.join("sites");
+        fs::create_dir_all(&vhost_dir).unwrap();
+        let main_path = directory.join("main.yaml");
+        fs::write(&main_path, "vhost_dir: sites\n").unwrap();
+        let site_path = vhost_dir.join("site.yaml");
+        fs::write(
+            &site_path,
+            "options:\n  debug: true\nvhost:\n  - server_names: [site.test]\n    proxy_pass: http://127.0.0.1:8080\n",
+        )
+        .unwrap();
+
+        let errors = check_file(&main_path);
+        assert!(
+            errors.iter().any(|error| {
+                error.starts_with(&site_path.display().to_string())
+                    && error.contains("options are only allowed in the main config file")
+            }),
+            "{errors:?}"
+        );
         let _ = fs::remove_dir_all(directory);
     }
 

@@ -5,6 +5,8 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
+use nix::unistd::{Group, User, getegid, geteuid};
+
 static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
 
 fn temp_dir() -> PathBuf {
@@ -68,5 +70,49 @@ fn check_config_accepts_empty_config_without_opening_logs() {
         !error_log.exists(),
         "validation must not open configured logs"
     );
+    let _ = fs::remove_dir_all(directory);
+}
+
+#[test]
+fn check_config_reports_a_missing_vhost_root() {
+    let directory = temp_dir();
+    let config = directory.join("vhosts.yaml");
+    let missing_root = directory.join("missing-site");
+    let (user, group) = if geteuid().is_root() {
+        let Some(user) = User::from_name("nobody").unwrap() else {
+            let _ = fs::remove_dir_all(directory);
+            return;
+        };
+        (user.name, user.gid)
+    } else {
+        let user = User::from_uid(geteuid()).unwrap().unwrap();
+        (user.name, getegid())
+    };
+    let group = Group::from_gid(group).unwrap().unwrap().name;
+    fs::write(
+        &config,
+        format!(
+            "vhost:\n  - server_names: [missing.test]\n    root: {:?}\n    user: {:?}\n    group: {:?}\n",
+            missing_root.to_string_lossy(),
+            user,
+            group
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_project-charlotte"))
+        .arg("--check-config")
+        .arg("--config")
+        .arg(&config)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&missing_root.display().to_string()),
+        "{stderr}"
+    );
+    assert!(stderr.contains("does not exist"), "{stderr}");
     let _ = fs::remove_dir_all(directory);
 }
