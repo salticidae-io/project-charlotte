@@ -1,8 +1,12 @@
 //! Drops master privileges and narrows process capabilities.
 
-use std::{error::Error, ffi::CString};
+#[cfg(any(feature = "acme", feature = "hosting"))]
+use std::io;
 #[cfg(feature = "acme")]
-use std::{io, path::Path};
+use std::path::Path;
+use std::{error::Error, ffi::CString};
+#[cfg(feature = "hosting")]
+use std::{os::unix::process::CommandExt, process::Command};
 
 use caps::{CapSet, Capability, CapsHashSet};
 #[cfg(feature = "hosting")]
@@ -69,7 +73,7 @@ pub(crate) fn drop_master(config: &Config) -> Result<(), Box<dyn Error + Send + 
         setgid(gid)?;
         setuid(user.uid)?;
         set_keepcaps(false)?;
-        retain_master_capabilities(keep_net_bind_service)?;
+        retain_master_capabilities(keep_net_bind_service, false)?;
         crate::log_debug!(
             "Master privileges dropped to uid {} and gid {}",
             user.uid.as_raw(),
@@ -94,7 +98,7 @@ pub(crate) fn drop_master(config: &Config) -> Result<(), Box<dyn Error + Send + 
             }
             caps::set(None, CapSet::Effective, &effective)?;
             setgroups(&[])?;
-            retain_master_capabilities(keep_net_bind_service)?;
+            retain_master_capabilities(keep_net_bind_service, true)?;
         }
     }
     Ok(())
@@ -184,10 +188,13 @@ fn prepare_acme_cache(path: &Path, uid: Uid, gid: Gid) -> io::Result<()> {
 
 fn retain_master_capabilities(
     keep_net_bind_service: bool,
+    keep_worker_capabilities: bool,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    #[cfg(not(feature = "hosting"))]
+    let _ = keep_worker_capabilities;
     let mut retained = CapsHashSet::new();
     #[cfg(feature = "hosting")]
-    {
+    if keep_worker_capabilities {
         retained.insert(SETUID);
         retained.insert(SETGID);
         if caps::has_cap(None, CapSet::Permitted, KILL)? {
@@ -202,6 +209,30 @@ fn retain_master_capabilities(
     caps::clear(None, CapSet::Inheritable)?;
     caps::set(None, CapSet::Effective, &retained)?;
     caps::set(None, CapSet::Permitted, &retained)?;
+    Ok(())
+}
+
+#[cfg(feature = "hosting")]
+#[allow(unsafe_code)]
+pub(crate) fn apply_identity(
+    command: &mut Command,
+    uid: u32,
+    gid: u32,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    use nix::unistd::{Gid, Uid, setgid, setgroups, setuid};
+
+    let uid = Uid::from_raw(uid);
+    let gid = Gid::from_raw(gid);
+    let groups = supplementary_groups(uid, gid)?;
+    // SAFETY: the callback performs only credential syscalls using values prepared before fork.
+    unsafe {
+        command.pre_exec(move || {
+            setgroups(&groups).map_err(io::Error::from)?;
+            setgid(gid).map_err(io::Error::from)?;
+            setuid(uid).map_err(io::Error::from)?;
+            Ok(())
+        });
+    }
     Ok(())
 }
 

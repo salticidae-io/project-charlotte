@@ -5,9 +5,10 @@ use std::time::Duration;
 use std::{
     collections::{BTreeMap, HashMap},
     error::Error,
-    fs::OpenOptions,
-    io::{self, Write},
+    fs::{File, OpenOptions},
+    io::{self, Read, Write},
     net::SocketAddr,
+    os::fd::AsRawFd,
     path::{Path, PathBuf},
     sync::{
         Arc, RwLock,
@@ -289,9 +290,7 @@ impl Router {
             current_dir.clone()
         };
         let file = if let Some(path) = path {
-            ensure_trusted_config(path)?;
-            let content =
-                std::fs::read_to_string(path).path_context("read virtual-host config", path)?;
+            let content = read_trusted_config(path)?;
             parse_file_config(&content)?
         } else {
             FileConfig {
@@ -378,8 +377,7 @@ impl Router {
             {
                 content.clone()
             } else {
-                ensure_trusted_config(&path)?;
-                std::fs::read_to_string(&path).path_context("read virtual-host config", &path)?
+                read_trusted_config(&path)?
             };
             let old = sources.files.get(&path);
             let entries = if old.is_some_and(|source| source.content == content) {
@@ -1708,16 +1706,45 @@ fn validate_vhost_waf_declarations<'a>(
     Ok(())
 }
 
-/// Refuses configuration that an unprivileged account could have written.
+/// Reads trusted configuration through the same descriptor used for its trust check.
 ///
 /// Virtual host declarations choose the account a worker runs as and the
 /// programs it starts, so whoever can write them controls the server.
+pub(crate) fn read_trusted_config(path: &Path) -> io::Result<String> {
+    let mut file = File::open(path).path_context("open virtual-host config", path)?;
+    let metadata = file
+        .metadata()
+        .path_context("inspect virtual-host config", path)?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} must be a regular file", path.display()),
+        ));
+    }
+    ensure_trusted_metadata(&metadata, path)?;
+    let mut content = String::new();
+    file.read_to_string(&mut content)
+        .path_context("read virtual-host config", path)?;
+    Ok(content)
+}
+
+/// Checks a configuration path without consuming its contents.
 pub(crate) fn ensure_trusted_config(path: &Path) -> io::Result<()> {
+    let file = File::open(path).path_context("open virtual-host config", path)?;
+    ensure_trusted_metadata(
+        &file
+            .metadata()
+            .path_context("inspect virtual-host config", path)?,
+        path,
+    )
+}
+
+fn ensure_trusted_metadata(metadata: &std::fs::Metadata, path: &Path) -> io::Result<()> {
     use std::os::unix::fs::MetadataExt;
 
-    let metadata = std::fs::metadata(path).path_context("inspect virtual-host config", path)?;
     let owner = metadata.uid();
-    if owner != 0 && owner != nix::unistd::geteuid().as_raw() {
+    let current_uid = nix::unistd::geteuid().as_raw();
+    if owner != 0 && owner != current_uid {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
@@ -1726,13 +1753,62 @@ pub(crate) fn ensure_trusted_config(path: &Path) -> io::Result<()> {
             ),
         ));
     }
-    if metadata.mode() & 0o002 != 0 {
+    let allow_group_write =
+        metadata.gid() == 0 || (owner == current_uid && private_group_write_allowed(metadata));
+    if !trusted_write_mode(metadata.mode(), allow_group_write) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            format!("{} must not be world-writable", path.display()),
+            format!("{} must not be group- or world-writable", path.display()),
         ));
     }
     Ok(())
+}
+
+fn trusted_write_mode(mode: u32, allow_group_write: bool) -> bool {
+    mode & 0o002 == 0 && (mode & 0o020 == 0 || allow_group_write)
+}
+
+fn private_group_write_allowed(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    use caps::{CapSet, Capability};
+    use nix::unistd::{Gid, Group, Uid, User};
+
+    let uid = nix::unistd::geteuid();
+    if uid.is_root()
+        || crate::logopener::is_active()
+        || caps::has_cap(None, CapSet::Effective, Capability::CAP_SETUID).unwrap_or(true)
+    {
+        return false;
+    }
+    let Ok(Some(user)) = User::from_uid(Uid::from_raw(metadata.uid())) else {
+        return false;
+    };
+    let gid = Gid::from_raw(metadata.gid());
+    if user.gid != gid {
+        return false;
+    }
+    let Ok(Some(group)) = Group::from_gid(gid) else {
+        return false;
+    };
+    if !group.mem.iter().all(|member| member == &user.name) {
+        return false;
+    }
+    let Ok(passwd) = std::fs::read_to_string("/etc/passwd") else {
+        return false;
+    };
+    let mut primary_group_members = 0;
+    for line in passwd.lines() {
+        let fields = line.split(':').collect::<Vec<_>>();
+        if fields.len() < 4 || fields[3].parse::<u32>().ok() != Some(gid.as_raw()) {
+            continue;
+        }
+        if fields[0] != user.name || fields[2].parse::<u32>().ok() != Some(metadata.uid()) {
+            return false;
+        }
+        primary_group_members += 1;
+    }
+    primary_group_members == 1
 }
 
 /// Refuses a set of virtual hosts in which a document root would expose the
@@ -1776,21 +1852,145 @@ fn resolve_config_path(path: PathBuf, config_dir: &Path) -> PathBuf {
     }
 }
 
+pub(crate) fn helper_directories(config: &Config) -> io::Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+    let current_dir = std::env::current_dir()?;
+    let config_dir = config
+        .config_file
+        .as_deref()
+        .and_then(Path::parent)
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(|parent| resolve_config_path(parent.to_path_buf(), &current_dir))
+        .unwrap_or_else(|| current_dir.clone());
+    let mut log_dirs = config
+        .log_dirs
+        .iter()
+        .cloned()
+        .map(|path| resolve_config_path(path, &current_dir))
+        .collect::<Vec<_>>();
+    let mut tls_dirs = config
+        .tls_dirs
+        .iter()
+        .cloned()
+        .map(|path| resolve_config_path(path, &current_dir))
+        .collect::<Vec<_>>();
+    for path in [
+        config.access_log_file.as_deref(),
+        config.error_log_file.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        add_parent_directory(&mut log_dirs, path, &current_dir);
+    }
+    if let Some(tls) = &config.tls {
+        add_parent_directory(&mut tls_dirs, &tls.cert, &current_dir);
+        add_parent_directory(&mut tls_dirs, &tls.key, &current_dir);
+    }
+    #[cfg(feature = "acme")]
+    if let Some(acme) = &config.acme {
+        tls_dirs.push(resolve_config_path(acme.cache.clone(), &current_dir));
+    }
+
+    let main_file = if let Some(path) = &config.config_file {
+        let contents = read_trusted_config(path)?;
+        let file = parse_file_config(&contents)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        for entry in &file.vhost {
+            append_vhost_helper_directories(entry, &mut log_dirs, &mut tls_dirs, &config_dir);
+        }
+        Some(file)
+    } else {
+        None
+    };
+    let vhost_dir = config
+        .vhost_dir
+        .clone()
+        .or_else(|| {
+            main_file.as_ref().and_then(|file| {
+                file.vhost_dir
+                    .clone()
+                    .map(|dir| resolve_config_path(dir, &config_dir))
+            })
+        })
+        .map(|dir| resolve_config_path(dir, &current_dir));
+    if let Some(dir) = vhost_dir {
+        ensure_trusted_config(&dir)?;
+        for path in scan_vhost_files(&dir)? {
+            let contents = read_trusted_config(&path)?;
+            let file = parse_file_config(&contents)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            for entry in &file.vhost {
+                let entry_dir = path.parent().unwrap_or(&dir);
+                append_vhost_helper_directories(entry, &mut log_dirs, &mut tls_dirs, entry_dir);
+            }
+        }
+    }
+    Ok((
+        deduplicate_directories(log_dirs),
+        deduplicate_directories(tls_dirs),
+    ))
+}
+
+fn append_vhost_helper_directories(
+    entry: &VhostFile,
+    log_dirs: &mut Vec<PathBuf>,
+    tls_dirs: &mut Vec<PathBuf>,
+    config_dir: &Path,
+) {
+    for path in [entry.access_log.as_ref(), entry.error_log.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        add_parent_directory(log_dirs, path, config_dir);
+    }
+    for path in [entry.tls_cert.as_ref(), entry.tls_key.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        add_parent_directory(tls_dirs, path, config_dir);
+    }
+}
+
+fn add_parent_directory(directories: &mut Vec<PathBuf>, path: &Path, base: &Path) {
+    let path = resolve_config_path(path.to_path_buf(), base);
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(base);
+    directories.push(parent.to_path_buf());
+}
+
+fn deduplicate_directories(directories: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut unique = Vec::new();
+    for directory in directories {
+        if !unique.contains(&directory) {
+            unique.push(directory);
+        }
+    }
+    unique
+}
+
 fn scan_vhost_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
     let mut files = Vec::new();
-    for entry in std::fs::read_dir(dir).path_context("read virtual-host directory", dir)? {
-        let path = entry
-            .path_context("read virtual-host directory entry", dir)?
-            .path();
-        if path
-            .file_name()
-            .is_some_and(|name| !name.to_string_lossy().starts_with('.'))
+    let directory = File::open(dir).path_context("open virtual-host directory", dir)?;
+    ensure_trusted_metadata(
+        &directory
+            .metadata()
+            .path_context("inspect virtual-host directory", dir)?,
+        dir,
+    )?;
+    let fd_path = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
+    for entry in std::fs::read_dir(&fd_path).path_context("read virtual-host directory", dir)? {
+        let entry = entry.path_context("read virtual-host directory entry", dir)?;
+        let name = entry.file_name();
+        let path = fd_path.join(&name);
+        if !name.to_string_lossy().starts_with('.')
             && path
                 .extension()
                 .is_some_and(|extension| extension == "yaml" || extension == "yml")
         {
             match std::fs::metadata(&path).path_context("inspect virtual-host config", &path) {
-                Ok(metadata) if metadata.is_file() => files.push(path),
+                Ok(metadata) if metadata.is_file() => files.push(dir.join(name)),
                 Ok(_) => {}
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error),
@@ -1924,11 +2124,7 @@ fn read_config_file_for_check(
     path: &Path,
     diagnostics: &mut Vec<String>,
 ) -> Option<(String, FileConfig)> {
-    if let Err(error) = ensure_trusted_config(path) {
-        diagnostics.push(format!("{}: {error}", path.display()));
-        return None;
-    }
-    let content = match std::fs::read_to_string(path) {
+    let content = match read_trusted_config(path) {
         Ok(content) => content,
         Err(error) => {
             diagnostics.push(format!("{}: {error}", path.display()));
@@ -2179,6 +2375,7 @@ fn check_vhost_root(root: &Path) -> io::Result<()> {
 #[cfg(feature = "hosting")]
 fn validate_worker_identity(uid: u32, gid: u32) -> Result<(), Box<dyn Error + Send + Sync>> {
     if !crate::privileges::can_set_ids()?
+        && !crate::logopener::is_active()
         && (nix::unistd::geteuid().as_raw() != uid || nix::unistd::getegid().as_raw() != gid)
     {
         return Err("a non-root server can only run workers as its current uid and gid".into());
@@ -2304,9 +2501,9 @@ mod tests {
         FileConfig, Router, TlsSni, Vhost, VhostFile, VhostTable, Worker, WorkerArgs,
         build_worker_args, ensure_trusted_config, match_score, normalize_host,
         normalize_server_name, parse_file_config, render_control_vhost, request_host,
-        resolve_identity, scan_vhost_files, select_route, valid_control_name, validate_index,
-        validate_vhost_declarations, validate_vhost_waf_declarations, worker_app_env,
-        worker_request,
+        resolve_identity, scan_vhost_files, select_route, trusted_write_mode, valid_control_name,
+        validate_index, validate_vhost_declarations, validate_vhost_waf_declarations,
+        worker_app_env, worker_request,
     };
     use crate::{
         config::{
@@ -3155,9 +3352,88 @@ mod tests {
         std::fs::write(&path, "").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(ensure_trusted_config(&path).is_ok());
+        assert!(!trusted_write_mode(0o664, false));
+        assert!(trusted_write_mode(0o664, true));
+        assert!(!trusted_write_mode(0o666, true));
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
         assert!(ensure_trusted_config(&path).is_err());
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn trusted_configuration_is_a_regular_file_read_through_its_descriptor() {
+        let directory = std::env::temp_dir().join(format!(
+            "project-charlotte-trusted-read-{}-{}",
+            std::process::id(),
+            NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("site.yaml");
+        std::fs::write(&path, "vhost: []\n").unwrap();
+        let link = directory.join("enabled.yaml");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+
+        assert_eq!(super::read_trusted_config(&path).unwrap(), "vhost: []\n");
+        assert_eq!(super::read_trusted_config(&link).unwrap(), "vhost: []\n");
+        let error = super::read_trusted_config(&directory).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn helper_directories_cover_configured_logs_and_tls_files() {
+        let directory = std::env::temp_dir().join(format!(
+            "project-charlotte-helper-directories-{}-{}",
+            std::process::id(),
+            NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+        ));
+        let vhosts = directory.join("vhosts.d");
+        std::fs::create_dir_all(&vhosts).unwrap();
+        let config_path = directory.join("charlotte.yaml");
+        std::fs::write(
+            &config_path,
+            "vhost_dir: vhosts.d\nvhost:\n  - server_names: [main.example.test]\n    proxy_pass: http://127.0.0.1:9\n    access_log: logs/main.log\n    tls_cert: /etc/ssl/main/cert.pem\n    tls_key: /etc/ssl/private/main.key\n",
+        )
+        .unwrap();
+        std::fs::write(
+            vhosts.join("site.yaml"),
+            "vhost:\n  - server_names: [site.example.test]\n    proxy_pass: http://127.0.0.1:9\n    error_log: /var/log/site/error.log\n    access_log: /var/log/site/access.log\n",
+        )
+        .unwrap();
+        let ParseResult::Config(config) = Config::parse([
+            "--config".to_owned(),
+            config_path.to_string_lossy().into_owned(),
+            "--error-log-file".to_owned(),
+            "/var/log/charlotte/error.log".to_owned(),
+            "--log-dir".to_owned(),
+            "/srv/logs".to_owned(),
+            "--tls-dir".to_owned(),
+            "/srv/tls".to_owned(),
+        ])
+        .unwrap() else {
+            panic!("expected config")
+        };
+
+        let (logs, tls) = super::helper_directories(&config).unwrap();
+
+        assert_eq!(
+            logs,
+            [
+                PathBuf::from("/srv/logs"),
+                PathBuf::from("/var/log/charlotte"),
+                directory.join("logs"),
+                PathBuf::from("/var/log/site"),
+            ]
+        );
+        assert_eq!(
+            tls,
+            [
+                PathBuf::from("/srv/tls"),
+                PathBuf::from("/etc/ssl/main"),
+                PathBuf::from("/etc/ssl/private"),
+            ]
+        );
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

@@ -187,8 +187,9 @@ matching virtual-host certificate or the configured fallback certificate. The
 same resolver supports TCP TLS and HTTP/3 TLS. After the handshake, the router
 compares the normalized SNI host with the request authority's selected host to
 prevent cross-host routing on a TLS connection. When the master drops to
-`--user`, the root helper reads static certificate and key PEM files and
-returns only parsed certificate and private-key DER sections to the master.
+`--user`, the root helper reads static certificate and key PEM files from the
+TLS directories it was started with and returns only parsed certificate and
+private-key DER sections to the master.
 
 `acme` manages the ACME account, HTTP-01 challenge responses, certificate
 cache, and renewal/provisioning work. Challenge responses are served by the
@@ -227,7 +228,7 @@ cleanup is handled when their router-owned handles are dropped.
 | `ratelimit` | Bounded per-client GCRA request buckets and `429` responses. |
 | `forwarded` | Trusted-proxy CIDR matching and XFF resolution/sanitization. |
 | `logging` | Apache-compatible access/error log formats, file targets, request context, and logging macros. |
-| `logopener` | Opens regular log files and reads TLS PEM sections in a root helper for a master that drops to `--user`. |
+| `logopener` | Root helper for a master that drops to `--user`: opens log files and reads TLS PEM sections inside directories fixed at startup, and starts and stops virtual-host workers. |
 | `tls` | Rustls configuration, static certificates, and SNI certificate selection. |
 | `acme` | ACME account, HTTP-01 challenges, certificate cache, and renewal. |
 | `http3` | QUIC and HTTP/3 connection handling, forwarding requests to the router. |
@@ -247,9 +248,12 @@ limits are configurable. The ACME cache is kept outside served roots so
 private key material is not exposed as static content.
 
 The master refuses a configuration file, virtual-host directory, or
-virtual-host file that is world-writable or owned by anyone other than root
-or the server's own user, and refuses a virtual host whose user is root: those
-files choose the account a worker runs as and the programs it starts. A
+virtual-host file that is world-writable, writable by a group other than
+root's, or owned by anyone other than root or the server's own user, and
+refuses a virtual host whose user is root: those files choose the account a
+worker runs as and the programs it starts. Each file is checked and read
+through one descriptor. Only a server with no privilege at all also accepts
+write access for its owner's private group. A
 worker receives only a short allowlist of the master's environment, and the
 environment of its FastCGI apps reaches it through its own environment rather
 than its command line.
@@ -272,6 +276,18 @@ that account before serving requests. It terminates TLS, parses requests,
 serves the fallback site, runs ModSecurity, and forwards reverse-proxy traffic
 in that process; the separate root helper opens log files and returns only
 parsed TLS certificate/key sections, never raw PEM file contents.
+
+With `--user` the master keeps no capability but `CAP_NET_BIND_SERVICE`, so a
+compromised master cannot return to root. The helper receives its log and TLS
+directories once, before the master drops privileges, holds a descriptor for
+each, and resolves every later request beneath one of them with
+`openat2(RESOLVE_BENEATH)`. It also owns the worker processes: the master
+sends the worker's identity, arguments, environment and its end of the
+socket pair, and the helper refuses UID 0, anything but a worker command line
+for that identity, and environment names outside the worker allowlist. It
+reaps exited workers and stops the rest when the master goes away. A server
+started without `--user` but with file capabilities has no root helper and
+starts workers itself, so it keeps `CAP_SETUID`, `CAP_SETGID` and `CAP_KILL`.
 
 Unit and integration tests cover routing, handlers, TLS, ACME, FastCGI, CGI,
 reverse proxying, and ModSecurity. Fuzz targets exercise parsed inputs and

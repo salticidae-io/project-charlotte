@@ -59,10 +59,11 @@ use tokio_rustls::TlsAcceptor;
 use crate::acme::AcmeManager;
 #[cfg(feature = "hosting")]
 use crate::config::FastCgiAddress;
+#[cfg(any(feature = "acme", feature = "hosting"))]
+use crate::pathctx::PathContext;
 use crate::{
     config::{Config, ParseResult},
     ja4::{ClientHelloInfo, RecordingStream, TlsFingerprint, parse_client_hello},
-    pathctx::PathContext,
     ratelimit::RateLimiter,
     tls::TlsSetup,
     vhost::{Router, TlsSni},

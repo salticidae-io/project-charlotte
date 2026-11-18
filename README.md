@@ -192,6 +192,8 @@ see all command-line options. Common options include:
 | `--access-log-file FILE` | Append access-log records to `FILE` (takes precedence over `--access-log`). |
 | `--access-log-format FORMAT` | Apache `LogFormat` string or nickname (`common`, `combined`, `vhost_common`, `vhost_combined`, `referer`, `agent`). |
 | `--error-log-file FILE` | Append error-log records (including CGI/FastCGI stderr) to `FILE` instead of stderr. |
+| `--log-dir DIRECTORY` | With `--user`: additional directory in which the root helper may open log files (repeatable). |
+| `--tls-dir DIRECTORY` | With `--user`: additional directory from which the root helper may read TLS PEM files (repeatable). |
 | `--error-log-format FORMAT` | Apache `ErrorLogFormat` string; defaults to `[%t] [%l] [pid %P] [module %m] %M`. |
 | `--bot-detection` | Enable the built-in bot policy in enforcing mode. |
 | `--bot-config FILE` | Load bot-detection settings from YAML; enables detection and overrides the defaults. |
@@ -247,16 +249,26 @@ server starts as root with `--user`, a small root helper opens log files,
 including worker stderr logs, and reads TLS certificate and key files so they
 need not be accessible to the website account. The master and website workers
 still perform website operations under their configured users and groups. The
-master retains `CAP_KILL` when permitted so it can stop workers and FastCGI apps
-running under other UIDs; this also allows it to signal other processes. The
 server sends error output to stderr when no error log is configured, including
-output from the root helper and worker processes. The helper only handles
-regular files, refuses a final-component symlink, and
-returns write-only descriptors for logs and only parsed certificate/key DER
-sections for TLS. A compromised master can still write to or truncate any
-regular file it can persuade the helper to open, and read PEM certificate or
-private-key sections from any file it can persuade the helper to read, so
-protect the binary and configuration files.
+output from the root helper and worker processes.
+
+The helper only works inside directories fixed at startup: the directories
+holding the log files and TLS certificate/key files named by the options and
+virtual hosts read at startup, the ACME cache, and any directory added with
+`--log-dir DIRECTORY` or `--tls-dir DIRECTORY` (both repeatable; `log_dir` and
+`tls_dir` in the `options` of the config file). Log and TLS directories are
+separate lists, the filesystem root cannot be listed, and the list cannot be
+changed while the server runs. A reload or control-socket change that names a
+log or TLS file in any other directory is refused until the server is
+restarted or the directory is listed with one of those options. Within a
+listed directory the helper resolves paths with `openat2(RESOLVE_BENEATH)`, so
+neither `..` nor a symlink can lead outside it; it only handles regular files,
+refuses a final-component symlink, and returns append-only descriptors for
+logs and only parsed certificate/key DER sections for TLS. A compromised
+master can therefore still append to log files and read PEM sections in the
+listed directories, and nowhere else. A listed directory is covered with all
+its subdirectories, so keep log files in a directory of their own: a log
+configured as `/var/log/site.log` lists all of `/var/log`.
 
 Access formats follow Apache `mod_log_config`: `%%`, `%a`, `%{c}a`, `%A`, `%b`,
 `%B`, `%D`, `%h`, `%H`, `%I`, `%{Name}i`, `%{Name}o`, `%{Name}C`, `%l`, `%m`,
@@ -430,13 +442,24 @@ supplementary groups from the account's group database entry, using `--group`
 as the primary group when supplied. Hosted workers likewise receive the
 configured user's supplementary groups. This grants access available through
 those groups to website operations, so configure group membership accordingly.
-The master retains only the capabilities needed to launch virtual-host workers
-as their configured users and groups (plus
-`CAP_NET_BIND_SERVICE` if it had that capability before dropping privileges).
-Log files are opened and TLS certificate/key PEM sections are read by a
-separate root helper; the master continues to handle requests and website
-operations under `--user`/`--group`, and hosted workers continue under their
-configured identities.
+After the drop the master holds no capability except `CAP_NET_BIND_SERVICE`
+(if it had it), so it cannot change its identity again or signal processes of
+other accounts. A separate root helper opens log files, reads TLS
+certificate/key PEM sections, and starts and stops virtual-host workers on the
+master's behalf. The helper only starts this same binary in worker mode, never
+as UID 0, with the short worker environment allowlist, and keeps only
+`CAP_DAC_OVERRIDE`, `CAP_SETUID`, `CAP_SETGID` and `CAP_KILL`. The master
+continues to handle requests and website operations under `--user`/`--group`,
+and hosted workers continue under their configured identities. A compromised
+master can still ask for a worker under any non-root account, as its
+configuration already can.
+
+The Debian package runs the server this way: `/etc/default/project-charlotte`
+passes `--user www-data`, and the systemd unit confines the service
+(`ProtectSystem=full`, private `/tmp` and devices, a capability bounding set,
+and a system-call filter). Virtual hosts created through the control socket
+are written by the `--user` account, so that account needs write access to the
+`--vhost-dir` directory, which must still be owned by root or by that account.
 
 Alternatively, an unprivileged account can run the binary with file
 capabilities:
@@ -447,7 +470,19 @@ sudo setcap cap_setuid,cap_setgid=ep /path/to/project-charlotte
 
 Add `cap_net_bind_service` to that command if the master must bind privileged
 ports. `CAP_SETUID` is powerful: a compromised master with this capability can
-switch to UID 0. Protect the binary and its configuration accordingly.
+switch to UID 0. Protect the binary and its configuration accordingly, or
+prefer starting as root with `--user`, where the master keeps no such
+capability.
+
+The main config file, the `--vhost-dir` directory and the files in it choose
+the accounts and programs the server runs. The server refuses any of them that
+is not owned by root or by the account running the server, that is
+world-writable, or that is group-writable by a group other than root's. Each
+file is checked and read through the same open descriptor, so it cannot be
+swapped between the check and the read. A server running without any
+privilege (not root, no `--user`, no `CAP_SETUID`) also accepts a file that is
+group-writable by its owner's private group, the group that has no other
+member.
 
 Virtual-host configuration is provided as YAML. For example, a basic host
 declaration looks like this:

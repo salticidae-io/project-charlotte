@@ -176,7 +176,7 @@ async fn root_helper_opens_vhost_logs_after_master_drops_privileges() {
     std::fs::write(
         &config,
         format!(
-            "vhost:\\n  - server_names: [logs.example.test]\\n    root: {:?}\\n    user: {:?}\\n    cgi: [cgi]\\n    access_log: vhost-access.log\\n    error_log: vhost-error.log\\n",
+            "vhost:\n  - server_names: [logs.example.test]\n    root: {:?}\n    user: {:?}\n    cgi: [cgi]\n    access_log: vhost-access.log\n    access_log_format: \"%v %>s %U %b\"\n    error_log: vhost-error.log\n",
             site.to_string_lossy(),
             user.name,
         ),
@@ -227,6 +227,11 @@ async fn root_helper_opens_vhost_logs_after_master_drops_privileges() {
     }
     assert_eq!(std::fs::metadata(&vhost_log).unwrap().uid(), 0);
     assert_eq!(std::fs::metadata(&vhost_error_log).unwrap().uid(), 0);
+    // The master keeps no capability that could restore its privileges: the
+    // root helper is what starts workers under other accounts.
+    let capabilities = process_permitted_capabilities(pid).unwrap();
+    const IDENTITY_CAPABILITIES: u64 = (1 << 1) | (1 << 5) | (1 << 6) | (1 << 7);
+    assert_eq!(capabilities & IDENTITY_CAPABILITIES, 0, "{capabilities:#x}");
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while TcpStream::connect(address).await.is_err() {
@@ -252,6 +257,15 @@ async fn root_helper_opens_vhost_logs_after_master_drops_privileges() {
 
     common::shutdown(&mut server);
     let _ = std::fs::remove_dir_all(&base);
+}
+
+#[cfg(target_os = "linux")]
+fn process_permitted_capabilities(pid: u32) -> Option<u64> {
+    std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("CapPrm:"))
+        .and_then(|value| u64::from_str_radix(value.trim(), 16).ok())
 }
 
 #[cfg(target_os = "linux")]

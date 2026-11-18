@@ -5,10 +5,7 @@ use std::{
     ffi::OsString,
     io,
     net::SocketAddr,
-    os::{
-        fd::OwnedFd,
-        unix::{net::UnixStream as StdUnixStream, process::CommandExt},
-    },
+    os::{fd::OwnedFd, unix::net::UnixStream as StdUnixStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
@@ -27,7 +24,7 @@ use hyper::{body::Incoming, client::conn::http2::SendRequest};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use nix::{
     sys::signal::{Signal, kill},
-    unistd::{Gid, Group, Pid, Uid, User, setgid, setgroups, setuid},
+    unistd::{Group, Pid, User},
 };
 use tokio::{io::AsyncReadExt, net::UnixStream, sync::Mutex, time::timeout};
 
@@ -69,62 +66,58 @@ pub(super) struct Worker {
 
 pub(super) struct WorkerProcess {
     pub(super) sender: WorkerSender,
-    pub(super) child: Child,
+    pub(super) child: WorkerChild,
+}
+
+pub(super) enum WorkerChild {
+    Direct(Child),
+    Helper(u64),
+}
+
+impl WorkerChild {
+    fn id(&self) -> u64 {
+        match self {
+            Self::Direct(child) => u64::from(child.id()),
+            Self::Helper(id) => *id,
+        }
+    }
+    fn stop(&mut self, force: bool) -> io::Result<()> {
+        match self {
+            Self::Helper(id) => crate::logopener::stop_worker(*id, force),
+            Self::Direct(child) => stop_direct_worker(child, force),
+        }
+    }
+}
+
+fn stop_direct_worker(child: &mut Child, force: bool) -> io::Result<()> {
+    if child.try_wait()?.is_some() {
+        return Ok(());
+    }
+    if !force {
+        let pid = i32::try_from(child.id())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid worker pid"))?;
+        let _ = kill(Pid::from_raw(pid), Signal::SIGTERM);
+        let deadline = Instant::now() + WORKER_SHUTDOWN_GRACE;
+        while Instant::now() < deadline {
+            if child.try_wait()?.is_some() {
+                return Ok(());
+            }
+            thread::sleep(WORKER_SHUTDOWN_POLL);
+        }
+    }
+    if let Err(error) = child.kill()
+        && child.try_wait()?.is_none()
+    {
+        return Err(error);
+    }
+    child.wait()?;
+    Ok(())
 }
 
 impl Drop for WorkerProcess {
     fn drop(&mut self) {
-        // SIGKILL alone would stop the worker before it could drop the handles
-        // that stop its FastCGI apps, orphaning those apps along with every
-        // descriptor they inherited. Ask for an orderly exit first, and fall
-        // back to SIGKILL only if the worker does not take it. The wait is
-        // bounded and short because this runs on whichever thread drops the
-        // worker, which may be a runtime thread.
-        if let Ok(pid) = i32::try_from(self.child.id())
-            && kill(Pid::from_raw(pid), Signal::SIGTERM).is_ok()
-        {
-            let deadline = Instant::now() + WORKER_SHUTDOWN_GRACE;
-            loop {
-                match self.child.try_wait() {
-                    Ok(Some(_)) => return,
-                    Ok(None) => {}
-                    Err(_) => break,
-                }
-                if Instant::now() >= deadline {
-                    break;
-                }
-                thread::sleep(WORKER_SHUTDOWN_POLL);
-            }
-        }
-        if let Err(error) = self.child.kill() {
-            crate::log_error!(
-                "Could not kill virtual-host worker {}: {error}",
-                self.child.id()
-            );
-            return;
-        }
-
-        let deadline = Instant::now() + WORKER_SHUTDOWN_GRACE;
-        loop {
-            match self.child.try_wait() {
-                Ok(Some(_)) => return,
-                Ok(None) => {}
-                Err(error) => {
-                    crate::log_error!(
-                        "Could not reap virtual-host worker {} after SIGKILL: {error}",
-                        self.child.id()
-                    );
-                    return;
-                }
-            }
-            if Instant::now() >= deadline {
-                crate::log_error!(
-                    "Timed out waiting for virtual-host worker {} after SIGKILL",
-                    self.child.id()
-                );
-                return;
-            }
-            thread::sleep(WORKER_SHUTDOWN_POLL);
+        if let Err(error) = self.child.stop(false) {
+            crate::log_error!("Could not stop virtual-host worker: {error}");
         }
     }
 }
@@ -177,59 +170,61 @@ impl Worker {
         );
         let (parent, child_socket) = StdUnixStream::pair()?;
         parent.set_nonblocking(true)?;
-        let mut command = Command::new(std::env::current_exe()?);
-        if crate::privileges::can_set_ids()? {
-            let uid = Uid::from_raw(self.uid);
-            let gid = Gid::from_raw(self.gid);
-            let groups = crate::privileges::supplementary_groups(uid, gid)?;
-            // SAFETY: this pre-exec callback uses only credential syscalls and
-            // data prepared before fork; it does not allocate or access shared state.
-            #[allow(unsafe_code)]
-            unsafe {
-                command.pre_exec(move || {
-                    setgroups(&groups).map_err(io::Error::from)?;
-                    setgid(gid).map_err(io::Error::from)?;
-                    setuid(uid).map_err(io::Error::from)?;
-                    Ok(())
-                });
-            }
-        }
-        command
-            .args(build_worker_args(WorkerArgs {
-                uid: self.uid,
-                gid: self.gid,
-                root: &self.root,
-                index: &self.index,
-                listing: self.listing,
-                try_files: &self.try_files,
-                fastcgi: &self.fastcgi,
-                timeout: self.fastcgi_timeout,
-                error_log_format: &self.error_log_format,
-            }))
-            .arg("--worker-threads")
-            .arg(self.threads.to_string())
-            .env_clear()
-            .envs(
-                WORKER_INHERITED_ENV
-                    .iter()
-                    .filter_map(|name| std::env::var_os(name).map(|value| (name, value))),
-            )
-            .stdin(Stdio::from(OwnedFd::from(child_socket)))
-            .current_dir("/");
+        let mut args = build_worker_args(WorkerArgs {
+            uid: self.uid,
+            gid: self.gid,
+            root: &self.root,
+            index: &self.index,
+            listing: self.listing,
+            try_files: &self.try_files,
+            fastcgi: &self.fastcgi,
+            timeout: self.fastcgi_timeout,
+            error_log_format: &self.error_log_format,
+        });
+        args.push("--worker-threads".into());
+        args.push(self.threads.to_string().into());
         if crate::logging::debug_enabled() {
-            command.arg("--debug");
+            args.push("--debug".into());
         }
-        if let Some(path) = &self.error_log_file {
-            let stderr = crate::logging::open_log_file(path)?;
-            command.stderr(Stdio::from(stderr));
-        }
+        let mut environment = WORKER_INHERITED_ENV
+            .iter()
+            .filter_map(|name| std::env::var_os(name).map(|value| (OsString::from(name), value)))
+            .collect::<Vec<_>>();
         if let Some(app_env) = worker_app_env(&self.fastcgi) {
-            command.env(crate::config::WORKER_APP_ENV, app_env);
+            environment.push((
+                OsString::from(crate::config::WORKER_APP_ENV),
+                OsString::from(app_env),
+            ));
         }
 
-        let mut child = command.spawn()?;
-        crate::log_debug!("Started virtual-host worker with pid {}", child.id());
-        drop(command);
+        let mut child = if crate::logopener::is_active() {
+            WorkerChild::Helper(crate::logopener::spawn_worker(
+                self.uid,
+                self.gid,
+                &args,
+                &environment,
+                self.error_log_file.as_deref(),
+                OwnedFd::from(child_socket),
+            )?)
+        } else {
+            let mut command = Command::new(std::env::current_exe()?);
+            command
+                .args(&args)
+                .env_clear()
+                .envs(environment.iter().map(|(key, value)| (key, value)))
+                .stdin(Stdio::from(OwnedFd::from(child_socket)))
+                .current_dir("/");
+            if let Some(path) = &self.error_log_file {
+                let stderr = crate::logging::open_log_file(path)?;
+                command.stderr(Stdio::from(stderr));
+            }
+            if crate::privileges::can_set_ids()? {
+                crate::privileges::apply_identity(&mut command, self.uid, self.gid)?;
+            }
+            let child = command.spawn()?;
+            crate::log_debug!("Started virtual-host worker with pid {}", child.id());
+            WorkerChild::Direct(child)
+        };
         let mut stream = UnixStream::from_std(parent)?;
         let ready_result = timeout(WORKER_READY_TIMEOUT, async {
             let mut byte = [0; 1];
@@ -277,30 +272,11 @@ impl Worker {
         Ok(WorkerProcess { sender, child })
     }
 
-    fn startup_failure(&self, child: &mut Child, reason: &str) -> String {
-        let kill_error = child.kill().err();
-        let deadline = Instant::now() + WORKER_SHUTDOWN_GRACE;
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break format!("exit status {status}"),
-                Ok(None) if Instant::now() >= deadline => {
-                    let termination_error = kill_error
-                        .as_ref()
-                        .map_or_else(String::new, |error| format!("; kill failed: {error}"));
-                    break format!(
-                        "exit status unavailable (worker did not exit{termination_error})"
-                    );
-                }
-                Ok(None) => thread::sleep(WORKER_SHUTDOWN_POLL),
-                Err(error) => {
-                    let termination_error =
-                        kill_error.as_ref().map_or_else(String::new, |kill_error| {
-                            format!("; kill failed: {kill_error}")
-                        });
-                    break format!("exit status unavailable ({error}{termination_error})");
-                }
-            }
-        };
+    fn startup_failure(&self, child: &mut WorkerChild, reason: &str) -> String {
+        let status = child.stop(true).map_or_else(
+            |error| format!("stop failed: {error}"),
+            |_| "stopped".to_owned(),
+        );
         let error_target = self
             .error_log_file
             .as_deref()

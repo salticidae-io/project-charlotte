@@ -44,8 +44,8 @@
 #
 # This file, the `vhost_dir` directory and the files in it decide which
 # accounts and programs the server runs, so they must be owned by root or by
-# the user running the server and must not be world-writable; otherwise the
-# server refuses to load them.
+# the user running the server and must not be world-writable or writable by a
+# group other than root's; otherwise the server refuses to load them.
 
 vhost_dir: vhosts.d
 

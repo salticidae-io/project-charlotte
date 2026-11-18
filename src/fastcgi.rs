@@ -1079,6 +1079,8 @@ mod tests {
             trusted_proxies: Vec::new(),
             access_log: false,
             access_log_file: None,
+            log_dirs: Vec::new(),
+            tls_dirs: Vec::new(),
             access_log_format: "%a %U".to_owned(),
             error_log_file: None,
             error_log_format: "[%l] %M".to_owned(),

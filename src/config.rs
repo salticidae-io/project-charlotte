@@ -74,6 +74,8 @@ pub struct Config {
     pub(crate) trusted_proxies: Vec<TrustedProxy>,
     pub(crate) access_log: bool,
     pub(crate) access_log_file: Option<PathBuf>,
+    pub(crate) log_dirs: Vec<PathBuf>,
+    pub(crate) tls_dirs: Vec<PathBuf>,
     pub(crate) access_log_format: String,
     pub(crate) error_log_file: Option<PathBuf>,
     pub(crate) error_log_format: String,
@@ -210,6 +212,12 @@ struct Cli {
     /// Append error-log records to a file
     #[arg(long, value_name = "FILE", allow_hyphen_values = true)]
     error_log_file: Option<PathBuf>,
+    /// Directory the root helper may use for log files; may be repeated
+    #[arg(long, value_name = "DIRECTORY", allow_hyphen_values = true)]
+    log_dir: Vec<PathBuf>,
+    /// Directory the root helper may use for TLS PEM files; may be repeated
+    #[arg(long, value_name = "DIRECTORY", allow_hyphen_values = true)]
+    tls_dir: Vec<PathBuf>,
     /// Apache-compatible error log format
     #[arg(long, value_name = "FORMAT", allow_hyphen_values = true)]
     error_log_format: Option<String>,
@@ -320,9 +328,7 @@ impl Config {
         };
         let matches = if let Some(config_path) = matches.get_one::<PathBuf>("config_file") {
             let config_path = config_path.clone();
-            crate::vhost::ensure_trusted_config(&config_path)
-                .map_err(|error| format!("{}: {error}", config_path.display()))?;
-            let content = std::fs::read_to_string(&config_path)
+            let content = crate::vhost::read_trusted_config(&config_path)
                 .map_err(|error| format!("{}: {error}", config_path.display()))?;
             let value: serde_yaml_ng::Value = match serde_yaml_ng::from_str(&content) {
                 Ok(value) => value,
@@ -475,6 +481,8 @@ impl Config {
             trusted_proxy,
             access_log,
             access_log_file,
+            log_dir,
+            tls_dir,
             access_log_format,
             error_log_file,
             error_log_format,
@@ -652,6 +660,8 @@ impl Config {
             trusted_proxies,
             access_log,
             access_log_file,
+            log_dirs: log_dir,
+            tls_dirs: tls_dir,
             access_log_format,
             error_log_file,
             error_log_format,
@@ -804,6 +814,8 @@ fn is_path_option(key: &str) -> bool {
             | "control_socket"
             | "access_log_file"
             | "error_log_file"
+            | "log_dir"
+            | "tls_dir"
             | "bot_config"
             | "modsecurity_rules"
             | "tls_cert"
@@ -1793,7 +1805,7 @@ mod tests {
     #[test]
     fn parses_global_options_from_config_file_and_resolves_relative_paths() {
         let path = write_config_file(
-            "options:\n  bind: 127.0.0.1:8123\n  debug: true\n  index: [home.htm, index.html]\n  user: charlotte\n  threads: 4\n  access-log-file: logs/access.log\n",
+            "options:\n  bind: 127.0.0.1:8123\n  debug: true\n  index: [home.htm, index.html]\n  user: charlotte\n  threads: 4\n  access-log-file: logs/access.log\n  log-dir: [logs, audit]\n  tls-dir: certificates\n",
         );
         let parsed =
             Config::parse(["--config".to_owned(), path.to_string_lossy().into_owned()]).unwrap();
@@ -1810,7 +1822,41 @@ mod tests {
             config.access_log_file,
             Some(path.parent().unwrap().join("logs/access.log"))
         );
+        assert_eq!(
+            config.log_dirs,
+            [
+                path.parent().unwrap().join("logs"),
+                path.parent().unwrap().join("audit")
+            ]
+        );
+        assert_eq!(
+            config.tls_dirs,
+            [path.parent().unwrap().join("certificates")]
+        );
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn parses_repeatable_helper_directory_flags() {
+        let ParseResult::Config(config) = Config::parse([
+            "--log-dir".to_owned(),
+            "/var/log/charlotte".to_owned(),
+            "--log-dir".to_owned(),
+            "/srv/logs".to_owned(),
+            "--tls-dir".to_owned(),
+            "/etc/charlotte/tls".to_owned(),
+        ])
+        .unwrap() else {
+            panic!("expected config")
+        };
+        assert_eq!(
+            config.log_dirs,
+            [
+                PathBuf::from("/var/log/charlotte"),
+                PathBuf::from("/srv/logs")
+            ]
+        );
+        assert_eq!(config.tls_dirs, [PathBuf::from("/etc/charlotte/tls")]);
     }
 
     #[cfg(feature = "hosting")]
