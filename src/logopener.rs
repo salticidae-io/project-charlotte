@@ -1070,7 +1070,15 @@ fn openat2_beneath(
         )
     };
     if descriptor < 0 {
-        return Err(io::Error::last_os_error());
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(nix::libc::ENOSYS) {
+            return Err(io::Error::new(
+                error.kind(),
+                "openat2 is unavailable (os error 38); the root helper needs Linux 5.6 or \
+                 later, and a seccomp sandbox such as systemd's RestrictSUIDSGID=true blocks it",
+            ));
+        }
+        return Err(error);
     }
     let descriptor = RawFd::try_from(descriptor)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid file descriptor"))?;

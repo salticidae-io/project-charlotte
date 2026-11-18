@@ -209,6 +209,14 @@ fn packaged_defaults_run_unprivileged_with_systemd_sandboxing() {
     ] {
         assert!(service.lines().any(|line| line == directive), "{directive}");
     }
+    // RestrictSUIDSGID makes systemd fail openat2 with ENOSYS, which the root
+    // helper needs for every log and TLS file, so the server cannot start.
+    assert!(
+        !service
+            .lines()
+            .any(|line| line.trim_start().starts_with("RestrictSUIDSGID=")),
+        "RestrictSUIDSGID breaks the root helper's openat2"
+    );
     let capability_bounding_set = service
         .lines()
         .find(|line| line.starts_with("CapabilityBoundingSet="))

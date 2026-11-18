@@ -27,7 +27,9 @@ ProtectHostname=true
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 RestrictNamespaces=true
 RestrictRealtime=true
-RestrictSUIDSGID=true
+# No RestrictSUIDSGID: its seccomp filter cannot inspect openat2's mode, so it
+# fails every openat2 with ENOSYS, and the root helper opens files only with
+# openat2. NoNewPrivileges already stops setuid/setgid binaries gaining rights.
 LockPersonality=true
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
