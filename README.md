@@ -356,35 +356,160 @@ storage `503`.
 
 ### Bot detection
 
-Bot detection is disabled unless `--bot-detection` or `--bot-config` is used.
-The built-in policy scores user-agent, browser-header, and (for TCP TLS)
-ClientHello/JA4 signals; scanner signatures are blocked, and intermediate
-scores receive a proof-of-work challenge. Claimed search-engine crawlers are
-verified with reverse and forward DNS by default. HTTP/3 and plaintext
-connections do not have a JA4 fingerprint.
+Bot detection is disabled unless `--bot-detection` (the built-in policy in
+enforcing mode) or `--bot-config FILE` (a YAML policy) is used. The master
+evaluates every request after the ACME challenge check and the rate limit, and
+before ModSecurity and routing, so blocked and challenged requests never reach
+the WAF, a worker, a script, or a proxied upstream. The client address is the
+same one used for rate limiting, so it honours `--trusted-proxy`.
 
-Use `mode: log` in a policy file to observe scores without enforcing them, or
-configure exceptions for health checks and API clients. A bot policy accepts
-`challenge_threshold` (40), `block_threshold` (80), `challenge_difficulty`
-(16 bits), `challenge_ttl` (seconds), `allow_ips`, `deny_ips`,
-`allow_user_agents`, `deny_user_agents`, `builtin_rules`, `honeypot_paths`,
-`honeypot_ban`, `exempt_paths`, `verify_crawlers`, `ja4_allow`, and `ja4_deny`.
-The challenge cookie is HMAC-signed and bound to the client IPv4 `/24` or IPv6
-`/64`; HTTPS responses mark it `Secure`.
+#### How a request is scored
+
+Each request gets a score from 0 upwards; the reasons are recorded alongside
+it. The checks run in this order:
+
+1. **Bypasses.** `mode: off`, a path starting with an `exempt_paths` prefix, or
+   a client in `allow_ips` is allowed without further checks.
+2. **Honeypots.** A client banned by a honeypot is blocked (score 100). A
+   request with any method whose path equals a `honeypot_paths` entry bans the
+   client IP for `honeypot_ban` seconds and is blocked.
+3. **Explicit rules.** A client in `deny_ips`, a user agent containing a
+   `deny_user_agents` substring, or a JA4 fingerprint in `ja4_deny` adds 100.
+   Without a deny match, a user agent containing an `allow_user_agents`
+   substring is allowed immediately. User-agent patterns are matched
+   case-insensitively.
+4. **Built-in rules** (`builtin_rules: true`, the default):
+
+   | Signal | Score |
+   | --- | --- |
+   | Scanner user agent (`sqlmap`, `nikto`, `nmap`, `masscan`, `zgrab`, `nuclei`, `wpscan`, `acunetix`, `nessus`, `openvas`, `dirbuster`, `gobuster`, `ffuf`) | 100 |
+   | Automation user agent (`curl`, `wget`, `python-requests`, `python-urllib`, `go-http-client`, `okhttp`, `java/`, `libwww-perl`, `scrapy`, `aiohttp`, `axios`, `node-fetch`, `httpclient`, `headlesschrome`, `phantomjs`) | 50 |
+   | Empty or missing user agent | 50 |
+   | Browser user agent over HTTP/1.0 | 30 |
+   | Browser user agent without `Accept` | 20 |
+   | Browser user agent without `Accept-Language` | 20 |
+   | Browser user agent over TLS without `Sec-Fetch-Mode` | 15 |
+
+   A "browser user agent" contains `chrome/`, `chromium/`, `firefox/`,
+   `safari/`, or `edg/`.
+5. **TLS fingerprint.** On TCP TLS connections Charlotte records the
+   ClientHello and computes its [JA4](https://github.com/FoxIO-LLC/ja4)
+   fingerprint (also available in access logs as `%{ja4}n`). Without a deny
+   match, a fingerprint in `ja4_allow` is allowed immediately. For browser
+   user agents, a ClientHello that offers neither `h2` nor `http/1.1` ALPN adds
+   30, one whose highest version is below TLS 1.3 adds 30, and a Chrome,
+   Chromium or Edge user agent without GREASE values adds 40.
+6. **Crawler verification** (`verify_crawlers: true`, the default). A user
+   agent claiming to be Googlebot, Bingbot, Applebot, YandexBot, Baiduspider or
+   DuckDuckBot triggers a reverse DNS lookup of the client IP. The name must end
+   in the operator's domain (`.googlebot.com`, `.search.msn.com`,
+   `.applebot.apple.com`, `.yandex.ru`, `.crawl.baidu.com`, `.duckduckgo.com`)
+   and resolve forward to the same IP. A verified crawler is allowed unless a
+   deny rule matched; an impostor adds 100. Lookups time out after 2 seconds,
+   at most 16 run at once, and results are cached for an hour (60 seconds after
+   a lookup error, which adds nothing to the score).
+
+#### What happens next
+
+A score at or above `block_threshold` (default 80) returns `403 Forbidden`. A
+score at or above `challenge_threshold` (default 40) gets a proof-of-work
+challenge, unless `challenge: false` or the request carries a valid challenge
+cookie. Anything lower is allowed. In `mode: log`, any request with a non-zero
+score is allowed and only logged. Each block, challenge and log decision is
+written to the error log, for example:
+
+```text
+bot detection: client=198.51.100.7:51234 score=50 action=Challenge reasons=["automation user-agent"]
+```
+
+The challenge is a small HTML page, returned with status 403. Its JavaScript
+searches for a nonce whose SHA-256 hash, combined with a server-issued seed,
+starts with `challenge_difficulty` zero bits (default 16, at most 24; each
+extra bit doubles the work). The browser then loads
+`/.well-known/charlotte-bot-challenge`. Charlotte checks the seed, the
+proof-of-work and the return path, sets the `charlotte_bot` cookie and
+redirects (`303`) to the original URL. The seed must be used within
+`challenge_ttl` seconds (default 3600). The cookie is HMAC-SHA256 signed,
+`HttpOnly`, `SameSite=Lax`, `Secure` on HTTPS, and valid for 7 days from the
+client's IPv4 `/24` or IPv6 `/64`. Clients without JavaScript or cookies cannot
+pass a challenge.
+
+#### Configuration
+
+A policy file, a vhost `bot` map, and the built-in defaults accept these keys:
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `mode` | `enforce` | `enforce`, `log` (score and log only), or `off`. |
+| `challenge_threshold` | `40` | Lowest score that is challenged (1–100, at most `block_threshold`). |
+| `block_threshold` | `80` | Lowest score that is blocked (at most 100). |
+| `challenge` | `true` | Set to `false` to allow, rather than challenge, mid-range scores. |
+| `challenge_difficulty` | `16` | Proof-of-work leading zero bits (0–24). |
+| `challenge_ttl` | `3600` | Seconds a challenge seed stays valid (at most 7 days). |
+| `allow_ips` / `deny_ips` | `[]` | IP addresses or CIDR ranges. |
+| `allow_user_agents` / `deny_user_agents` | `[]` | Case-insensitive user-agent substrings. |
+| `ja4_allow` / `ja4_deny` | `[]` | Exact JA4 fingerprints. |
+| `builtin_rules` | `true` | Enable the built-in user-agent and header rules. |
+| `honeypot_paths` | `[]` | Exact paths that ban the client. |
+| `honeypot_ban` | `3600` | Ban length in seconds (at most 30 days). |
+| `exempt_paths` | `[]` | Path prefixes that skip bot detection. |
+| `verify_crawlers` | `true` | Verify claimed search-engine crawlers through DNS. |
+
+Unknown keys are rejected, and paths must be local absolute paths.
 
 ```yaml
 mode: log
 challenge_threshold: 40
 block_threshold: 80
 allow_ips: [192.0.2.0/24]
+allow_user_agents: [internal-monitor/]
 exempt_paths: [/health, /api/]
+honeypot_paths: [/wp-login.php]
+honeypot_ban: 86400
 verify_crawlers: true
 ```
 
-Per-vhost YAML can inherit the global policy, disable it with `bot: off`, or
-provide its own policy map. Since automation clients such as `curl` can be
-legitimate health checks, begin with log mode and explicitly allow trusted
-clients before enforcing.
+The `--bot-config` file is the global policy. A virtual host inherits it, turns
+it off with `bot: off`, or replaces it with its own policy map (a replacement,
+not a merge):
+
+```yaml
+vhost:
+  - server_names: [api.example.com]
+    root: /srv/www/api
+    user: www-api
+    bot: off
+  - server_names: [www.example.com]
+    root: /srv/www/example
+    user: www-example
+    bot:
+      challenge_difficulty: 18
+      honeypot_paths: [/admin.php]
+```
+
+Automation clients such as `curl` score 50 and are challenged by default, which
+breaks health checks and API clients. Start in log mode, read the logged
+reasons, and add exemptions or allow rules for trusted clients before
+enforcing.
+
+#### Limitations
+
+- The signing key, bans and crawler cache are held in memory. Restarting the
+  server invalidates all challenge cookies and lifts all bans.
+- All virtual hosts share one signing key and ban list. A challenge cookie
+  issued by one vhost is accepted by the others, and a honeypot ban applies on
+  every vhost with bot detection enabled.
+- HTTP/3 and plaintext connections have no JA4 fingerprint, and neither does
+  a ClientHello larger than the 16 KiB capture buffer. JA4 rules and scores do
+  not apply to these requests.
+- `exempt_paths` is a plain prefix match: `/health` also exempts
+  `/healthcheck`. End the prefix with `/` where that matters.
+- Honeypot bans are per exact IP address, so clients sharing a NAT are banned
+  together, and an IPv6 client can move to another address in its `/64`.
+  Anything that makes a visitor's browser request a honeypot URL, such as an
+  embedded image on another site, bans that visitor.
+- Allow rules based on user agents or JA4 fingerprints rely on values the
+  client controls. Use `allow_ips` for clients that must never be challenged.
 
 ### OWASP Core Rule Set
 
