@@ -5,6 +5,7 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
+#[cfg(feature = "hosting")]
 use nix::unistd::{Group, User, getegid, geteuid};
 
 static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
@@ -73,6 +74,9 @@ fn check_config_accepts_empty_config_without_opening_logs() {
     let _ = fs::remove_dir_all(directory);
 }
 
+// A vhost with a document root needs the `hosting` feature; without it the
+// config is rejected before the root is checked.
+#[cfg(feature = "hosting")]
 #[test]
 fn check_config_reports_a_missing_vhost_root() {
     let directory = temp_dir();
