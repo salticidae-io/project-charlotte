@@ -1,6 +1,6 @@
 //! Library entry point that composes server services and coordinates listeners and shutdown.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 #[cfg(feature = "acme")]
 mod acme;
@@ -19,8 +19,10 @@ mod http3;
 mod httpdate;
 mod ja4;
 mod logging;
+mod logopener;
 #[cfg(feature = "hosting")]
 mod mime;
+mod pathctx;
 mod privileges;
 #[cfg(feature = "proxy")]
 mod proxy;
@@ -57,6 +59,8 @@ use tokio_rustls::TlsAcceptor;
 use crate::acme::AcmeManager;
 #[cfg(feature = "hosting")]
 use crate::config::FastCgiAddress;
+#[cfg(any(feature = "acme", feature = "hosting"))]
+use crate::pathctx::PathContext;
 use crate::{
     config::{Config, ParseResult},
     ja4::{ClientHelloInfo, RecordingStream, TlsFingerprint, parse_client_hello},
@@ -172,6 +176,12 @@ async fn accepted_stream(
 
 /// Runs the server using the process command-line arguments.
 pub fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|argument| argument == logopener::HELPER_ARGUMENT)
+    {
+        return logopener::run_helper(0);
+    }
     let config = match Config::parse(std::env::args().skip(1))? {
         ParseResult::Help => {
             println!("{}", Config::usage());
@@ -179,6 +189,14 @@ pub fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         }
         ParseResult::Config(config) => *config,
     };
+    if config.check_config {
+        let diagnostics = vhost::check_config(&config);
+        if diagnostics.is_empty() {
+            println!("Configuration OK");
+            return Ok(());
+        }
+        return Err(diagnostics.join("\n").into());
+    }
     #[cfg(feature = "hosting")]
     let mut config = config;
     #[cfg(not(feature = "hosting"))]
@@ -216,44 +234,105 @@ pub fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         )
     });
     logging::set_global_access_log(access_log.map(std::sync::Arc::new));
+    logging::set_debug(config.debug);
+    crate::log_debug!(
+        "Error log target: {}",
+        config
+            .error_log_file
+            .as_deref()
+            .map_or_else(|| "stderr".to_owned(), |path| path.display().to_string())
+    );
+    crate::log_debug!(
+        "Access log target: {}",
+        config.access_log_file.as_deref().map_or_else(
+            || if config.access_log {
+                "stdout"
+            } else {
+                "disabled"
+            }
+            .to_owned(),
+            |path| path.display().to_string()
+        )
+    );
 
-    #[cfg(feature = "hosting")]
-    if config.worker {
-        if let Ok(app_env) = std::env::var(config::WORKER_APP_ENV) {
-            config.apply_fastcgi_app_env(&app_env)?;
+    let report_startup_errors = config.error_log_file.is_some();
+    let startup_result = (move || -> Result<(), Box<dyn Error + Send + Sync>> {
+        #[cfg(feature = "hosting")]
+        if config.worker {
+            crate::log_debug!("Starting in virtual-host worker mode");
+            if let Ok(app_env) = std::env::var(config::WORKER_APP_ENV) {
+                config.apply_fastcgi_app_env(&app_env)?;
+            }
+            worker::drop_privileges(&config)?;
+            crate::log_debug!(
+                "Starting worker runtime with {} thread(s)",
+                config.worker_threads
+            );
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(config.worker_threads)
+                .enable_all()
+                .build()?;
+            return runtime.block_on(worker::run(config));
         }
-        worker::drop_privileges(&config)?;
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(config.worker_threads)
-            .enable_all()
-            .build()?;
-        return runtime.block_on(worker::run(config));
+        crate::log_debug!("Starting master process");
+        logopener::start(&config)?;
+        privileges::drop_master(&config)?;
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        if let Some(threads) = config.threads {
+            builder.worker_threads(threads);
+        }
+        crate::log_debug!(
+            "Starting master runtime with {} thread(s)",
+            config
+                .threads
+                .map_or_else(|| "Tokio default".to_owned(), |threads| threads.to_string())
+        );
+        let runtime = builder.enable_all().build()?;
+        runtime.block_on(run_master(config))
+    })();
+    if report_startup_errors {
+        if let Err(error) = &startup_result {
+            crate::log_error!("Startup failed: {error}");
+        }
     }
-    privileges::drop_master(&config)?;
-    let mut builder = tokio::runtime::Builder::new_multi_thread();
-    if let Some(threads) = config.threads {
-        builder.worker_threads(threads);
-    }
-    let runtime = builder.enable_all().build()?;
-    runtime.block_on(run_master(config))
+    startup_result
 }
 
 async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> {
     #[cfg(feature = "hosting")]
-    let root = tokio::fs::canonicalize(&config.root).await?;
+    let root = tokio::fs::canonicalize(&config.root)
+        .await
+        .path_context("resolve document root", &config.root)?;
     #[cfg(feature = "hosting")]
-    if !tokio::fs::metadata(&root).await?.is_dir() {
+    if !tokio::fs::metadata(&root)
+        .await
+        .path_context("inspect document root", &root)?
+        .is_dir()
+    {
         return Err(format!("document root is not a directory: {}", root.display()).into());
     }
+    #[cfg(feature = "hosting")]
+    crate::log_debug!("Resolved fallback document root to {}", root.display());
     #[cfg(feature = "hosting")]
     let mut config = Config { root, ..config };
     #[cfg(not(feature = "hosting"))]
     let config = config;
     #[cfg(feature = "hosting")]
+    crate::log_debug!("Starting configured FastCGI applications");
+    #[cfg(feature = "hosting")]
     let _fastcgi_apps = fastcgi_app::start_apps(&mut config).await?;
     let listener = if config.plain_http {
-        Some(TcpListener::bind(config.bind).await?)
+        crate::log_debug!("Binding plain HTTP listener to {}", config.bind);
+        let listener = TcpListener::bind(config.bind).await.map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("could not bind TCP listener to {}: {error}", config.bind),
+            )
+        })?;
+        crate::log_debug!("Bound plain HTTP listener on {}", listener.local_addr()?);
+        Some(listener)
     } else {
+        crate::log_debug!("Plain HTTP listener disabled");
         None
     };
     let waf = if config.modsecurity_rules.is_empty() {
@@ -271,6 +350,7 @@ async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> 
     let rate_limit = config
         .rate_limit
         .map(|limit| Arc::new(RateLimiter::new(limit)));
+    log_debug!("Loading virtual-host router");
     let router = Router::load(
         Arc::new(config.clone()),
         config.config_file.as_ref(),
@@ -278,20 +358,27 @@ async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> 
         waf,
     )
     .await?;
+    log_debug!("Loaded virtual-host router");
     #[cfg(feature = "acme")]
     let router = {
         let mut router = router;
         if let Some(settings) = config.acme.clone() {
             let cache = settings.cache.clone();
+            log_debug!("Initializing ACME manager with cache {}", cache.display());
             let acme = AcmeManager::load(settings, router.acme_names()).await?;
-            let cache = tokio::fs::canonicalize(&cache).await?;
+            let cache = tokio::fs::canonicalize(&cache)
+                .await
+                .path_context("resolve ACME cache directory", &cache)?;
             for root in router.document_roots() {
-                let root = tokio::fs::canonicalize(root).await?;
+                let root = tokio::fs::canonicalize(&root)
+                    .await
+                    .path_context("resolve document root", &root)?;
                 if cache.starts_with(root) {
                     return Err("ACME cache must be outside every served document root".into());
                 }
             }
             router.set_acme_manager(Some(acme));
+            log_debug!("Initialized ACME manager");
         }
         router
     };
@@ -307,12 +394,25 @@ async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> 
         );
     }
     let tls_listener = match (config.tls_bind, tls_setup.as_ref()) {
-        (Some(address), Some(_)) => Some(TcpListener::bind(address).await?),
+        (Some(address), Some(_)) => {
+            crate::log_debug!("Binding TLS listener to {address}");
+            let listener = TcpListener::bind(address).await.map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!("could not bind TLS listener to {address}: {error}"),
+                )
+            })?;
+            crate::log_debug!("Bound TLS listener on {}", listener.local_addr()?);
+            Some(listener)
+        }
         _ => None,
     };
     #[cfg(feature = "http3")]
     let http3_endpoint = if let Some(tls) = &tls_setup {
-        Some(http3::bind(config.http3_bind, &tls.http3)?)
+        crate::log_debug!("Binding HTTP/3 endpoint to {}", config.http3_bind);
+        let endpoint = http3::bind(config.http3_bind, &tls.http3)?;
+        crate::log_debug!("Bound HTTP/3 endpoint on {}", endpoint.1);
+        Some(endpoint)
     } else {
         None
     };

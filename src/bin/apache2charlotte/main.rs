@@ -22,6 +22,12 @@ struct Cli {
     /// Write output to this file instead of stdout
     #[arg(short, long, value_name = "FILE")]
     output: Option<PathBuf>,
+    /// Omit explanatory and review comments from the generated YAML
+    #[arg(long)]
+    no_comments: bool,
+    /// Set each vhost's user and group from its document root owner
+    #[arg(long)]
+    user_from_root: bool,
     /// ServerRoot used to resolve relative Include paths
     #[arg(long, value_name = "DIRECTORY")]
     server_root: Option<PathBuf>,
@@ -46,7 +52,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             defines: cli.defines,
         },
     )?;
-    let converted = convert::convert(&nodes);
+    let converted = convert::convert(&nodes, !cli.no_comments, cli.user_from_root);
     if let Some(output) = cli.output {
         fs::write(output, converted)?;
     } else {

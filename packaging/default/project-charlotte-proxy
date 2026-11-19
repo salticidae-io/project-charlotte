@@ -1,5 +1,12 @@
 # Options passed to project-charlotte by systemd.
-CHARLOTTE_OPTS="--config /etc/charlotte/charlotte.yaml --bind 0.0.0.0:80 --control-socket /run/charlotte/control.sock"
+#
+# The server starts as root to bind its listeners and then runs as --user.
+# A small root helper stays behind to open log files, read TLS PEM files and
+# start virtual-host workers. It only touches the directories of the log and
+# TLS files configured at startup; name further ones with --log-dir and
+# --tls-dir. Files that the server itself writes, such as virtual hosts
+# created through the control socket, must be writable by --user.
+CHARLOTTE_OPTS="--user www-data --config /etc/charlotte/charlotte.yaml --bind 0.0.0.0:80 --control-socket /run/charlotte/control.sock"
 
 # For ACME and TLS, add the TLS and HTTP/3 listeners and configure eligible
 # virtual hosts.

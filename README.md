@@ -107,7 +107,18 @@ apache2charlotte /etc/apache2/apache2.conf --output charlotte-vhosts.yaml
 
 Use `--server-root DIRECTORY` to override `ServerRoot`, and repeat `-D NAME`
 or `-D NAME=VALUE` to define Apache variables used by `Include` and
-`<IfDefine>`.
+`<IfDefine>`. Add `--no-comments` to omit the generated review and explanation
+comments from the YAML output.
+
+Add `--user-from-root` to set each vhost's `user` and `group` to the owner of
+its document root, overriding configured values. Relative document roots are
+resolved from the converter's current working directory; if ownership cannot
+be determined, configured values are kept and a review comment is emitted.
+FastCGI apps are emitted only when their executable is an absolute path;
+commands such as `php-cgi` or relative paths are skipped with a review comment.
+Apache `DirectoryIndex` and nginx `index` entries are converted to an ordered
+`index` list; entries that are not bare file names are skipped with a review
+comment.
 
 ### nginx configuration conversion
 
@@ -123,7 +134,14 @@ nginx2charlotte /etc/nginx/nginx.conf --output charlotte-vhosts.yaml
 
 Use `--prefix DIRECTORY` to change the base directory for relative includes.
 Only `location /` and PHP regex locations have direct route mappings; other
-locations and nginx listener settings are retained as comments.
+locations and nginx listener settings are retained as comments. Add
+`--no-comments` to omit the generated review and explanation comments from the
+YAML output.
+
+Add `--user-from-root` to set each vhost's `user` and `group` to the owner of
+its root, overriding configured values. Relative roots are resolved from the
+converter's current working directory; if ownership cannot be determined,
+configured values are kept and a review comment is emitted.
 
 ## Quick start
 
@@ -154,14 +172,16 @@ see all command-line options. Common options include:
 | Option | Purpose |
 | --- | --- |
 | `--bind ADDRESS` | Plain HTTP listener; defaults to `127.0.0.1:8080`. |
+| `--debug` | Log verbose startup details, including listener binding, workers, and TLS initialization. |
 | `--no-plain-http` | Disable the plain HTTP listener; incompatible with ACME HTTP-01. |
 | `--root DIRECTORY` | Fallback document root when no virtual host handles a request; defaults to `.`. |
 | `--user USER [--group GROUP]` | Drop the master process to this account before starting; requires root. |
-| `--index NAME` | Fallback index file name; defaults to `index.html`. |
+| `--index NAME` | Fallback index file name; repeat or comma-separate values to try them in order (default `index.html`). |
 | `--no-listing` | Disable directory listings, which are enabled by default. |
 | `--try-files ENTRY` | Add a candidate or fallback rule; may be specified more than once. |
 | `--config FILE` | Load virtual-host declarations from a YAML file. |
 | `--vhost-dir DIRECTORY` | Load and watch additional `.yaml` and `.yml` virtual-host files in a directory. |
+| `--check-config` | Validate the virtual-host YAML files and exit, reporting errors with source locations. |
 | `--control-socket PATH` | Serve the local HTTP configuration API on a Unix socket. |
 | `--tls-bind ADDRESS` | Listen for HTTPS; configure a certificate with `--tls-cert` and `--tls-key`, or use eligible ACME virtual hosts. |
 | `--http3-bind ADDRESS` | Enable the HTTP/3 listener; TLS configuration is required. |
@@ -172,6 +192,8 @@ see all command-line options. Common options include:
 | `--access-log-file FILE` | Append access-log records to `FILE` (takes precedence over `--access-log`). |
 | `--access-log-format FORMAT` | Apache `LogFormat` string or nickname (`common`, `combined`, `vhost_common`, `vhost_combined`, `referer`, `agent`). |
 | `--error-log-file FILE` | Append error-log records (including CGI/FastCGI stderr) to `FILE` instead of stderr. |
+| `--log-dir DIRECTORY` | With `--user`: additional directory in which the root helper may open log files (repeatable). |
+| `--tls-dir DIRECTORY` | With `--user`: additional directory from which the root helper may read TLS PEM files (repeatable). |
 | `--error-log-format FORMAT` | Apache `ErrorLogFormat` string; defaults to `[%t] [%l] [pid %P] [module %m] %M`. |
 | `--bot-detection` | Enable the built-in bot policy in enforcing mode. |
 | `--bot-config FILE` | Load bot-detection settings from YAML; enables detection and overrides the defaults. |
@@ -183,6 +205,23 @@ see all command-line options. Common options include:
 | `--modsecurity-rules FILE` | Load ModSecurity rules; can be repeated to load multiple files. |
 | `--modsecurity-block-status CODE` | Override the status for ModSecurity blocking interventions (400–599; defaults to the rule status or 403). |
 | `--acme-directory URL --acme-cache DIR` | Configure ACME certificate provisioning and its cache. |
+
+Any command-line option can also be set as a global default in the main
+configuration file's top-level `options` mapping. Use the long option name with
+hyphens or underscores; flags take YAML booleans, single-value options take a
+scalar, and repeatable options take a scalar or sequence. Command-line values
+override file defaults, and an explicitly supplied repeatable option replaces
+the corresponding file sequence. Relative path options are resolved against
+the directory containing the config file. The `config`, `check-config`, `help`,
+and internal worker options cannot be set this way. For example:
+
+```yaml
+options:
+  bind: 0.0.0.0:8080
+  debug: true
+  index: [index.html, index.htm]
+  access-log-file: logs/access.log
+```
 
 Rate limits return `429 Too Many Requests` with a `Retry-After` header. The
 client key is the socket peer IP unless that peer matches a configured
@@ -205,19 +244,46 @@ Access and error logs can be written directly to files for the whole server
 the `access_log`, `access_log_format`, `error_log`, and `error_log_format` YAML
 keys. A vhost without its own setting inherits the server's file and format.
 Files are opened in append mode with mode `0640`; vhost log paths are relative
-to the YAML file and are reopened when virtual hosts are reloaded. Vhost log
-files are opened after the server drops privileges, so they must be writable
-by the server user.
+to the YAML file and are reopened when virtual hosts are reloaded. When the
+server starts as root with `--user`, a small root helper opens log files,
+including worker stderr logs, and reads TLS certificate and key files so they
+need not be accessible to the website account. The master and website workers
+still perform website operations under their configured users and groups. The
+server sends error output to stderr when no error log is configured, including
+output from the root helper and worker processes.
+
+The helper only works inside directories fixed at startup: the directories
+holding the log files and TLS certificate/key files named by the options and
+virtual hosts read at startup, the ACME cache, and any directory added with
+`--log-dir DIRECTORY` or `--tls-dir DIRECTORY` (both repeatable; `log_dir` and
+`tls_dir` in the `options` of the config file). Log and TLS directories are
+separate lists, the filesystem root cannot be listed, and the list cannot be
+changed while the server runs. A reload or control-socket change that names a
+log or TLS file in any other directory is refused until the server is
+restarted or the directory is listed with one of those options. Within a
+listed directory the helper resolves paths with `openat2(RESOLVE_BENEATH)`, so
+neither `..` nor a symlink can lead outside it; it only handles regular files,
+refuses a final-component symlink, and returns append-only descriptors for
+logs and only parsed certificate/key DER sections for TLS. A compromised
+master can therefore still append to log files and read PEM sections in the
+listed directories, and nowhere else. A listed directory is covered with all
+its subdirectories, so keep log files in a directory of their own: a log
+configured as `/var/log/site.log` lists all of `/var/log`.
 
 Access formats follow Apache `mod_log_config`: `%%`, `%a`, `%{c}a`, `%A`, `%b`,
-`%B`, `%D`, `%h`, `%H`, `%{Name}i`, `%{Name}o`, `%{Name}C`, `%l`, `%m`,
-`%{ja4}n`, `%p`, `%{local|remote|canonical}p`, `%P`, `%q`, `%r`, `%s`, `%>s`,
-`%t`, `%{strftime}t` (with `begin:`/`end:` and `sec`, `msec`, `usec`,
-`msec_frac`, `usec_frac`), `%T`, `%{s|ms|us}T`, `%u`, `%U`, `%v`, and `%V`, plus
+`%B`, `%D`, `%h`, `%H`, `%I`, `%{Name}i`, `%{Name}o`, `%{Name}C`, `%l`, `%m`,
+`%{ja4}n`, `%O`, `%p`, `%{local|remote|canonical}p`, `%P`, `%q`, `%r`,
+`%s`, `%S`, `%>s`, `%t`, `%{strftime}t` (including `begin:`/`end:` and
+`sec`, `msec`, `usec`, `msec_frac`, `usec_frac`), `%T`, `%{s|ms|us}T`, `%u`,
+`%U`, `%v`, and `%V`, plus
 status conditions such as `%400,501{User-Agent}i` and `%!200{Referer}i`.
 Unsupported directives are rejected at startup. The default format keeps the
 previous stdout layout. Records are written when the response body finishes,
 so `%b`, `%D`, and `%T` reflect what was sent.
+`%I`, `%O`, and `%S` include request bytes received, response bytes sent, and
+their total, respectively. Header sizes are estimates based on HTTP/1.x request
+and response lines and header fields; they may differ from actual wire bytes,
+especially with HTTP/2 compression or headers added by Hyper after dispatch.
 
 Error formats follow Apache `ErrorLogFormat`: `%%`, `%a`, `%A`, `%t`, `%{u}t`,
 `%{c}t`, `%{cu}t`, `%l`, `%m`, `%M`, `%P`, `%T`, and `%v`. As in Apache, a
@@ -231,9 +297,15 @@ stderr, so their raw output is appended to the same file unformatted.
 ### Configuration socket
 
 `--control-socket /run/charlotte/control.sock` enables a local HTTP/1.1 JSON
-API for the vhost directory. The socket is created with mode `0600`; its parent
-directory must already exist, be writable by the server's effective account
-(after any privilege drop), and not be writable by untrusted users. `GET /vhosts`
+API for the vhost directory. The socket is created with mode `0600`. A missing
+parent directory is created with mode `0750` (missing ancestors get `0755`);
+with `--user`, this happens before privileges are dropped and the directory is
+owned by the `--user`/`--group` account. An existing directory owned by that
+account is tightened to `0750`. An existing directory owned by someone else is
+handed over only if it is empty or contains just the old socket; otherwise it
+must already be writable by the server's effective account, and startup fails
+with an explanatory error rather than re-owning a shared directory such as
+`/run`. Keep the directory unwritable by untrusted users. `GET /vhosts`
 lists directory-backed vhosts and read-only vhosts from the main config, while
 `GET /vhosts/{name}` returns the YAML entries as JSON.
 Names are limited to 64 ASCII letters, digits, dots, underscores, and hyphens,
@@ -284,35 +356,160 @@ storage `503`.
 
 ### Bot detection
 
-Bot detection is disabled unless `--bot-detection` or `--bot-config` is used.
-The built-in policy scores user-agent, browser-header, and (for TCP TLS)
-ClientHello/JA4 signals; scanner signatures are blocked, and intermediate
-scores receive a proof-of-work challenge. Claimed search-engine crawlers are
-verified with reverse and forward DNS by default. HTTP/3 and plaintext
-connections do not have a JA4 fingerprint.
+Bot detection is disabled unless `--bot-detection` (the built-in policy in
+enforcing mode) or `--bot-config FILE` (a YAML policy) is used. The master
+evaluates every request after the ACME challenge check and the rate limit, and
+before ModSecurity and routing, so blocked and challenged requests never reach
+the WAF, a worker, a script, or a proxied upstream. The client address is the
+same one used for rate limiting, so it honours `--trusted-proxy`.
 
-Use `mode: log` in a policy file to observe scores without enforcing them, or
-configure exceptions for health checks and API clients. A bot policy accepts
-`challenge_threshold` (40), `block_threshold` (80), `challenge_difficulty`
-(16 bits), `challenge_ttl` (seconds), `allow_ips`, `deny_ips`,
-`allow_user_agents`, `deny_user_agents`, `builtin_rules`, `honeypot_paths`,
-`honeypot_ban`, `exempt_paths`, `verify_crawlers`, `ja4_allow`, and `ja4_deny`.
-The challenge cookie is HMAC-signed and bound to the client IPv4 `/24` or IPv6
-`/64`; HTTPS responses mark it `Secure`.
+#### How a request is scored
+
+Each request gets a score from 0 upwards; the reasons are recorded alongside
+it. The checks run in this order:
+
+1. **Bypasses.** `mode: off`, a path starting with an `exempt_paths` prefix, or
+   a client in `allow_ips` is allowed without further checks.
+2. **Honeypots.** A client banned by a honeypot is blocked (score 100). A
+   request with any method whose path equals a `honeypot_paths` entry bans the
+   client IP for `honeypot_ban` seconds and is blocked.
+3. **Explicit rules.** A client in `deny_ips`, a user agent containing a
+   `deny_user_agents` substring, or a JA4 fingerprint in `ja4_deny` adds 100.
+   Without a deny match, a user agent containing an `allow_user_agents`
+   substring is allowed immediately. User-agent patterns are matched
+   case-insensitively.
+4. **Built-in rules** (`builtin_rules: true`, the default):
+
+   | Signal | Score |
+   | --- | --- |
+   | Scanner user agent (`sqlmap`, `nikto`, `nmap`, `masscan`, `zgrab`, `nuclei`, `wpscan`, `acunetix`, `nessus`, `openvas`, `dirbuster`, `gobuster`, `ffuf`) | 100 |
+   | Automation user agent (`curl`, `wget`, `python-requests`, `python-urllib`, `go-http-client`, `okhttp`, `java/`, `libwww-perl`, `scrapy`, `aiohttp`, `axios`, `node-fetch`, `httpclient`, `headlesschrome`, `phantomjs`) | 50 |
+   | Empty or missing user agent | 50 |
+   | Browser user agent over HTTP/1.0 | 30 |
+   | Browser user agent without `Accept` | 20 |
+   | Browser user agent without `Accept-Language` | 20 |
+   | Browser user agent over TLS without `Sec-Fetch-Mode` | 15 |
+
+   A "browser user agent" contains `chrome/`, `chromium/`, `firefox/`,
+   `safari/`, or `edg/`.
+5. **TLS fingerprint.** On TCP TLS connections Charlotte records the
+   ClientHello and computes its [JA4](https://github.com/FoxIO-LLC/ja4)
+   fingerprint (also available in access logs as `%{ja4}n`). Without a deny
+   match, a fingerprint in `ja4_allow` is allowed immediately. For browser
+   user agents, a ClientHello that offers neither `h2` nor `http/1.1` ALPN adds
+   30, one whose highest version is below TLS 1.3 adds 30, and a Chrome,
+   Chromium or Edge user agent without GREASE values adds 40.
+6. **Crawler verification** (`verify_crawlers: true`, the default). A user
+   agent claiming to be Googlebot, Bingbot, Applebot, YandexBot, Baiduspider or
+   DuckDuckBot triggers a reverse DNS lookup of the client IP. The name must end
+   in the operator's domain (`.googlebot.com`, `.search.msn.com`,
+   `.applebot.apple.com`, `.yandex.ru`, `.crawl.baidu.com`, `.duckduckgo.com`)
+   and resolve forward to the same IP. A verified crawler is allowed unless a
+   deny rule matched; an impostor adds 100. Lookups time out after 2 seconds,
+   at most 16 run at once, and results are cached for an hour (60 seconds after
+   a lookup error, which adds nothing to the score).
+
+#### What happens next
+
+A score at or above `block_threshold` (default 80) returns `403 Forbidden`. A
+score at or above `challenge_threshold` (default 40) gets a proof-of-work
+challenge, unless `challenge: false` or the request carries a valid challenge
+cookie. Anything lower is allowed. In `mode: log`, any request with a non-zero
+score is allowed and only logged. Each block, challenge and log decision is
+written to the error log, for example:
+
+```text
+bot detection: client=198.51.100.7:51234 score=50 action=Challenge reasons=["automation user-agent"]
+```
+
+The challenge is a small HTML page, returned with status 403. Its JavaScript
+searches for a nonce whose SHA-256 hash, combined with a server-issued seed,
+starts with `challenge_difficulty` zero bits (default 16, at most 24; each
+extra bit doubles the work). The browser then loads
+`/.well-known/charlotte-bot-challenge`. Charlotte checks the seed, the
+proof-of-work and the return path, sets the `charlotte_bot` cookie and
+redirects (`303`) to the original URL. The seed must be used within
+`challenge_ttl` seconds (default 3600). The cookie is HMAC-SHA256 signed,
+`HttpOnly`, `SameSite=Lax`, `Secure` on HTTPS, and valid for 7 days from the
+client's IPv4 `/24` or IPv6 `/64`. Clients without JavaScript or cookies cannot
+pass a challenge.
+
+#### Configuration
+
+A policy file, a vhost `bot` map, and the built-in defaults accept these keys:
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `mode` | `enforce` | `enforce`, `log` (score and log only), or `off`. |
+| `challenge_threshold` | `40` | Lowest score that is challenged (1–100, at most `block_threshold`). |
+| `block_threshold` | `80` | Lowest score that is blocked (at most 100). |
+| `challenge` | `true` | Set to `false` to allow, rather than challenge, mid-range scores. |
+| `challenge_difficulty` | `16` | Proof-of-work leading zero bits (0–24). |
+| `challenge_ttl` | `3600` | Seconds a challenge seed stays valid (at most 7 days). |
+| `allow_ips` / `deny_ips` | `[]` | IP addresses or CIDR ranges. |
+| `allow_user_agents` / `deny_user_agents` | `[]` | Case-insensitive user-agent substrings. |
+| `ja4_allow` / `ja4_deny` | `[]` | Exact JA4 fingerprints. |
+| `builtin_rules` | `true` | Enable the built-in user-agent and header rules. |
+| `honeypot_paths` | `[]` | Exact paths that ban the client. |
+| `honeypot_ban` | `3600` | Ban length in seconds (at most 30 days). |
+| `exempt_paths` | `[]` | Path prefixes that skip bot detection. |
+| `verify_crawlers` | `true` | Verify claimed search-engine crawlers through DNS. |
+
+Unknown keys are rejected, and paths must be local absolute paths.
 
 ```yaml
 mode: log
 challenge_threshold: 40
 block_threshold: 80
 allow_ips: [192.0.2.0/24]
+allow_user_agents: [internal-monitor/]
 exempt_paths: [/health, /api/]
+honeypot_paths: [/wp-login.php]
+honeypot_ban: 86400
 verify_crawlers: true
 ```
 
-Per-vhost YAML can inherit the global policy, disable it with `bot: off`, or
-provide its own policy map. Since automation clients such as `curl` can be
-legitimate health checks, begin with log mode and explicitly allow trusted
-clients before enforcing.
+The `--bot-config` file is the global policy. A virtual host inherits it, turns
+it off with `bot: off`, or replaces it with its own policy map (a replacement,
+not a merge):
+
+```yaml
+vhost:
+  - server_names: [api.example.com]
+    root: /srv/www/api
+    user: www-api
+    bot: off
+  - server_names: [www.example.com]
+    root: /srv/www/example
+    user: www-example
+    bot:
+      challenge_difficulty: 18
+      honeypot_paths: [/admin.php]
+```
+
+Automation clients such as `curl` score 50 and are challenged by default, which
+breaks health checks and API clients. Start in log mode, read the logged
+reasons, and add exemptions or allow rules for trusted clients before
+enforcing.
+
+#### Limitations
+
+- The signing key, bans and crawler cache are held in memory. Restarting the
+  server invalidates all challenge cookies and lifts all bans.
+- All virtual hosts share one signing key and ban list. A challenge cookie
+  issued by one vhost is accepted by the others, and a honeypot ban applies on
+  every vhost with bot detection enabled.
+- HTTP/3 and plaintext connections have no JA4 fingerprint, and neither does
+  a ClientHello larger than the 16 KiB capture buffer. JA4 rules and scores do
+  not apply to these requests.
+- `exempt_paths` is a plain prefix match: `/health` also exempts
+  `/healthcheck`. End the prefix with `/` where that matters.
+- Honeypot bans are per exact IP address, so clients sharing a NAT are banned
+  together, and an IPv6 client can move to another address in its `/64`.
+  Anything that makes a visitor's browser request a honeypot URL, such as an
+  embedded image on another site, bans that visitor.
+- Allow rules based on user agents or JA4 fingerprints rely on values the
+  client controls. Use `allow_ips` for clients that must never be challenged.
 
 ### OWASP Core Rule Set
 
@@ -365,10 +562,29 @@ status with a `Status: CODE` header or a leading NPH `HTTP/1.0`, `HTTP/1.1`,
 
 The master normally keeps the identity of the account that starts it. To start
 as root and run the master as an unprivileged account, use `--user` and
-optionally override its primary group with `--group`. The master clears
-supplementary groups and retains only the capabilities needed to launch
-virtual-host workers as their configured users and groups (plus
-`CAP_NET_BIND_SERVICE` if it had that capability before dropping privileges).
+optionally override its primary group with `--group`. The master initializes
+supplementary groups from the account's group database entry, using `--group`
+as the primary group when supplied. Hosted workers likewise receive the
+configured user's supplementary groups. This grants access available through
+those groups to website operations, so configure group membership accordingly.
+After the drop the master holds no capability except `CAP_NET_BIND_SERVICE`
+(if it had it), so it cannot change its identity again or signal processes of
+other accounts. A separate root helper opens log files, reads TLS
+certificate/key PEM sections, and starts and stops virtual-host workers on the
+master's behalf. The helper only starts this same binary in worker mode, never
+as UID 0, with the short worker environment allowlist, and keeps only
+`CAP_DAC_OVERRIDE`, `CAP_SETUID`, `CAP_SETGID` and `CAP_KILL`. The master
+continues to handle requests and website operations under `--user`/`--group`,
+and hosted workers continue under their configured identities. A compromised
+master can still ask for a worker under any non-root account, as its
+configuration already can.
+
+The Debian package runs the server this way: `/etc/default/project-charlotte`
+passes `--user www-data`, and the systemd unit confines the service
+(`ProtectSystem=full`, private `/tmp` and devices, a capability bounding set,
+and a system-call filter). Virtual hosts created through the control socket
+are written by the `--user` account, so that account needs write access to the
+`--vhost-dir` directory, which must still be owned by root or by that account.
 
 Alternatively, an unprivileged account can run the binary with file
 capabilities:
@@ -379,7 +595,19 @@ sudo setcap cap_setuid,cap_setgid=ep /path/to/project-charlotte
 
 Add `cap_net_bind_service` to that command if the master must bind privileged
 ports. `CAP_SETUID` is powerful: a compromised master with this capability can
-switch to UID 0. Protect the binary and its configuration accordingly.
+switch to UID 0. Protect the binary and its configuration accordingly, or
+prefer starting as root with `--user`, where the master keeps no such
+capability.
+
+The main config file, the `--vhost-dir` directory and the files in it choose
+the accounts and programs the server runs. The server refuses any of them that
+is not owned by root or by the account running the server, that is
+world-writable, or that is group-writable by a group other than root's. Each
+file is checked and read through the same open descriptor, so it cannot be
+swapped between the check and the read. A server running without any
+privilege (not root, no `--user`, no `CAP_SETUID`) also accepts a file that is
+group-writable by its owner's private group, the group that has no other
+member.
 
 Virtual-host configuration is provided as YAML. For example, a basic host
 declaration looks like this:
@@ -390,11 +618,15 @@ vhost:
     root: /srv/www/example.com/public
     user: www-example
     group: www-data
-    index: index.html
+    index: [index.html, index.htm]
     listing: false
     rate_limit: "20/s"
     rate_limit_burst: 40
 ```
+
+Each vhost `index` may be a single filename or an ordered list. Charlotte serves
+the first matching file found in the requested directory, then falls back to a
+directory listing (if enabled).
 
 Virtual hosts without `rate_limit` inherit the global CLI limit. Set
 `rate_limit: off` to exempt a host, or give it a rate such as `20/s` to create
@@ -403,8 +635,16 @@ the rate rounded up per second.
 
 Worker-backed hosts require a document root and worker user. A host configured
 with `proxy_pass` is served directly by the master and does not need `root` or
-`user`. A proxy vhost can forward requests arriving over
-HTTP/1.1, HTTP/2, or HTTP/3 to an HTTP or HTTPS upstream:
+`user`. Worker-backed vhost configuration and document-root existence are
+validated at startup, but the worker process is started only when that host
+receives its first request. Workers are stopped after 300 seconds without
+active requests by default; set `--worker-idle-timeout SECS` to change the
+default, or use `worker_idle_timeout: SECS` on a vhost. Set either value to `0`
+to keep workers alive indefinitely. If the master cannot inspect a root because
+of filesystem permissions, it defers that access check to the worker user.
+
+A proxy vhost can forward requests arriving over HTTP/1.1, HTTP/2, or HTTP/3 to
+an HTTP or HTTPS upstream:
 
 ```yaml
 vhost:
@@ -459,7 +699,9 @@ configuration file.
 
 For ACME HTTP-01 provisioning, configure eligible virtual hosts and ensure the
 ACME service can reach the server over plaintext HTTP. Keep the ACME cache
-outside all served document roots. See
+outside all served document roots. When started with `--user`, the server
+creates the cache directory if needed and assigns it and its existing regular
+files to that account before dropping privileges. See
 [`examples/reverse-proxy-acme.yaml`](examples/reverse-proxy-acme.yaml) for an
 SSL-terminating reverse proxy configuration with automated certificate
 provisioning, or [`examples/charlotte.yaml`](examples/charlotte.yaml) for the

@@ -14,12 +14,17 @@ use crate::{
     ratelimit::RateLimit,
 };
 use clap::{
-    ArgMatches, ColorChoice, CommandFactory, FromArgMatches, Parser, error::ErrorKind,
+    ArgAction, ArgMatches, ColorChoice, CommandFactory, FromArgMatches, Parser, error::ErrorKind,
     parser::ValueSource,
 };
 #[cfg(feature = "hosting")]
 use std::sync::Arc;
-use std::{collections::BTreeMap, net::SocketAddr, path::PathBuf, time::Duration};
+use std::{
+    collections::BTreeMap,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 #[derive(Clone, Debug)]
 pub struct FastCgiBackend {
@@ -48,6 +53,7 @@ pub struct FastCgiApp {
 
 #[derive(Clone, Debug)]
 pub struct Config {
+    pub debug: bool,
     pub plain_http: bool,
     pub bind: SocketAddr,
     pub tls_bind: Option<SocketAddr>,
@@ -56,17 +62,20 @@ pub struct Config {
     pub config_file: Option<PathBuf>,
     pub vhost_dir: Option<PathBuf>,
     pub control_socket: Option<PathBuf>,
-    pub index: String,
+    pub index: Vec<String>,
     pub listing: bool,
     pub try_files: Vec<String>,
     pub fastcgi: Vec<FastCgiBackend>,
     pub fastcgi_timeout: Duration,
     pub threads: Option<usize>,
     pub worker_threads: usize,
+    pub worker_idle_timeout: Duration,
     pub(crate) rate_limit: Option<RateLimit>,
     pub(crate) trusted_proxies: Vec<TrustedProxy>,
     pub(crate) access_log: bool,
     pub(crate) access_log_file: Option<PathBuf>,
+    pub(crate) log_dirs: Vec<PathBuf>,
+    pub(crate) tls_dirs: Vec<PathBuf>,
     pub(crate) access_log_format: String,
     pub(crate) error_log_file: Option<PathBuf>,
     pub(crate) error_log_format: String,
@@ -77,6 +86,7 @@ pub struct Config {
     pub modsecurity_response_body_limit: usize,
     pub tls: Option<TlsFiles>,
     pub acme: Option<AcmeSettings>,
+    pub check_config: bool,
     pub worker: bool,
     pub worker_uid: Option<u32>,
     pub worker_gid: Option<u32>,
@@ -118,6 +128,9 @@ const HTTP3: bool = cfg!(feature = "http3");
     color = ColorChoice::Never
 )]
 struct Cli {
+    /// Log verbose startup details
+    #[arg(long)]
+    debug: bool,
     /// Drop privileges to this user after binding the listeners
     #[arg(long, value_name = "USER", value_parser = parse_cli_name("--user", "user"), allow_hyphen_values = true)]
     user: Option<String>,
@@ -136,9 +149,9 @@ struct Cli {
     /// Document root of the fallback site
     #[arg(long, value_name = "DIRECTORY", default_value = ".", hide = !HOSTING, allow_hyphen_values = true)]
     root: PathBuf,
-    /// Directory index file name
-    #[arg(long, value_name = "NAME", default_value = "index.html", hide = !HOSTING, allow_hyphen_values = true)]
-    index: String,
+    /// Directory index file name (may be repeated or comma-separated, in lookup order)
+    #[arg(long, value_name = "NAME", value_delimiter = ',', default_value = "index.html", hide = !HOSTING, allow_hyphen_values = true)]
+    index: Vec<String>,
     /// Disable directory listings
     #[arg(long, hide = !HOSTING)]
     no_listing: bool,
@@ -175,6 +188,9 @@ struct Cli {
     /// Runtime threads of each vhost worker
     #[arg(long, value_name = "N", default_value_t = DEFAULT_WORKER_THREADS, value_parser = parse_thread_count, hide = !HOSTING, allow_hyphen_values = true)]
     worker_threads: usize,
+    /// Seconds a hosted worker is kept alive without requests; 0 disables reaping
+    #[arg(long, value_name = "SECS", default_value = "300", hide = !HOSTING, allow_hyphen_values = true)]
+    worker_idle_timeout: u64,
     /// Per-client request rate (N/s, N/m, or N/h)
     #[arg(long, value_name = "RATE", allow_hyphen_values = true)]
     rate_limit: Option<String>,
@@ -196,6 +212,12 @@ struct Cli {
     /// Append error-log records to a file
     #[arg(long, value_name = "FILE", allow_hyphen_values = true)]
     error_log_file: Option<PathBuf>,
+    /// Directory the root helper may use for log files; may be repeated
+    #[arg(long, value_name = "DIRECTORY", allow_hyphen_values = true)]
+    log_dir: Vec<PathBuf>,
+    /// Directory the root helper may use for TLS PEM files; may be repeated
+    #[arg(long, value_name = "DIRECTORY", allow_hyphen_values = true)]
+    tls_dir: Vec<PathBuf>,
     /// Apache-compatible error log format
     #[arg(long, value_name = "FORMAT", allow_hyphen_values = true)]
     error_log_format: Option<String>,
@@ -223,6 +245,9 @@ struct Cli {
     /// Unix socket for managing virtual hosts
     #[arg(long, value_name = "PATH", allow_hyphen_values = true)]
     control_socket: Option<PathBuf>,
+    /// Validate virtual-host configuration and exit
+    #[arg(long)]
+    check_config: bool,
     /// Fallback TLS certificate chain (PEM)
     #[arg(long, value_name = "PATH", allow_hyphen_values = true)]
     tls_cert: Option<PathBuf>,
@@ -275,6 +300,7 @@ const FEATURE_OPTIONS: &[(&str, bool, &[&str])] = &[
             "fastcgi_app_env",
             "fastcgi_timeout",
             "worker_threads",
+            "worker_idle_timeout",
         ],
     ),
     (
@@ -292,12 +318,65 @@ const FEATURE_OPTIONS: &[(&str, bool, &[&str])] = &[
 
 impl Config {
     pub fn parse(args: impl IntoIterator<Item = String>) -> Result<ParseResult, String> {
-        let matches = match Cli::command()
-            .try_get_matches_from(std::iter::once("project-charlotte".to_owned()).chain(args))
-        {
+        let args = args.into_iter().collect::<Vec<_>>();
+        let matches = match Cli::command().try_get_matches_from(
+            std::iter::once("project-charlotte".to_owned()).chain(args.iter().cloned()),
+        ) {
             Ok(matches) => matches,
             Err(error) if error.kind() == ErrorKind::DisplayHelp => return Ok(ParseResult::Help),
             Err(error) => return Err(error.to_string().trim_end().to_owned()),
+        };
+        let matches = if let Some(config_path) = matches.get_one::<PathBuf>("config_file") {
+            let config_path = config_path.clone();
+            let content = crate::vhost::read_trusted_config(&config_path)
+                .map_err(|error| format!("{}: {error}", config_path.display()))?;
+            let value: serde_yaml_ng::Value = match serde_yaml_ng::from_str(&content) {
+                Ok(value) => value,
+                Err(_) if matches.get_flag("check_config") => serde_yaml_ng::Value::Null,
+                Err(error) => {
+                    return Err(if let Some(location) = error.location() {
+                        format!(
+                            "{}:{}:{}: {error}",
+                            config_path.display(),
+                            location.line(),
+                            location.column()
+                        )
+                    } else {
+                        format!("{}: {error}", config_path.display())
+                    });
+                }
+            };
+            let options = value.as_mapping().and_then(|mapping| {
+                mapping.get(serde_yaml_ng::Value::String("options".to_owned()))
+            });
+            if let Some(options) = options {
+                let file_args = options_to_args(options, &matches, &config_path)?;
+                if file_args.is_empty() {
+                    matches
+                } else {
+                    match Cli::command().try_get_matches_from(
+                        std::iter::once("project-charlotte".to_owned())
+                            .chain(file_args)
+                            .chain(args.iter().cloned()),
+                    ) {
+                        Ok(matches) => matches,
+                        Err(error) if error.kind() == ErrorKind::DisplayHelp => {
+                            return Ok(ParseResult::Help);
+                        }
+                        Err(error) => {
+                            return Err(format!(
+                                "{}: {}",
+                                config_path.display(),
+                                error.to_string().trim_end()
+                            ));
+                        }
+                    }
+                }
+            } else {
+                matches
+            }
+        } else {
+            matches
         };
         reject_compiled_out_options(&matches)?;
         let cli = Cli::from_arg_matches(&matches).map_err(|error| error.to_string())?;
@@ -385,6 +464,7 @@ impl Config {
         let Cli {
             user: master_user,
             group: master_group,
+            debug,
             bind,
             no_plain_http,
             tls_bind,
@@ -395,11 +475,14 @@ impl Config {
             fastcgi_timeout,
             threads,
             worker_threads,
+            worker_idle_timeout,
             rate_limit,
             rate_limit_burst,
             trusted_proxy,
             access_log,
             access_log_file,
+            log_dir,
+            tls_dir,
             access_log_format,
             error_log_file,
             error_log_format,
@@ -411,6 +494,7 @@ impl Config {
             config_file,
             vhost_dir,
             control_socket,
+            check_config,
             tls_cert,
             tls_key,
             acme_directory,
@@ -458,14 +542,7 @@ impl Config {
         let modsecurity_body_limit = body_limit.unwrap_or(16 * 1024 * 1024);
         let modsecurity_response_body_limit = body_limit.unwrap_or(1024 * 1024);
 
-        if index.is_empty()
-            || index.contains('/')
-            || index.contains('\\')
-            || index == "."
-            || index == ".."
-        {
-            return Err("--index must be a non-empty file name".to_owned());
-        }
+        validate_index_names(&index).map_err(|error| format!("--index {error}"))?;
         validate_try_files(&try_files)?;
 
         for (extension, arg) in fastcgi_app_args {
@@ -557,8 +634,12 @@ impl Config {
         if worker && worker_uid.is_none() {
             return Err("--worker requires worker uid/gid options".to_owned());
         }
+        if worker && check_config {
+            return Err("--check-config cannot be used with --worker".to_owned());
+        }
 
         Ok(ParseResult::Config(Box::new(Self {
+            debug,
             plain_http: !no_plain_http,
             bind,
             tls_bind,
@@ -574,10 +655,13 @@ impl Config {
             fastcgi_timeout,
             threads,
             worker_threads,
+            worker_idle_timeout: Duration::from_secs(worker_idle_timeout),
             rate_limit,
             trusted_proxies,
             access_log,
             access_log_file,
+            log_dirs: log_dir,
+            tls_dirs: tls_dir,
             access_log_format,
             error_log_file,
             error_log_format,
@@ -588,6 +672,7 @@ impl Config {
             modsecurity_response_body_limit,
             tls,
             acme,
+            check_config,
             worker,
             worker_uid,
             worker_gid,
@@ -620,6 +705,144 @@ impl Config {
             compiled_features()
         )
     }
+}
+
+fn options_to_args(
+    options: &serde_yaml_ng::Value,
+    cli_matches: &ArgMatches,
+    config_path: &Path,
+) -> Result<Vec<String>, String> {
+    let mapping = options
+        .as_mapping()
+        .ok_or_else(|| format!("{}: options must be a mapping", config_path.display()))?;
+    let command = Cli::command();
+    let mut args = Vec::new();
+    for (key, value) in mapping {
+        let key = key.as_str().ok_or_else(|| {
+            format!(
+                "{}: option names in options must be strings",
+                config_path.display()
+            )
+        })?;
+        let normalized_key = key.replace('-', "_");
+        if matches!(
+            normalized_key.as_str(),
+            "config" | "check_config" | "help" | "worker" | "worker_uid" | "worker_gid"
+        ) {
+            return Err(format!(
+                "{}: option {key} is not allowed in options",
+                config_path.display()
+            ));
+        }
+        let Some(arg) = command.get_arguments().find(|arg| {
+            arg.get_long()
+                .is_some_and(|long| long.replace('-', "_") == normalized_key)
+        }) else {
+            return Err(format!(
+                "{}: unknown option in options: {key}",
+                config_path.display()
+            ));
+        };
+        if cli_matches.value_source(arg.get_id().as_str()) == Some(ValueSource::CommandLine) {
+            continue;
+        }
+        let long = arg
+            .get_long()
+            .expect("matched an argument with a long name");
+        if matches!(arg.get_action(), ArgAction::SetTrue) {
+            match value.as_bool() {
+                Some(true) => args.push(format!("--{long}")),
+                Some(false) => {}
+                None => {
+                    return Err(format!(
+                        "{}: option {key} must be a boolean",
+                        config_path.display()
+                    ));
+                }
+            }
+            continue;
+        }
+
+        let values = if matches!(arg.get_action(), ArgAction::Append) {
+            match value {
+                serde_yaml_ng::Value::Sequence(values) => values.iter().collect::<Vec<_>>(),
+                value => vec![value],
+            }
+        } else {
+            vec![value]
+        };
+        if values.is_empty() {
+            return Err(format!(
+                "{}: option {key} must not be an empty sequence",
+                config_path.display()
+            ));
+        }
+        for value in values {
+            let value = option_scalar(value).ok_or_else(|| {
+                format!(
+                    "{}: option {key} must have a scalar value",
+                    config_path.display()
+                )
+            })?;
+            let value = if is_path_option(&normalized_key) {
+                resolve_option_path(&value, config_path)
+                    .map_err(|error| format!("{}: {error}", config_path.display()))?
+            } else {
+                value
+            };
+            args.push(format!("--{long}"));
+            args.push(value);
+        }
+    }
+    Ok(args)
+}
+
+fn option_scalar(value: &serde_yaml_ng::Value) -> Option<String> {
+    match value {
+        serde_yaml_ng::Value::String(value) => Some(value.clone()),
+        serde_yaml_ng::Value::Number(value) => Some(value.to_string()),
+        serde_yaml_ng::Value::Bool(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn is_path_option(key: &str) -> bool {
+    matches!(
+        key,
+        "root"
+            | "vhost_dir"
+            | "control_socket"
+            | "access_log_file"
+            | "error_log_file"
+            | "log_dir"
+            | "tls_dir"
+            | "bot_config"
+            | "modsecurity_rules"
+            | "tls_cert"
+            | "tls_key"
+            | "acme_cache"
+            | "acme_ca_root"
+    )
+}
+
+fn resolve_option_path(value: &str, config_path: &Path) -> Result<String, String> {
+    let path = Path::new(value);
+    if path.is_absolute() {
+        return Ok(value.to_owned());
+    }
+    let path = config_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .join(path);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()
+            .map_err(|error| format!("could not resolve relative option path: {error}"))?
+            .join(path)
+    };
+    Ok(path.to_string_lossy().into_owned())
 }
 
 /// Environment variable through which the master hands a worker the
@@ -808,6 +1031,18 @@ pub(crate) fn validate_try_files(entries: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+pub(crate) fn validate_index_names(names: &[String]) -> Result<(), String> {
+    if names.is_empty() {
+        return Err("must contain at least one file name".to_owned());
+    }
+    if names.iter().any(|name| {
+        name.is_empty() || name.contains('/') || name.contains('\\') || name == "." || name == ".."
+    }) {
+        return Err("entries must be non-empty file names without path separators".to_owned());
+    }
+    Ok(())
+}
+
 fn validate_try_files_variables(entry: &str) -> Result<(), String> {
     let bytes = entry.as_bytes();
     let mut index = 0;
@@ -986,9 +1221,25 @@ mod tests {
     use super::{DEFAULT_FASTCGI_APP_IDLE_TIMEOUT_SECS, FastCgiAddress, validate_try_files};
     use crate::forwarded::TrustedProxy;
     use crate::ratelimit::RateLimit;
-    use std::path::PathBuf;
     #[cfg(feature = "hosting")]
     use std::time::Duration;
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    static NEXT_CONFIG_FILE: AtomicUsize = AtomicUsize::new(0);
+
+    fn write_config_file(content: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "project-charlotte-cli-config-{}-{}.yaml",
+            std::process::id(),
+            NEXT_CONFIG_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(&path, content).unwrap();
+        path
+    }
 
     #[cfg(feature = "hosting")]
     #[test]
@@ -1011,9 +1262,28 @@ mod tests {
         assert_eq!(config.root.as_path(), std::path::Path::new("public"));
         assert_eq!(config.config_file, None);
         assert_eq!(config.control_socket, None);
-        assert_eq!(config.index, "home.htm");
+        assert_eq!(config.index, ["home.htm"]);
         assert!(!config.listing);
         assert!(config.try_files.is_empty());
+    }
+
+    #[cfg(feature = "hosting")]
+    #[test]
+    fn parses_multiple_directory_indexes_in_order() {
+        let parsed = Config::parse([
+            "--index".to_owned(),
+            "home.htm,index.html".to_owned(),
+            "--index".to_owned(),
+            "default.php".to_owned(),
+        ])
+        .unwrap();
+        let ParseResult::Config(config) = parsed else {
+            panic!("expected config")
+        };
+        assert_eq!(config.index, ["home.htm", "index.html", "default.php"]);
+
+        assert!(Config::parse(["--index".to_owned(), "../index.html".to_owned()]).is_err());
+        assert!(Config::parse(["--index".to_owned(), "".to_owned()]).is_err());
     }
 
     #[test]
@@ -1491,12 +1761,15 @@ mod tests {
         };
         assert_eq!(defaults.threads, None);
         assert_eq!(defaults.worker_threads, 2);
+        assert_eq!(defaults.worker_idle_timeout, Duration::from_secs(300));
 
         let parsed = Config::parse([
             "--threads".to_owned(),
             "8".to_owned(),
             "--worker-threads".to_owned(),
             "3".to_owned(),
+            "--worker-idle-timeout".to_owned(),
+            "0".to_owned(),
         ])
         .unwrap();
         let ParseResult::Config(config) = parsed else {
@@ -1504,10 +1777,12 @@ mod tests {
         };
         assert_eq!(config.threads, Some(8));
         assert_eq!(config.worker_threads, 3);
+        assert_eq!(config.worker_idle_timeout, Duration::ZERO);
         for invalid in ["0", "-1", "abc", "1025"] {
             assert!(Config::parse(["--threads".to_owned(), invalid.to_owned()]).is_err());
             assert!(Config::parse(["--worker-threads".to_owned(), invalid.to_owned()]).is_err());
         }
+        assert!(Config::parse(["--worker-idle-timeout".to_owned(), "-1".to_owned()]).is_err());
     }
 
     #[test]
@@ -1528,10 +1803,111 @@ mod tests {
 
     #[cfg(feature = "hosting")]
     #[test]
-    fn parses_config_file_and_worker_identity() {
+    fn parses_global_options_from_config_file_and_resolves_relative_paths() {
+        let path = write_config_file(
+            "options:\n  bind: 127.0.0.1:8123\n  debug: true\n  index: [home.htm, index.html]\n  user: charlotte\n  threads: 4\n  access-log-file: logs/access.log\n  log-dir: [logs, audit]\n  tls-dir: certificates\n",
+        );
+        let parsed =
+            Config::parse(["--config".to_owned(), path.to_string_lossy().into_owned()]).unwrap();
+        let ParseResult::Config(config) = parsed else {
+            panic!("expected config")
+        };
+
+        assert_eq!(config.bind.to_string(), "127.0.0.1:8123");
+        assert!(config.debug);
+        assert_eq!(config.index, ["home.htm", "index.html"]);
+        assert_eq!(config.master_user.as_deref(), Some("charlotte"));
+        assert_eq!(config.threads, Some(4));
+        assert_eq!(
+            config.access_log_file,
+            Some(path.parent().unwrap().join("logs/access.log"))
+        );
+        assert_eq!(
+            config.log_dirs,
+            [
+                path.parent().unwrap().join("logs"),
+                path.parent().unwrap().join("audit")
+            ]
+        );
+        assert_eq!(
+            config.tls_dirs,
+            [path.parent().unwrap().join("certificates")]
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn parses_repeatable_helper_directory_flags() {
+        let ParseResult::Config(config) = Config::parse([
+            "--log-dir".to_owned(),
+            "/var/log/charlotte".to_owned(),
+            "--log-dir".to_owned(),
+            "/srv/logs".to_owned(),
+            "--tls-dir".to_owned(),
+            "/etc/charlotte/tls".to_owned(),
+        ])
+        .unwrap() else {
+            panic!("expected config")
+        };
+        assert_eq!(
+            config.log_dirs,
+            [
+                PathBuf::from("/var/log/charlotte"),
+                PathBuf::from("/srv/logs")
+            ]
+        );
+        assert_eq!(config.tls_dirs, [PathBuf::from("/etc/charlotte/tls")]);
+    }
+
+    #[cfg(feature = "hosting")]
+    #[test]
+    fn command_line_values_override_global_file_defaults() {
+        let path = write_config_file(
+            "options:\n  bind: 127.0.0.1:8123\n  index: [home.htm, index.html]\n",
+        );
         let parsed = Config::parse([
             "--config".to_owned(),
-            "sites.yaml".to_owned(),
+            path.to_string_lossy().into_owned(),
+            "--bind".to_owned(),
+            "127.0.0.1:9123".to_owned(),
+            "--index".to_owned(),
+            "cli.html".to_owned(),
+        ])
+        .unwrap();
+        let ParseResult::Config(config) = parsed else {
+            panic!("expected config")
+        };
+
+        assert_eq!(config.bind.to_string(), "127.0.0.1:9123");
+        assert_eq!(config.index, ["cli.html"]);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rejects_unknown_reserved_and_mistyped_global_options() {
+        for (contents, expected) in [
+            ("options:\n  not-a-real-option: true\n", "unknown option"),
+            ("options:\n  worker: true\n", "not allowed"),
+            ("options:\n  debug: \"true\"\n", "must be a boolean"),
+        ] {
+            let path = write_config_file(contents);
+            let error = Config::parse(["--config".to_owned(), path.to_string_lossy().into_owned()])
+                .err()
+                .expect("invalid options should be rejected");
+            assert!(error.contains(&path.display().to_string()), "{error}");
+            assert!(error.contains(expected), "{error}");
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[cfg(feature = "hosting")]
+    #[test]
+    fn parses_config_file_and_worker_identity() {
+        let path = write_config_file("");
+        let parsed = Config::parse([
+            "--config".to_owned(),
+            path.to_string_lossy().into_owned(),
+            "--debug".to_owned(),
             "--worker".to_owned(),
             "--worker-uid".to_owned(),
             "1000".to_owned(),
@@ -1542,10 +1918,25 @@ mod tests {
         let ParseResult::Config(config) = parsed else {
             panic!("expected config")
         };
-        assert_eq!(config.config_file, Some(PathBuf::from("sites.yaml")));
+        assert_eq!(config.config_file, Some(path.clone()));
+        assert!(config.debug);
         assert!(config.worker);
         assert_eq!(config.worker_uid, Some(1000));
         assert_eq!(config.worker_gid, Some(1001));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn debug_flag_defaults_off_and_can_be_enabled() {
+        let ParseResult::Config(defaults) = Config::parse(Vec::<String>::new()).unwrap() else {
+            panic!("expected config")
+        };
+        assert!(!defaults.debug);
+
+        let ParseResult::Config(config) = Config::parse(["--debug".to_owned()]).unwrap() else {
+            panic!("expected config")
+        };
+        assert!(config.debug);
     }
 
     #[test]
@@ -1700,24 +2091,23 @@ mod tests {
         }
 
         // Options that belong to no feature are accepted by every build.
+        let path = write_config_file("");
         assert!(
-            Config::parse(
-                [
-                    "--bind",
-                    "127.0.0.1:8080",
-                    "--tls-bind",
-                    "127.0.0.1:8443",
-                    "--user",
-                    "nobody",
-                    "--config",
-                    "sites.yaml",
-                    "--threads",
-                    "4",
-                ]
-                .map(str::to_owned)
-            )
+            Config::parse([
+                "--bind".to_owned(),
+                "127.0.0.1:8080".to_owned(),
+                "--tls-bind".to_owned(),
+                "127.0.0.1:8443".to_owned(),
+                "--user".to_owned(),
+                "nobody".to_owned(),
+                "--config".to_owned(),
+                path.to_string_lossy().into_owned(),
+                "--threads".to_owned(),
+                "4".to_owned(),
+            ])
             .is_ok()
         );
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -1784,6 +2174,36 @@ mod tests {
             panic!("expected config")
         };
         assert!(!config.plain_http);
+    }
+
+    #[test]
+    fn check_config_is_an_option_and_is_rejected_for_workers() {
+        let Ok(ParseResult::Config(default_config)) = Config::parse(Vec::<String>::new()) else {
+            panic!("expected config");
+        };
+        assert!(!default_config.check_config);
+        let Ok(ParseResult::Config(config)) = Config::parse(["--check-config".to_owned()]) else {
+            panic!("expected config");
+        };
+        assert!(config.check_config);
+
+        #[cfg(feature = "hosting")]
+        {
+            let error = Config::parse(
+                [
+                    "--check-config",
+                    "--worker",
+                    "--worker-uid",
+                    "1000",
+                    "--worker-gid",
+                    "1000",
+                ]
+                .map(str::to_owned),
+            )
+            .err()
+            .expect("worker mode must reject config validation");
+            assert!(error.contains("--check-config cannot be used with --worker"));
+        }
     }
 
     #[cfg(feature = "acme")]

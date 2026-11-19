@@ -1,6 +1,6 @@
 [package]
 name = "project-charlotte"
-version = "0.8.1"
+version = "0.9.0"
 edition = "2024"
 default-run = "project-charlotte"
 description = "General-purpose webserver and reverse proxy meant for large-scale environments"
@@ -35,7 +35,7 @@ hyper-rustls = { version = "0.27", default-features = false, features = ["http1"
 hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
 instant-acme = { version = "0.8.5", default-features = false, features = ["ring", "hyper-rustls", "rcgen"], optional = true }
 libmodsecurity3-rs = { version = "0.1.1" }
-nix = { version = "0.31.3", features = ["process", "signal", "user"] }
+nix = { version = "0.31.3", features = ["fs", "poll", "process", "signal", "socket", "uio", "user"] }
 notify = { version = "8", default-features = false }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"], optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

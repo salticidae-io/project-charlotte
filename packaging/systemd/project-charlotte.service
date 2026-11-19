@@ -14,7 +14,27 @@ KillMode=mixed
 Restart=on-failure
 LimitNOFILE=65536
 NoNewPrivileges=true
-ProtectSystem=true
+ProtectSystem=full
+ReadWritePaths=-/etc/charlotte
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=true
+RestrictRealtime=true
+# No RestrictSUIDSGID: its seccomp filter cannot inspect openat2's mode, so it
+# fails every openat2 with ENOSYS, and the root helper opens files only with
+# openat2. NoNewPrivileges already stops setuid/setgid binaries gaining rights.
+LockPersonality=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_SETUID CAP_SETGID CAP_KILL CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_CHOWN CAP_FOWNER
 
 [Install]
 WantedBy=multi-user.target

@@ -311,7 +311,7 @@ where
 
 fn resolve_static(
     root: &Path,
-    index: &str,
+    indexes: &[String],
     relative_path: &Path,
     raw_path_is_dir: bool,
     read_small: bool,
@@ -330,24 +330,27 @@ fn resolve_static(
         if !raw_path_is_dir {
             return StaticResolution::Redirect;
         }
-        let Ok(index_path) = std_fs::canonicalize(canonical.join(index)) else {
-            return StaticResolution::Listing(canonical);
-        };
-        if !index_path.starts_with(root) {
-            return StaticResolution::Listing(canonical);
+        for index in indexes {
+            let Ok(index_path) = std_fs::canonicalize(canonical.join(index)) else {
+                continue;
+            };
+            if !index_path.starts_with(root)
+                || !std_fs::metadata(&index_path).is_ok_and(|metadata| metadata.is_file())
+            {
+                continue;
+            }
+            if let Some((file, metadata, contents)) =
+                open_static_file(&index_path, root, read_small)
+            {
+                return StaticResolution::File {
+                    file,
+                    metadata,
+                    path: index_path,
+                    contents,
+                };
+            }
         }
-        if !std_fs::metadata(&index_path).is_ok_and(|metadata| metadata.is_file()) {
-            return StaticResolution::Listing(canonical);
-        }
-        return match open_static_file(&index_path, root, read_small) {
-            Some((file, metadata, contents)) => StaticResolution::File {
-                file,
-                metadata,
-                path: index_path,
-                contents,
-            },
-            None => StaticResolution::NotFound,
-        };
+        return StaticResolution::Listing(canonical);
     }
     if !metadata.is_file() {
         return StaticResolution::NotFound;
@@ -764,7 +767,8 @@ fn full_body(bytes: Bytes) -> ResponseBody {
 #[cfg(test)]
 mod tests {
     use super::{
-        OriginalUri, apply_try_files, decode_request_path, escape_html_into, parse_byte_range,
+        OriginalUri, StaticResolution, apply_try_files, decode_request_path, escape_html_into,
+        parse_byte_range, resolve_static,
     };
     use chrono::{DateTime, Utc};
     use std::{
@@ -893,6 +897,30 @@ mod tests {
             response.into_body().collect().await.unwrap().to_bytes(),
             "directory index"
         );
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn directory_index_uses_the_next_existing_file_name() {
+        let root = temp_root().await;
+        tokio::fs::create_dir(root.join("folder")).await.unwrap();
+        tokio::fs::write(root.join("folder/index.htm"), b"fallback directory index")
+            .await
+            .unwrap();
+        let indexes = vec!["index.html".to_owned(), "index.htm".to_owned()];
+
+        let resolution = resolve_static(&root, &indexes, Path::new("folder"), true, true);
+        let StaticResolution::File {
+            path,
+            contents: Some(contents),
+            ..
+        } = resolution
+        else {
+            panic!("expected the second directory index to be served")
+        };
+        assert!(path.ends_with("index.htm"));
+        assert_eq!(contents, "fallback directory index");
+
         tokio::fs::remove_dir_all(root).await.unwrap();
     }
 

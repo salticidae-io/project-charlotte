@@ -5,5 +5,5 @@ vhost:
     root: /srv/www/shop.example.com/public
     user: www-shop
     group: www-data
-    index: index.html
+    index: [index.html, index.htm]
     listing: false

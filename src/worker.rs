@@ -10,36 +10,73 @@ use std::{
 use http::{Request, StatusCode, Uri, Version};
 use hyper::{server::conn::http2, service::service_fn};
 use hyper_util::rt::{TokioExecutor, TokioIo};
-use nix::unistd::{Gid, Uid, getegid, geteuid, getgroups, setgid, setgroups, setuid};
+use nix::unistd::{
+    Gid, Uid, User, getegid, geteuid, getgroups, initgroups, setgid, setgroups, setuid,
+};
 use tokio::{
     io::AsyncWriteExt,
     net::UnixStream,
     signal::unix::{SignalKind, signal},
 };
 
-use crate::{config::Config, fastcgi_app, handler, privileges, vhost::TlsSni};
+use crate::{
+    config::Config, fastcgi_app, handler, pathctx::PathContext, privileges, vhost::TlsSni,
+};
 
 pub(crate) fn drop_privileges(config: &Config) -> Result<(), Box<dyn Error + Send + Sync>> {
     let uid = Uid::from_raw(config.worker_uid.ok_or("worker uid is missing")?);
     let gid = Gid::from_raw(config.worker_gid.ok_or("worker gid is missing")?);
     if geteuid().is_root() {
-        setgroups(&[])?;
+        if let Some(user) = User::from_uid(uid)? {
+            let user_name = std::ffi::CString::new(user.name)?;
+            initgroups(user_name.as_c_str(), gid)?;
+        } else {
+            setgroups(&[])?;
+        }
         setgid(gid)?;
         setuid(uid)?;
     } else if geteuid() != uid || getegid() != gid {
         return Err("a non-root server can only run workers as its current uid and gid".into());
-    } else if !getgroups()?.is_empty() {
-        // A non-root process cannot clear inherited groups; retaining the current
-        // user's groups is safe only when the worker keeps that same identity.
-        crate::log_error!("virtual host worker retains the server user's supplementary groups");
+    } else {
+        let mut actual_groups = getgroups()?;
+        let mut expected_groups = privileges::supplementary_groups(uid, gid)?;
+        actual_groups.sort_unstable_by_key(|group| group.as_raw());
+        expected_groups.sort_unstable_by_key(|group| group.as_raw());
+        if actual_groups != expected_groups {
+            crate::log_error!(
+                "virtual host worker supplementary groups differ from those configured for uid {} and gid {}",
+                uid.as_raw(),
+                gid.as_raw()
+            );
+        }
     }
     privileges::clear_all()?;
     Ok(())
 }
 
-pub(crate) async fn run(mut config: Config) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let root = tokio::fs::canonicalize(&config.root).await?;
-    if !tokio::fs::metadata(&root).await?.is_dir() {
+pub(crate) async fn run(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let result = run_inner(config).await;
+    if let Err(error) = &result {
+        crate::log_error!("virtual host worker failed: {error}");
+    }
+    result
+}
+
+async fn run_inner(mut config: Config) -> Result<(), Box<dyn Error + Send + Sync>> {
+    crate::log_debug!(
+        "Starting virtual-host worker pid {} as uid {} gid {}",
+        std::process::id(),
+        config.worker_uid.unwrap_or_default(),
+        config.worker_gid.unwrap_or_default()
+    );
+    let root = tokio::fs::canonicalize(&config.root)
+        .await
+        .path_context("resolve document root", &config.root)?;
+    if !tokio::fs::metadata(&root)
+        .await
+        .path_context("inspect document root", &root)?
+        .is_dir()
+    {
         return Err(format!(
             "worker document root is not a directory: {}",
             root.display()
@@ -53,6 +90,7 @@ pub(crate) async fn run(mut config: Config) -> Result<(), Box<dyn Error + Send +
     socket.set_nonblocking(true)?;
     let mut socket = UnixStream::from_std(socket)?;
     socket.write_all(&[1]).await?;
+    crate::log_debug!("Virtual-host worker pid {} is ready", std::process::id());
 
     let config = Arc::new(config);
     let service = service_fn(move |request: Request<hyper::body::Incoming>| {

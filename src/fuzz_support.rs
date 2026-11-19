@@ -206,6 +206,7 @@ pub(crate) fn fixture() -> &'static FuzzFixture {
 
 pub(crate) fn fuzz_config(root: PathBuf) -> Config {
     Config {
+        debug: false,
         plain_http: true,
         bind: "127.0.0.1:8080".parse().expect("valid fuzz bind"),
         tls_bind: None,
@@ -214,7 +215,7 @@ pub(crate) fn fuzz_config(root: PathBuf) -> Config {
         config_file: None,
         vhost_dir: None,
         control_socket: None,
-        index: "index.html".to_owned(),
+        index: vec!["index.html".to_owned()],
         listing: true,
         try_files: Vec::new(),
         fastcgi: vec![FastCgiBackend {
@@ -224,10 +225,13 @@ pub(crate) fn fuzz_config(root: PathBuf) -> Config {
         fastcgi_timeout: std::time::Duration::from_secs(1),
         threads: None,
         worker_threads: 2,
+        worker_idle_timeout: std::time::Duration::from_secs(300),
         rate_limit: None,
         trusted_proxies: Vec::new(),
         access_log: false,
         access_log_file: None,
+        log_dirs: Vec::new(),
+        tls_dirs: Vec::new(),
         access_log_format: "%a %U".to_owned(),
         error_log_file: None,
         error_log_format: "[%l] %M".to_owned(),
@@ -238,6 +242,7 @@ pub(crate) fn fuzz_config(root: PathBuf) -> Config {
         modsecurity_response_body_limit: 1024 * 1024,
         tls: None,
         acme: None,
+        check_config: false,
         worker: false,
         worker_uid: None,
         worker_gid: None,
