@@ -802,3 +802,68 @@ fn write_strings(output: &mut String, values: &[String]) {
 fn yaml_string(value: &str) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_owned())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::convert;
+    use crate::parse::{self, ParseOptions};
+    use serde_yaml_ng::Value;
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    static NEXT_FILE: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn converts_php_proxy_timeouts_and_multiple_indexes() {
+        let input = r#"
+http {
+    server {
+        server_name php.example.test;
+        root /srv/php;
+        index index.php index.html;
+        location ~ \.php$ {
+            fastcgi_pass 127.0.0.1:9000;
+            fastcgi_read_timeout 2m;
+        }
+    }
+    server {
+        server_name proxy.example.test;
+        location / {
+            proxy_pass http://127.0.0.1:8080/api;
+            proxy_read_timeout 45s;
+        }
+    }
+}
+"#;
+        let id = NEXT_FILE.fetch_add(1, Ordering::Relaxed);
+        let path: PathBuf = std::env::temp_dir().join(format!(
+            "project-charlotte-nginx-convert-{}-{id}.conf",
+            std::process::id()
+        ));
+        fs::write(&path, input).unwrap();
+        let nodes = parse::parse(&path, &ParseOptions::default()).unwrap();
+        let _ = fs::remove_file(&path);
+
+        let output = convert(&nodes, false, false);
+        let document: Value = serde_yaml_ng::from_str(&output).unwrap();
+        let hosts = document["vhost"].as_sequence().unwrap();
+        let php = hosts
+            .iter()
+            .find(|host| host["server_names"][0] == "php.example.test")
+            .unwrap();
+        assert_eq!(php["fastcgi"][0], "php=127.0.0.1:9000");
+        assert_eq!(php["fastcgi_timeout"], 120);
+        assert_eq!(php["index"][0], "index.php");
+        assert_eq!(php["index"][1], "index.html");
+
+        let proxy = hosts
+            .iter()
+            .find(|host| host["server_names"][0] == "proxy.example.test")
+            .unwrap();
+        assert_eq!(proxy["proxy_pass"], "http://127.0.0.1:8080/api");
+        assert_eq!(proxy["proxy_timeout"], 45);
+    }
+}

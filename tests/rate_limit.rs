@@ -32,6 +32,10 @@ struct Fixture {
 
 impl Fixture {
     async fn start() -> Self {
+        Self::start_with_trusted_proxy(false).await
+    }
+
+    async fn start_with_trusted_proxy(trusted_proxy: bool) -> Self {
         let guard = TEST_LOCK.lock().await;
         let id = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
@@ -64,9 +68,12 @@ impl Fixture {
             .arg("--rate-limit")
             .arg("1/m")
             .arg("--rate-limit-burst")
-            .arg("2")
+            .arg(if trusted_proxy { "1" } else { "2" })
             .stdout(Stdio::null())
             .stderr(Stdio::inherit());
+        if trusted_proxy {
+            command.arg("--trusted-proxy").arg("127.0.0.1");
+        }
         let mut server = common::spawn(&mut command).unwrap();
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
@@ -110,11 +117,18 @@ fn worker_user() -> String {
 }
 
 async fn request(address: SocketAddr, host: &str) -> String {
+    request_with_xff(address, host, None).await
+}
+
+async fn request_with_xff(address: SocketAddr, host: &str, xff: Option<&str>) -> String {
     let mut stream = TcpStream::connect(address).await.unwrap();
+    let forwarded = xff.map_or_else(String::new, |value| format!("X-Forwarded-For: {value}\r\n"));
     stream
         .write_all(
-            format!("GET /index.html HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n")
-                .as_bytes(),
+            format!(
+                "GET /index.html HTTP/1.1\r\nHost: {host}\r\n{forwarded}Connection: close\r\n\r\n"
+            )
+            .as_bytes(),
         )
         .await
         .unwrap();
@@ -148,4 +162,23 @@ async fn enforces_global_limit_and_allows_vhost_override() {
 
     let exempt = request(fixture.address, "exempt.test").await;
     assert!(exempt.starts_with("HTTP/1.1 200"), "{exempt}");
+}
+
+#[tokio::test]
+async fn trusted_forwarded_clients_have_independent_rate_limit_buckets() {
+    let fixture = Fixture::start_with_trusted_proxy(true).await;
+
+    let first_client =
+        request_with_xff(fixture.address, "fallback.test", Some("198.51.100.10")).await;
+    let other_client =
+        request_with_xff(fixture.address, "fallback.test", Some("198.51.100.20")).await;
+    let first_client_again =
+        request_with_xff(fixture.address, "fallback.test", Some("198.51.100.10")).await;
+
+    assert!(first_client.starts_with("HTTP/1.1 200"), "{first_client}");
+    assert!(other_client.starts_with("HTTP/1.1 200"), "{other_client}");
+    assert!(
+        first_client_again.starts_with("HTTP/1.1 429"),
+        "{first_client_again}"
+    );
 }

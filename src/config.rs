@@ -8,6 +8,8 @@
     allow(dead_code)
 )]
 
+#[cfg(feature = "hosting")]
+use crate::cgroup::CgroupSpec;
 use crate::{
     bot::{BotPolicy, BotPolicyFile},
     forwarded::TrustedProxy,
@@ -56,6 +58,9 @@ pub struct Config {
     pub debug: bool,
     pub plain_http: bool,
     pub bind: SocketAddr,
+    pub max_connections: usize,
+    pub header_read_timeout: Duration,
+    pub tls_handshake_timeout: Duration,
     pub tls_bind: Option<SocketAddr>,
     pub http3_bind: SocketAddr,
     pub root: PathBuf,
@@ -70,6 +75,8 @@ pub struct Config {
     pub threads: Option<usize>,
     pub worker_threads: usize,
     pub worker_idle_timeout: Duration,
+    #[cfg(feature = "hosting")]
+    pub worker_cgroup: Option<CgroupSpec>,
     pub(crate) rate_limit: Option<RateLimit>,
     pub(crate) trusted_proxies: Vec<TrustedProxy>,
     pub(crate) access_log: bool,
@@ -140,6 +147,15 @@ struct Cli {
     /// Plain HTTP listen address
     #[arg(long, value_name = "ADDRESS", default_value = "127.0.0.1:8080", value_parser = parse_cli_address("socket address"), allow_hyphen_values = true)]
     bind: SocketAddr,
+    /// Maximum number of concurrent client connections
+    #[arg(long, value_name = "N", default_value = "4096", value_parser = parse_positive_usize, allow_hyphen_values = true)]
+    max_connections: usize,
+    /// Seconds allowed to receive a complete request head
+    #[arg(long, value_name = "SECS", default_value = "30", value_parser = parse_cli_timeout, allow_hyphen_values = true)]
+    header_read_timeout: Duration,
+    /// Seconds allowed to complete a TLS handshake
+    #[arg(long, value_name = "SECS", default_value = "10", value_parser = parse_cli_timeout, allow_hyphen_values = true)]
+    tls_handshake_timeout: Duration,
     /// Disable the plain HTTP listener
     #[arg(long)]
     no_plain_http: bool,
@@ -191,6 +207,18 @@ struct Cli {
     /// Seconds a hosted worker is kept alive without requests; 0 disables reaping
     #[arg(long, value_name = "SECS", default_value = "300", hide = !HOSTING, allow_hyphen_values = true)]
     worker_idle_timeout: u64,
+    /// Cgroup v2 path for hosted workers, relative to /sys/fs/cgroup
+    #[arg(long, value_name = "PATH", hide = !HOSTING, allow_hyphen_values = true)]
+    worker_cgroup: Option<String>,
+    /// Memory limit for hosted workers (bytes or K/M/G/T; max for unlimited)
+    #[arg(long, value_name = "LIMIT", hide = !HOSTING, allow_hyphen_values = true)]
+    worker_cgroup_memory_max: Option<String>,
+    /// CPU limit for hosted workers (max, percentage, or QUOTA [PERIOD])
+    #[arg(long, value_name = "LIMIT", hide = !HOSTING, allow_hyphen_values = true)]
+    worker_cgroup_cpu_max: Option<String>,
+    /// PID limit for hosted workers (positive integer or max)
+    #[arg(long, value_name = "LIMIT", hide = !HOSTING, allow_hyphen_values = true)]
+    worker_cgroup_pids_max: Option<String>,
     /// Per-client request rate (N/s, N/m, or N/h)
     #[arg(long, value_name = "RATE", allow_hyphen_values = true)]
     rate_limit: Option<String>,
@@ -301,6 +329,10 @@ const FEATURE_OPTIONS: &[(&str, bool, &[&str])] = &[
             "fastcgi_timeout",
             "worker_threads",
             "worker_idle_timeout",
+            "worker_cgroup",
+            "worker_cgroup_memory_max",
+            "worker_cgroup_cpu_max",
+            "worker_cgroup_pids_max",
         ],
     ),
     (
@@ -466,6 +498,9 @@ impl Config {
             group: master_group,
             debug,
             bind,
+            max_connections,
+            header_read_timeout,
+            tls_handshake_timeout,
             no_plain_http,
             tls_bind,
             root,
@@ -476,6 +511,10 @@ impl Config {
             threads,
             worker_threads,
             worker_idle_timeout,
+            worker_cgroup,
+            worker_cgroup_memory_max,
+            worker_cgroup_cpu_max,
+            worker_cgroup_pids_max,
             rate_limit,
             rate_limit_burst,
             trusted_proxy,
@@ -634,6 +673,32 @@ impl Config {
         if worker && worker_uid.is_none() {
             return Err("--worker requires worker uid/gid options".to_owned());
         }
+        #[cfg(feature = "hosting")]
+        let worker_cgroup = match worker_cgroup {
+            Some(path) => Some(
+                CgroupSpec::new(
+                    &path,
+                    worker_cgroup_memory_max.as_deref(),
+                    worker_cgroup_cpu_max.as_deref(),
+                    worker_cgroup_pids_max.as_deref(),
+                )
+                .map_err(|error| format!("--worker-cgroup: {error}"))?,
+            ),
+            None if worker_cgroup_memory_max.is_some()
+                || worker_cgroup_cpu_max.is_some()
+                || worker_cgroup_pids_max.is_some() =>
+            {
+                return Err("--worker-cgroup limits require --worker-cgroup".to_owned());
+            }
+            None => None,
+        };
+        #[cfg(not(feature = "hosting"))]
+        let _ = (
+            worker_cgroup,
+            worker_cgroup_memory_max,
+            worker_cgroup_cpu_max,
+            worker_cgroup_pids_max,
+        );
         if worker && check_config {
             return Err("--check-config cannot be used with --worker".to_owned());
         }
@@ -642,6 +707,9 @@ impl Config {
             debug,
             plain_http: !no_plain_http,
             bind,
+            max_connections,
+            header_read_timeout,
+            tls_handshake_timeout,
             tls_bind,
             http3_bind: http3_bind.unwrap_or_else(|| tls_bind.unwrap_or(bind)),
             root,
@@ -656,6 +724,8 @@ impl Config {
             threads,
             worker_threads,
             worker_idle_timeout: Duration::from_secs(worker_idle_timeout),
+            #[cfg(feature = "hosting")]
+            worker_cgroup,
             rate_limit,
             trusted_proxies,
             access_log,
@@ -947,6 +1017,23 @@ fn parse_cli_fastcgi_timeout(value: &str) -> Result<Duration, String> {
         .ok_or_else(|| format!("invalid FastCGI timeout: {value}"))
 }
 
+fn parse_positive_usize(value: &str) -> Result<usize, String> {
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|number| *number > 0)
+        .ok_or_else(|| format!("invalid positive number: {value}"))
+}
+
+fn parse_cli_timeout(value: &str) -> Result<Duration, String> {
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+        .ok_or_else(|| format!("invalid timeout: {value}; expected a positive number of seconds"))
+}
+
 fn parse_cli_body_limit(value: &str) -> Result<usize, String> {
     value
         .parse::<usize>()
@@ -1221,7 +1308,6 @@ mod tests {
     use super::{DEFAULT_FASTCGI_APP_IDLE_TIMEOUT_SECS, FastCgiAddress, validate_try_files};
     use crate::forwarded::TrustedProxy;
     use crate::ratelimit::RateLimit;
-    #[cfg(feature = "hosting")]
     use std::time::Duration;
     use std::{
         fs,
@@ -1258,6 +1344,9 @@ mod tests {
             panic!("expected config")
         };
         assert_eq!(config.bind.to_string(), "0.0.0.0:9000");
+        assert_eq!(config.max_connections, 4096);
+        assert_eq!(config.header_read_timeout, Duration::from_secs(30));
+        assert_eq!(config.tls_handshake_timeout, Duration::from_secs(10));
         assert_eq!(config.http3_bind, config.bind);
         assert_eq!(config.root.as_path(), std::path::Path::new("public"));
         assert_eq!(config.config_file, None);
@@ -1265,6 +1354,76 @@ mod tests {
         assert_eq!(config.index, ["home.htm"]);
         assert!(!config.listing);
         assert!(config.try_files.is_empty());
+        assert!(config.worker_cgroup.is_none());
+    }
+
+    #[cfg(feature = "hosting")]
+    #[test]
+    fn parses_worker_cgroup_path_and_limits() {
+        let parsed = Config::parse([
+            "--worker-cgroup".to_owned(),
+            "/charlotte/sites/{uid}/{name}".to_owned(),
+            "--worker-cgroup-memory-max".to_owned(),
+            "64M".to_owned(),
+            "--worker-cgroup-cpu-max".to_owned(),
+            "150%".to_owned(),
+            "--worker-cgroup-pids-max".to_owned(),
+            "32".to_owned(),
+        ])
+        .unwrap();
+        let ParseResult::Config(config) = parsed else {
+            panic!("expected config")
+        };
+        let cgroup = config.worker_cgroup.unwrap();
+        assert_eq!(cgroup.path, PathBuf::from("charlotte/sites/{uid}/{name}"));
+        assert_eq!(cgroup.memory_max.as_deref(), Some("67108864"));
+        assert_eq!(cgroup.cpu_max.as_deref(), Some("150000 100000"));
+        assert_eq!(cgroup.pids_max.as_deref(), Some("32"));
+
+        assert!(
+            Config::parse(["--worker-cgroup-memory-max".to_owned(), "1G".to_owned(),]).is_err()
+        );
+        assert!(Config::parse(["--worker-cgroup".to_owned(), "../escape".to_owned(),]).is_err());
+        assert!(
+            Config::parse([
+                "--worker-cgroup".to_owned(),
+                "site".to_owned(),
+                "--worker-cgroup-pids-max".to_owned(),
+                "0".to_owned(),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn parses_connection_limits_and_timeouts() {
+        let parsed = Config::parse([
+            "--max-connections".to_owned(),
+            "12".to_owned(),
+            "--header-read-timeout".to_owned(),
+            "3".to_owned(),
+            "--tls-handshake-timeout".to_owned(),
+            "2".to_owned(),
+        ])
+        .unwrap();
+        let ParseResult::Config(config) = parsed else {
+            panic!("expected config")
+        };
+        assert_eq!(config.max_connections, 12);
+        assert_eq!(config.header_read_timeout, Duration::from_secs(3));
+        assert_eq!(config.tls_handshake_timeout, Duration::from_secs(2));
+
+        for (option, value) in [
+            ("--max-connections", "0"),
+            ("--max-connections", "not-a-number"),
+            ("--header-read-timeout", "0"),
+            ("--tls-handshake-timeout", "-1"),
+        ] {
+            assert!(
+                Config::parse([option.to_owned(), value.to_owned()]).is_err(),
+                "accepted {option} {value}"
+            );
+        }
     }
 
     #[cfg(feature = "hosting")]
@@ -1805,7 +1964,7 @@ mod tests {
     #[test]
     fn parses_global_options_from_config_file_and_resolves_relative_paths() {
         let path = write_config_file(
-            "options:\n  bind: 127.0.0.1:8123\n  debug: true\n  index: [home.htm, index.html]\n  user: charlotte\n  threads: 4\n  access-log-file: logs/access.log\n  log-dir: [logs, audit]\n  tls-dir: certificates\n",
+            "options:\n  bind: 127.0.0.1:8123\n  debug: true\n  index: [home.htm, index.html]\n  user: charlotte\n  threads: 4\n  access-log-file: logs/access.log\n  log-dir: [logs, audit]\n  tls-dir: certificates\n  worker_cgroup: charlotte/sites/{uid}/{name}\n  worker_cgroup_memory_max: 512M\n  worker_cgroup_cpu_max: 150%\n  worker_cgroup_pids_max: 64\n",
         );
         let parsed =
             Config::parse(["--config".to_owned(), path.to_string_lossy().into_owned()]).unwrap();
@@ -1818,6 +1977,11 @@ mod tests {
         assert_eq!(config.index, ["home.htm", "index.html"]);
         assert_eq!(config.master_user.as_deref(), Some("charlotte"));
         assert_eq!(config.threads, Some(4));
+        let cgroup = config.worker_cgroup.as_ref().unwrap();
+        assert_eq!(cgroup.path, PathBuf::from("charlotte/sites/{uid}/{name}"));
+        assert_eq!(cgroup.memory_max.as_deref(), Some("536870912"));
+        assert_eq!(cgroup.cpu_max.as_deref(), Some("150000 100000"));
+        assert_eq!(cgroup.pids_max.as_deref(), Some("64"));
         assert_eq!(
             config.access_log_file,
             Some(path.parent().unwrap().join("logs/access.log"))

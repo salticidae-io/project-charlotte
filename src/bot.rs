@@ -886,14 +886,44 @@ fn javascript_string(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        BotAction, BotMode, BotPolicy, BotPolicyFile, BotState, CHALLENGE_PATH, evaluate,
-        unix_time, verify_pow,
+        BotAction, BotMode, BotPolicy, BotPolicyFile, BotState, CHALLENGE_PATH, CrawlerCheck,
+        TtlEntry, evaluate, javascript_string, unix_time, verify_pow,
     };
     use http::{HeaderMap, HeaderValue, Request, StatusCode, Version, header};
-    use std::{net::SocketAddr, str::FromStr};
+    use std::{
+        net::{IpAddr, SocketAddr},
+        str::FromStr,
+        time::{Duration, Instant},
+    };
 
     fn address(value: &str) -> SocketAddr {
         SocketAddr::from_str(value).unwrap()
+    }
+
+    fn challenge_request(query: &str) -> Request<()> {
+        Request::builder()
+            .uri(format!("{CHALLENGE_PATH}?{query}"))
+            .body(())
+            .unwrap()
+    }
+
+    fn seed_crawler(state: &BotState, ip: IpAddr, value: CrawlerCheck) {
+        const SUFFIX: &str = ".googlebot.com";
+        let shard = state.shard(ip);
+        state.crawlers[shard].lock().unwrap().insert(
+            (ip, SUFFIX),
+            TtlEntry {
+                expires: Instant::now() + Duration::from_secs(60),
+                value,
+            },
+        );
+    }
+
+    fn signed_cookie(state: &BotState, ip: IpAddr, expires: u64) -> String {
+        format!(
+            "charlotte_bot={expires}.{}",
+            state.cookie_value(ip, expires)
+        )
     }
 
     #[tokio::test]
@@ -1022,6 +1052,509 @@ mod tests {
             })
             .is_ok()
         );
+    }
+
+    #[test]
+    fn rejects_invalid_policy_thresholds_ttls_patterns_ips_and_paths() {
+        let invalid_policies = [
+            BotPolicyFile {
+                challenge_threshold: 81,
+                block_threshold: 80,
+                ..BotPolicyFile::default()
+            },
+            BotPolicyFile {
+                challenge_threshold: 0,
+                ..BotPolicyFile::default()
+            },
+            BotPolicyFile {
+                block_threshold: 101,
+                ..BotPolicyFile::default()
+            },
+            BotPolicyFile {
+                challenge_ttl: 0,
+                ..BotPolicyFile::default()
+            },
+            BotPolicyFile {
+                honeypot_ban: 30 * 24 * 3600 + 1,
+                ..BotPolicyFile::default()
+            },
+            BotPolicyFile {
+                allow_user_agents: vec![String::new()],
+                ..BotPolicyFile::default()
+            },
+            BotPolicyFile {
+                deny_ips: vec!["not-an-ip".to_owned()],
+                ..BotPolicyFile::default()
+            },
+            BotPolicyFile {
+                exempt_paths: vec!["health".to_owned()],
+                ..BotPolicyFile::default()
+            },
+        ];
+        for file in invalid_policies {
+            assert!(BotPolicy::parse(file).is_err());
+        }
+
+        assert!(serde_yaml_ng::from_str::<BotPolicyFile>("unknown_option: true").is_err());
+    }
+
+    #[tokio::test]
+    async fn explicit_rules_deny_and_allow_ip_bypasses_bot_checks() {
+        let state = BotState::new().unwrap();
+        let denied = BotPolicy::parse(BotPolicyFile {
+            deny_ips: vec!["192.0.2.0/24".to_owned()],
+            allow_user_agents: vec!["nuclei".to_owned()],
+            ..BotPolicyFile::default()
+        })
+        .unwrap();
+        let scanner = Request::builder()
+            .header("user-agent", "nuclei/3.0")
+            .body(())
+            .unwrap();
+        let verdict = evaluate(&denied, &state, &scanner, address("192.0.2.10:80"), None).await;
+        assert_eq!(verdict.action, BotAction::Block);
+        assert!(verdict.reasons.contains(&"explicit deny rule"));
+
+        let denied_user_agent = BotPolicy::parse(BotPolicyFile {
+            deny_user_agents: vec!["nuclei".to_owned()],
+            allow_user_agents: vec!["nuclei".to_owned()],
+            ..BotPolicyFile::default()
+        })
+        .unwrap();
+        assert_eq!(
+            evaluate(
+                &denied_user_agent,
+                &state,
+                &scanner,
+                address("192.0.2.10:81"),
+                None
+            )
+            .await
+            .action,
+            BotAction::Block
+        );
+
+        let allowed_ip = BotPolicy::parse(BotPolicyFile {
+            allow_ips: vec!["192.0.2.0/24".to_owned()],
+            honeypot_paths: vec!["/trap".to_owned()],
+            ..BotPolicyFile::default()
+        })
+        .unwrap();
+        let trap = Request::builder()
+            .uri("/trap")
+            .header("user-agent", "nuclei/3.0")
+            .body(())
+            .unwrap();
+        assert_eq!(
+            evaluate(&allowed_ip, &state, &trap, address("192.0.2.11:80"), None)
+                .await
+                .action,
+            BotAction::Allow
+        );
+        assert!(!state.banned("192.0.2.11".parse().unwrap(), Instant::now()));
+    }
+
+    #[tokio::test]
+    async fn off_and_log_modes_have_expected_honeypot_and_browser_actions() {
+        let state = BotState::new().unwrap();
+        let off = BotPolicy::parse(BotPolicyFile {
+            mode: BotMode::Off,
+            honeypot_paths: vec!["/trap".to_owned()],
+            ..BotPolicyFile::default()
+        })
+        .unwrap();
+        let trap = Request::builder().uri("/trap").body(()).unwrap();
+        assert_eq!(
+            evaluate(&off, &state, &trap, address("192.0.2.12:80"), None)
+                .await
+                .action,
+            BotAction::Allow
+        );
+
+        let log = BotPolicy::parse(BotPolicyFile {
+            mode: BotMode::Log,
+            honeypot_paths: vec!["/trap".to_owned()],
+            verify_crawlers: false,
+            ..BotPolicyFile::default()
+        })
+        .unwrap();
+        assert_eq!(
+            evaluate(&log, &state, &trap, address("192.0.2.13:80"), None)
+                .await
+                .action,
+            BotAction::Log
+        );
+        let browser = Request::builder()
+            .header("user-agent", "Mozilla/5.0 Chrome/130.0")
+            .header("accept", "text/html")
+            .header("accept-language", "en-US")
+            .body(())
+            .unwrap();
+        assert_eq!(
+            evaluate(&log, &state, &browser, address("192.0.2.14:80"), None)
+                .await
+                .action,
+            BotAction::Allow
+        );
+    }
+
+    #[tokio::test]
+    async fn builtins_challenge_toggle_custom_threshold_and_empty_user_agent_are_covered() {
+        let state = BotState::new().unwrap();
+        let scanner = Request::builder()
+            .header("user-agent", "nuclei/3.0")
+            .body(())
+            .unwrap();
+        let no_builtins = BotPolicy::parse(BotPolicyFile {
+            builtin_rules: false,
+            verify_crawlers: false,
+            ..BotPolicyFile::default()
+        })
+        .unwrap();
+        assert_eq!(
+            evaluate(
+                &no_builtins,
+                &state,
+                &scanner,
+                address("192.0.2.15:80"),
+                None
+            )
+            .await
+            .action,
+            BotAction::Allow
+        );
+
+        let no_challenge = BotPolicy::parse(BotPolicyFile {
+            challenge: false,
+            verify_crawlers: false,
+            ..BotPolicyFile::default()
+        })
+        .unwrap();
+        let automation = Request::builder()
+            .header("user-agent", "curl/8.0")
+            .body(())
+            .unwrap();
+        assert_eq!(
+            evaluate(
+                &no_challenge,
+                &state,
+                &automation,
+                address("192.0.2.16:80"),
+                None
+            )
+            .await
+            .action,
+            BotAction::Allow
+        );
+        assert_eq!(
+            evaluate(
+                &no_challenge,
+                &state,
+                &scanner,
+                address("192.0.2.17:80"),
+                None
+            )
+            .await
+            .action,
+            BotAction::Block
+        );
+
+        let custom_threshold = BotPolicy::parse(BotPolicyFile {
+            challenge_threshold: 30,
+            verify_crawlers: false,
+            ..BotPolicyFile::default()
+        })
+        .unwrap();
+        let browser = Request::builder()
+            .header("user-agent", "Mozilla/5.0 Chrome/130.0")
+            .body(())
+            .unwrap();
+        assert_eq!(
+            evaluate(
+                &custom_threshold,
+                &state,
+                &browser,
+                address("192.0.2.18:80"),
+                None
+            )
+            .await
+            .action,
+            BotAction::Challenge
+        );
+        let empty = Request::new(());
+        assert_eq!(
+            evaluate(
+                &custom_threshold,
+                &state,
+                &empty,
+                address("192.0.2.19:80"),
+                None
+            )
+            .await
+            .action,
+            BotAction::Challenge
+        );
+    }
+
+    #[tokio::test]
+    async fn ja4_rules_and_chromium_fingerprint_signals_are_applied() {
+        let state = BotState::new().unwrap();
+        let fingerprint = crate::ja4::ClientHelloInfo {
+            ja4: "test-fingerprint".to_owned(),
+            max_version: 0x0301,
+            ciphers: Vec::new(),
+            extensions: Vec::new(),
+            alpn: Vec::new(),
+            sig_algs: Vec::new(),
+            sni: None,
+            grease: false,
+        };
+        let automation = Request::builder()
+            .header("user-agent", "curl/8.0")
+            .body(())
+            .unwrap();
+        let ja4_allow = BotPolicy::parse(BotPolicyFile {
+            ja4_allow: vec![fingerprint.ja4.clone()],
+            verify_crawlers: false,
+            ..BotPolicyFile::default()
+        })
+        .unwrap();
+        assert_eq!(
+            evaluate(
+                &ja4_allow,
+                &state,
+                &automation,
+                address("192.0.2.20:80"),
+                Some(&fingerprint)
+            )
+            .await
+            .action,
+            BotAction::Allow
+        );
+
+        let ja4_deny = BotPolicy::parse(BotPolicyFile {
+            ja4_allow: vec![fingerprint.ja4.clone()],
+            ja4_deny: vec![fingerprint.ja4.clone()],
+            verify_crawlers: false,
+            ..BotPolicyFile::default()
+        })
+        .unwrap();
+        assert_eq!(
+            evaluate(
+                &ja4_deny,
+                &state,
+                &automation,
+                address("192.0.2.21:80"),
+                Some(&fingerprint)
+            )
+            .await
+            .action,
+            BotAction::Block
+        );
+
+        let chrome = Request::builder()
+            .header("user-agent", "Mozilla/5.0 Chrome/130.0")
+            .body(())
+            .unwrap();
+        let signals = evaluate(
+            &BotPolicy::parse(BotPolicyFile {
+                verify_crawlers: false,
+                ..BotPolicyFile::default()
+            })
+            .unwrap(),
+            &state,
+            &chrome,
+            address("192.0.2.22:80"),
+            Some(&fingerprint),
+        )
+        .await;
+        assert!(signals.reasons.contains(&"Chromium JA4 lacks GREASE"));
+        assert!(signals.reasons.contains(&"browser negotiated old TLS"));
+        assert!(signals.reasons.contains(&"browser JA4 lacks browser ALPN"));
+        assert!(signals.score >= 100);
+        assert_eq!(signals.action, BotAction::Block);
+    }
+
+    #[tokio::test]
+    async fn crawler_verification_uses_cached_results_and_obeys_explicit_denies() {
+        let state = BotState::new().unwrap();
+        let client = address("192.0.2.23:80");
+        let crawler = Request::builder()
+            .header("user-agent", "Googlebot/2.1")
+            .body(())
+            .unwrap();
+        let policy = BotPolicy::default_enforcing();
+        seed_crawler(&state, client.ip(), CrawlerCheck::Impostor);
+        assert_eq!(
+            evaluate(&policy, &state, &crawler, client, None)
+                .await
+                .action,
+            BotAction::Block
+        );
+
+        seed_crawler(&state, client.ip(), CrawlerCheck::Verified);
+        assert_eq!(
+            evaluate(&policy, &state, &crawler, client, None)
+                .await
+                .action,
+            BotAction::Allow
+        );
+        let denied = BotPolicy::parse(BotPolicyFile {
+            deny_user_agents: vec!["googlebot".to_owned()],
+            ..BotPolicyFile::default()
+        })
+        .unwrap();
+        assert_eq!(
+            evaluate(&denied, &state, &crawler, client, None)
+                .await
+                .action,
+            BotAction::Block
+        );
+
+        let skip_verification = BotPolicy::parse(BotPolicyFile {
+            verify_crawlers: false,
+            ..BotPolicyFile::default()
+        })
+        .unwrap();
+        assert_eq!(
+            evaluate(
+                &skip_verification,
+                &state,
+                &crawler,
+                address("192.0.2.24:80"),
+                None
+            )
+            .await
+            .action,
+            BotAction::Allow
+        );
+    }
+
+    #[test]
+    fn bans_are_per_ip_and_expired_entries_are_removed() {
+        let state = BotState::new().unwrap();
+        let first: IpAddr = "192.0.2.25".parse().unwrap();
+        let second: IpAddr = "192.0.2.26".parse().unwrap();
+        let now = Instant::now();
+        state.ban(first, Duration::from_secs(60), now);
+        assert!(state.banned(first, now));
+        assert!(!state.banned(second, now));
+
+        let expired_at = now - Duration::from_secs(2);
+        state.ban(second, Duration::from_secs(1), expired_at);
+        assert!(!state.banned(second, now));
+    }
+
+    #[test]
+    fn cookies_validate_prefix_tampering_expiry_and_malformed_values() {
+        let state = BotState::new().unwrap();
+        let client: IpAddr = "192.0.2.17".parse().unwrap();
+        let expires = unix_time() + 60;
+        let cookie = signed_cookie(&state, client, expires);
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, HeaderValue::from_str(&cookie).unwrap());
+        assert!(state.has_valid_cookie(&headers, "192.0.2.99".parse().unwrap()));
+        assert!(!state.has_valid_cookie(&headers, "192.0.3.17".parse().unwrap()));
+
+        let mut tampered = cookie.clone();
+        let last = tampered.pop().unwrap();
+        tampered.push(if last == '0' { '1' } else { '0' });
+        headers.insert(header::COOKIE, HeaderValue::from_str(&tampered).unwrap());
+        assert!(!state.has_valid_cookie(&headers, client));
+
+        for expires in [
+            unix_time().saturating_sub(1),
+            unix_time().saturating_add(7 * 24 * 3600 + 1),
+        ] {
+            let expired_or_future = signed_cookie(&state, client, expires);
+            headers.insert(
+                header::COOKIE,
+                HeaderValue::from_str(&expired_or_future).unwrap(),
+            );
+            assert!(!state.has_valid_cookie(&headers, client));
+        }
+        for malformed in [
+            "charlotte_bot=malformed",
+            "charlotte_bot=nope.sig",
+            "other=x",
+        ] {
+            headers.insert(header::COOKIE, HeaderValue::from_str(malformed).unwrap());
+            assert!(!state.has_valid_cookie(&headers, client));
+        }
+
+        let ipv6: IpAddr = "2001:db8:1:2::1".parse().unwrap();
+        let ipv6_cookie = signed_cookie(&state, ipv6, unix_time() + 60);
+        headers.insert(header::COOKIE, HeaderValue::from_str(&ipv6_cookie).unwrap());
+        assert!(state.has_valid_cookie(&headers, "2001:db8:1:2::abcd".parse().unwrap()));
+        assert!(!state.has_valid_cookie(&headers, "2001:db8:1:3::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn challenge_rejects_missing_or_invalid_parameters_and_weak_proofs() {
+        let state = BotState::new().unwrap();
+        let client = address("192.0.2.27:8080");
+        for query in ["", "exp=1", "exp=1&seed=x", "exp=1&seed=x&nonce=0"] {
+            assert_eq!(
+                state
+                    .solve_challenge(&challenge_request(query), client, false, 4, 3600)
+                    .status,
+                StatusCode::FORBIDDEN
+            );
+        }
+
+        let expires = unix_time() + 60;
+        let seed = state.expected_seed(client.ip(), expires);
+        let weak_nonce = (0_u64..)
+            .find(|nonce| !verify_pow(&seed, &nonce.to_string(), 24))
+            .unwrap();
+        let invalid_queries = [
+            format!("exp={expires}&seed=wrong&nonce=0&return=%2F"),
+            format!("exp={expires}&seed={seed}&nonce=bad&return=%2F"),
+            format!("exp={expires}&seed={seed}&nonce=0&return=%2F%2Fevil"),
+            format!("exp={expires}&seed={seed}&nonce=0&return=%2F%5Cevil"),
+            format!("exp={expires}&seed={seed}&nonce=0&return=%GG"),
+            format!("exp={expires}&seed={seed}&nonce={weak_nonce}&return=%2F"),
+        ];
+        for query in invalid_queries {
+            assert_eq!(
+                state
+                    .solve_challenge(&challenge_request(&query), client, false, 24, 3600)
+                    .status,
+                StatusCode::FORBIDDEN,
+                "accepted query {query}"
+            );
+        }
+    }
+
+    #[test]
+    fn successful_challenges_set_secure_only_for_tls_and_escape_script_text() {
+        let state = BotState::new().unwrap();
+        let client = address("192.0.2.28:8080");
+        let expires = unix_time() + 60;
+        let seed = state.expected_seed(client.ip(), expires);
+        let nonce = (0_u64..)
+            .find(|nonce| verify_pow(&seed, &nonce.to_string(), 4))
+            .unwrap();
+        let query = format!("exp={expires}&seed={seed}&nonce={nonce}&return=%2Fwelcome");
+        let secure = state.solve_challenge(&challenge_request(&query), client, true, 4, 3600);
+        assert_eq!(secure.status, StatusCode::SEE_OTHER);
+        assert!(secure.set_cookie.unwrap().ends_with("; Secure"));
+        let plain = state.solve_challenge(&challenge_request(&query), client, false, 4, 3600);
+        assert_eq!(plain.status, StatusCode::SEE_OTHER);
+        assert!(!plain.set_cookie.unwrap().contains("; Secure"));
+
+        assert_eq!(javascript_string("</script>'\""), "\\x3c/script\\x3e\\'\"");
+        let challenge = state.challenge(
+            &Request::builder()
+                .uri("/?q=%3C%2Fscript%3E%27%22")
+                .body(())
+                .unwrap(),
+            client,
+            4,
+            60,
+        );
+        assert_eq!(challenge.body.matches("</script>").count(), 1);
+        assert!(challenge.body.contains("%3C%2Fscript%3E%27%22"));
     }
 
     #[test]

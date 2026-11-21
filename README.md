@@ -172,6 +172,9 @@ see all command-line options. Common options include:
 | Option | Purpose |
 | --- | --- |
 | `--bind ADDRESS` | Plain HTTP listener; defaults to `127.0.0.1:8080`. |
+| `--max-connections N` | Maximum concurrent client connections across TCP listeners; defaults to 4096 and must be positive. |
+| `--header-read-timeout SECS` | Maximum time to receive a complete request head, including a client that sends no bytes; defaults to 30 seconds. |
+| `--tls-handshake-timeout SECS` | Maximum time to complete a TLS handshake; defaults to 10 seconds. |
 | `--debug` | Log verbose startup details, including listener binding, workers, and TLS initialization. |
 | `--no-plain-http` | Disable the plain HTTP listener; incompatible with ACME HTTP-01. |
 | `--root DIRECTORY` | Fallback document root when no virtual host handles a request; defaults to `.`. |
@@ -642,6 +645,40 @@ active requests by default; set `--worker-idle-timeout SECS` to change the
 default, or use `worker_idle_timeout: SECS` on a vhost. Set either value to `0`
 to keep workers alive indefinitely. If the master cannot inspect a root because
 of filesystem permissions, it defers that access check to the worker user.
+
+Hosted workers can optionally be placed in a cgroup v2 group under
+`/sys/fs/cgroup`. Set `--worker-cgroup PATH` and any of
+`--worker-cgroup-memory-max`, `--worker-cgroup-cpu-max`, or
+`--worker-cgroup-pids-max` for global defaults; the same options can be set in
+the main config file's `options:` mapping. A vhost can override these with
+`cgroup`, `cgroup_memory_max`, `cgroup_cpu_max`, and `cgroup_pids_max`:
+
+```yaml
+options:
+  worker_cgroup: charlotte/sites/{uid}/{name}
+  worker_cgroup_memory_max: 512M
+  worker_cgroup_cpu_max: 150%
+  worker_cgroup_pids_max: 64
+
+vhost:
+  - server_names: [www.example.com]
+    root: /srv/www/example.com/public
+    user: www-example
+    cgroup: charlotte/sites/{uid}/example-site
+    cgroup_pids_max: 32
+```
+
+The path is relative to the cgroup v2 mount (a leading `/` is also accepted
+and stripped), and supports `{uid}`, `{gid}`, and `{name}` placeholders; `{name}`
+uses the first server name with unsafe characters replaced. Per-vhost paths
+override the global path, while per-vhost limits override only the matching
+global limit. Memory values are positive bytes with optional K/M/G/T suffixes
+or `max`; CPU accepts `max`, an integer percentage such as `150%`, or
+`QUOTA [PERIOD]` in the kernel's `cpu.max` format; PID limits are a positive
+integer or `max`. CGI scripts and FastCGI applications inherit the worker's
+cgroup. The service needs a writable, delegated cgroup v2 hierarchy with the
+requested controllers available; enabling controllers can fail if a non-root
+ancestor cgroup still contains processes.
 
 A proxy vhost can forward requests arriving over HTTP/1.1, HTTP/2, or HTTP/3 to
 an HTTP or HTTPS upstream:

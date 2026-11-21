@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
+    fs,
     net::{SocketAddr, TcpListener, UdpSocket},
     process::{Child, Command, ExitStatus, Output, Stdio},
     sync::Mutex,
@@ -98,4 +99,47 @@ pub fn shutdown(server: &mut Child) {
     }
     let _ = server.kill();
     let _ = server.wait();
+}
+
+#[allow(dead_code)]
+pub fn descendants_with_argument(root_pid: u32, argument: &str) -> Vec<u32> {
+    let Ok(processes) = fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    processes
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| {
+            let Ok(command_line) = fs::read(format!("/proc/{pid}/cmdline")) else {
+                return false;
+            };
+            if !command_line
+                .split(|byte| *byte == 0)
+                .any(|value| value == argument.as_bytes())
+            {
+                return false;
+            }
+            let mut current = *pid;
+            for _ in 0..32 {
+                let Some(parent) = process_parent(current) else {
+                    return false;
+                };
+                if parent == root_pid {
+                    return true;
+                }
+                if parent <= 1 || parent == current {
+                    return false;
+                }
+                current = parent;
+            }
+            false
+        })
+        .collect()
+}
+
+fn process_parent(pid: u32) -> Option<u32> {
+    let status = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("PPid:")?.trim().parse().ok())
 }

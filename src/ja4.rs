@@ -471,6 +471,76 @@ mod tests {
         assert!(hello.ja4.contains("h2_"));
     }
 
+    #[test_fuzz::test_fuzz]
+    fn ja4_client_hello(bytes: Vec<u8>) {
+        if let Some(hello) = parse_client_hello(&bytes) {
+            if let Some(sni) = &hello.sni {
+                assert!(sni.len() <= bytes.len());
+            }
+            assert_ja4_shape(&hello.ja4);
+        }
+
+        let truncated_len = bytes.len().saturating_sub(1);
+        let _ = parse_client_hello(&bytes[..truncated_len]);
+    }
+
+    fn assert_ja4_shape(ja4: &str) {
+        let mut parts = ja4.rsplitn(3, '_');
+        let extension_hash = parts.next().unwrap_or_default();
+        let cipher_hash = parts.next().unwrap_or_default();
+        let prefix = parts.next().unwrap_or_default();
+        assert!(
+            extension_hash.len() == 12
+                && extension_hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+        );
+        assert!(
+            cipher_hash.len() == 12 && cipher_hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+        );
+
+        let prefix = prefix.chars().collect::<Vec<_>>();
+        assert_eq!(prefix.first(), Some(&'t'));
+        let version = prefix
+            .get(1..3)
+            .unwrap_or_default()
+            .iter()
+            .collect::<String>();
+        assert!(matches!(version.as_str(), "00" | "10" | "11" | "12" | "13"));
+        assert!(prefix.get(3).is_some_and(|flag| matches!(flag, 'd' | 'i')));
+        assert!(
+            prefix
+                .get(4..8)
+                .is_some_and(|counts| counts.iter().all(char::is_ascii_digit))
+        );
+    }
+
+    fn split_client_hello() -> Vec<u8> {
+        let hello = client_hello(false);
+        let handshake = &hello[5..];
+        let split = handshake.len() / 2;
+        let mut records = Vec::new();
+        for contents in [&handshake[..split], &handshake[split..]] {
+            records.extend_from_slice(&[22, 3, 1]);
+            records.extend_from_slice(
+                &u16::try_from(contents.len())
+                    .expect("test record is shorter than the TLS record limit")
+                    .to_be_bytes(),
+            );
+            records.extend_from_slice(contents);
+        }
+        records
+    }
+
+    #[test]
+    fn fuzz_seed_ja4_client_hello() {
+        ja4_client_hello(client_hello(false));
+        ja4_client_hello(client_hello(true));
+        ja4_client_hello(split_client_hello());
+        ja4_client_hello(vec![0, 1, 2, 3, 4, 5]);
+        let mut truncated = client_hello(false);
+        truncated.pop();
+        ja4_client_hello(truncated);
+    }
+
     #[tokio::test]
     async fn recording_stream_captures_split_input() {
         let (mut writer, reader) = duplex(1024);

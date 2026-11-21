@@ -7,6 +7,8 @@
 mod common;
 
 use std::{
+    io::Read,
+    net::TcpListener,
     os::unix::fs::PermissionsExt,
     path::Path,
     process::{Command, Stdio},
@@ -143,20 +145,79 @@ async fn writes_global_and_vhost_access_and_error_logs() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+#[tokio::test]
+async fn debug_startup_logs_listener_binding_to_stderr() {
+    let root = std::env::temp_dir().join(format!(
+        "project-charlotte-debug-logging-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let address = common::reserve_tcp_address();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_project-charlotte"));
+    command
+        .arg("--debug")
+        .arg("--bind")
+        .arg(address.to_string())
+        .arg("--root")
+        .arg(&root)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut server = common::spawn(&mut command).unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    while TcpStream::connect(address).await.is_err() {
+        if let Some(status) = server.try_wait().unwrap() {
+            panic!("server exited before becoming ready: {status}");
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "server did not start"
+        );
+        sleep(Duration::from_millis(20)).await;
+    }
+    common::shutdown(&mut server);
+    let mut log = String::new();
+    server
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut log)
+        .unwrap();
+
+    assert!(log.contains("Binding plain HTTP listener"), "{log}");
+    assert!(log.contains("Bound plain HTTP listener"), "{log}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn startup_errors_default_to_stderr_without_an_error_log() {
+    let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = occupied.local_addr().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_project-charlotte"))
+        .arg("--bind")
+        .arg(address.to_string())
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("could not bind TCP listener"), "{stderr}");
+    assert!(stderr.contains(&address.to_string()), "{stderr}");
+}
+
 #[cfg(target_os = "linux")]
 #[tokio::test]
+#[ignore = "requires root; run in the privileged CI job with cargo test -- --ignored"]
 async fn root_helper_opens_vhost_logs_after_master_drops_privileges() {
     use std::os::unix::fs::MetadataExt;
 
-    if !nix::unistd::geteuid().is_root() {
-        return;
-    }
-    let Some(user) = nix::unistd::User::from_name("nobody").unwrap() else {
-        return;
-    };
-    let Some(group) = nix::unistd::Group::from_gid(user.gid).unwrap() else {
-        return;
-    };
+    assert!(nix::unistd::geteuid().is_root(), "this test requires root");
+    let user = nix::unistd::User::from_name("nobody")
+        .unwrap()
+        .expect("root test environment must provide the nobody account");
+    let group = nix::unistd::Group::from_gid(user.gid)
+        .unwrap()
+        .expect("nobody's primary group must exist");
 
     let base = std::env::temp_dir().join(format!(
         "project-charlotte-root-logopener-{}",

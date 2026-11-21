@@ -5,6 +5,8 @@
 #[cfg(feature = "acme")]
 mod acme;
 mod bot;
+#[cfg_attr(not(feature = "hosting"), allow(dead_code))]
+mod cgroup;
 mod config;
 mod control;
 #[cfg(feature = "hosting")]
@@ -122,11 +124,6 @@ pub mod bench {
     }
 }
 
-/// Connections served at once across the TCP listeners. Further connections
-/// wait in the listen backlog rather than consume descriptors and memory.
-const MAX_CONNECTIONS: usize = 4096;
-/// How long a client may take to send a complete request head.
-const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// How often an idle HTTP/2 connection is probed, and how long it has to
 /// answer before it is closed.
 const HTTP2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
@@ -517,7 +514,7 @@ async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> 
         None
     };
     let mut connections = JoinSet::new();
-    let limiter = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    let limiter = Arc::new(Semaphore::new(config.max_connections));
     let signal_tx = shutdown_tx.clone();
     tokio::spawn(async move {
         tokio::select! {
@@ -557,6 +554,7 @@ async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> 
                         router,
                         connection_shutdown,
                         alt_svc_port,
+                        config.header_read_timeout,
                         None,
                         None,
                     ).await {
@@ -578,7 +576,7 @@ async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> 
                     let _permit = permit;
                     let recording = RecordingStream::new(stream);
                     let captured = recording.captured();
-                    match timeout(Duration::from_secs(10), acceptor.accept(recording)).await {
+                    match timeout(config.tls_handshake_timeout, acceptor.accept(recording)).await {
                         Ok(Ok(stream)) => {
                             let sni = stream.get_ref().1.server_name().map(Arc::<str>::from);
                             let fingerprint = parse_client_hello(
@@ -594,6 +592,7 @@ async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> 
                                 router,
                                 connection_shutdown,
                                 alt_svc_port,
+                                config.header_read_timeout,
                                 Some(sni),
                                 fingerprint,
                             )
@@ -646,6 +645,7 @@ async fn serve_connection<I>(
     router: Arc<Router>,
     mut shutdown: watch::Receiver<bool>,
     alt_svc_port: Option<u16>,
+    header_read_timeout: Duration,
     sni: Option<Option<Arc<str>>>,
     fingerprint: Option<Arc<ClientHelloInfo>>,
 ) -> Result<(), Box<dyn Error + Send + Sync>>
@@ -681,7 +681,7 @@ where
     builder
         .http1()
         .timer(TokioTimer::new())
-        .header_read_timeout(HEADER_READ_TIMEOUT);
+        .header_read_timeout(header_read_timeout);
     builder
         .http2()
         .timer(TokioTimer::new())
@@ -699,7 +699,7 @@ where
     // protocol detection before it has no timeout at all. This deadline covers
     // a client that connects and then sends nothing, or too little to tell.
     let no_request = async {
-        timeout(HEADER_READ_TIMEOUT, first_request.wait_for(|seen| *seen))
+        timeout(header_read_timeout, first_request.wait_for(|seen| *seen))
             .await
             .is_err()
     };

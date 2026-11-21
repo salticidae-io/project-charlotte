@@ -26,6 +26,8 @@ use tokio::sync::Mutex;
 #[cfg(feature = "acme")]
 use crate::acme::AcmeManager;
 #[cfg(feature = "hosting")]
+use crate::cgroup::CgroupSpec;
+#[cfg(feature = "hosting")]
 use crate::config::FastCgiAddress;
 #[cfg(feature = "proxy")]
 use crate::forwarded::DirectPeer;
@@ -84,6 +86,10 @@ struct VhostFile {
     fastcgi_timeout: Option<u64>,
     worker_threads: Option<usize>,
     worker_idle_timeout: Option<u64>,
+    cgroup: Option<String>,
+    cgroup_memory_max: Option<String>,
+    cgroup_cpu_max: Option<String>,
+    cgroup_pids_max: Option<String>,
     rate_limit: Option<String>,
     rate_limit_burst: Option<u32>,
     bot: Option<BotPolicyDeclarationFile>,
@@ -824,8 +830,8 @@ impl Router {
             };
             let vhost_waf = vhost_waf.map(|waf| waf.with_block_status(block_status));
             let mut normalized_names = Vec::with_capacity(entry.server_names.len());
-            for name in entry.server_names {
-                let normalized = normalize_server_name(&name)
+            for name in &entry.server_names {
+                let normalized = normalize_server_name(name)
                     .ok_or_else(|| format!("invalid virtual host name: {name}"))?;
                 normalized_names.push(normalized);
             }
@@ -883,6 +889,13 @@ impl Router {
                     return Err(format!("virtual host user must not be root: {user}").into());
                 }
                 validate_worker_identity(uid, gid)?;
+                let worker_cgroup = cgroup_for_vhost(
+                    &entry,
+                    &fallback,
+                    uid,
+                    gid,
+                    normalized_names.first().map_or("", String::as_str),
+                )?;
                 let index_names = entry.index.unwrap_or_else(|| fallback.index.clone());
                 validate_index(&index_names)?;
                 let listing = entry.listing.unwrap_or(fallback.listing);
@@ -1010,6 +1023,7 @@ impl Router {
                     uid,
                     gid,
                     root,
+                    cgroup: worker_cgroup,
                     idle_timeout: (idle_timeout != Duration::ZERO).then_some(idle_timeout),
                     active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                     last_used: Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
@@ -1513,6 +1527,42 @@ fn validate_index(index: &[String]) -> Result<(), Box<dyn Error + Send + Sync>> 
         .map_err(|_| "vhost index must be a non-empty list of file names".into())
 }
 
+#[cfg(feature = "hosting")]
+fn cgroup_for_vhost(
+    entry: &VhostFile,
+    fallback: &Config,
+    uid: u32,
+    gid: u32,
+    name: &str,
+) -> Result<Option<CgroupSpec>, Box<dyn Error + Send + Sync>> {
+    let global = fallback.worker_cgroup.as_ref();
+    let path = entry
+        .cgroup
+        .as_deref()
+        .or_else(|| global.and_then(|spec| spec.path.to_str()));
+    let memory_max = entry
+        .cgroup_memory_max
+        .as_deref()
+        .or_else(|| global.and_then(|spec| spec.memory_max.as_deref()));
+    let cpu_max = entry
+        .cgroup_cpu_max
+        .as_deref()
+        .or_else(|| global.and_then(|spec| spec.cpu_max.as_deref()));
+    let pids_max = entry
+        .cgroup_pids_max
+        .as_deref()
+        .or_else(|| global.and_then(|spec| spec.pids_max.as_deref()));
+    let Some(path) = path else {
+        if memory_max.is_some() || cpu_max.is_some() || pids_max.is_some() {
+            return Err("worker cgroup limits require a cgroup path".into());
+        }
+        return Ok(None);
+    };
+    Ok(Some(
+        CgroupSpec::new(path, memory_max, cpu_max, pids_max)?.expand(uid, gid, name)?,
+    ))
+}
+
 fn validate_vhost_declarations<'a>(
     entries: impl IntoIterator<Item = &'a VhostFile>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -1527,6 +1577,17 @@ fn validate_vhost_declarations<'a>(
             .into());
         }
         if entry.proxy_pass.is_some() {
+            if entry.cgroup.is_some()
+                || entry.cgroup_memory_max.is_some()
+                || entry.cgroup_cpu_max.is_some()
+                || entry.cgroup_pids_max.is_some()
+            {
+                return Err(format!(
+                    "vhost {} worker cgroup options require a hosted vhost",
+                    index + 1
+                )
+                .into());
+            }
             #[cfg(feature = "proxy")]
             ReverseProxy::validate_upstream_url(entry.proxy_pass.as_deref().unwrap())
                 .map_err(|error| format!("vhost {} proxy_pass: {error}", index + 1))?;
@@ -1574,6 +1635,32 @@ fn validate_vhost_declarations<'a>(
             return Err(
                 format!("vhost {} must provide both tls_cert and tls_key", index + 1).into(),
             );
+        }
+        #[cfg(feature = "hosting")]
+        {
+            if let Some(path) = entry.cgroup.as_deref() {
+                CgroupSpec::new(
+                    path,
+                    entry.cgroup_memory_max.as_deref(),
+                    entry.cgroup_cpu_max.as_deref(),
+                    entry.cgroup_pids_max.as_deref(),
+                )
+                .map_err(|error| format!("vhost {} cgroup: {error}", index + 1))?;
+            } else {
+                if let Some(limit) = entry.cgroup_memory_max.as_deref() {
+                    crate::cgroup::normalize_memory_max(limit).map_err(|error| {
+                        format!("vhost {} cgroup_memory_max: {error}", index + 1)
+                    })?;
+                }
+                if let Some(limit) = entry.cgroup_cpu_max.as_deref() {
+                    crate::cgroup::normalize_cpu_max(limit)
+                        .map_err(|error| format!("vhost {} cgroup_cpu_max: {error}", index + 1))?;
+                }
+                if let Some(limit) = entry.cgroup_pids_max.as_deref() {
+                    crate::cgroup::normalize_pids_max(limit)
+                        .map_err(|error| format!("vhost {} cgroup_pids_max: {error}", index + 1))?;
+                }
+            }
         }
         if let Some(threads) = entry.worker_threads {
             crate::config::parse_thread_count(&threads.to_string())
@@ -1675,6 +1762,14 @@ fn validate_vhost_declarations<'a>(
 /// built without it: proxying for `proxy_pass`, hosting for a document root,
 /// and ACME for an explicit `acme: true`.
 fn missing_feature(entry: &VhostFile) -> Option<&'static str> {
+    if (entry.cgroup.is_some()
+        || entry.cgroup_memory_max.is_some()
+        || entry.cgroup_cpu_max.is_some()
+        || entry.cgroup_pids_max.is_some())
+        && !cfg!(feature = "hosting")
+    {
+        return Some("hosting");
+    }
     if entry.proxy_pass.is_some() {
         if !cfg!(feature = "proxy") {
             return Some("proxy");
@@ -2269,6 +2364,8 @@ fn validate_vhost_entry(
             return Err(format!("virtual host user must not be root: {user}").into());
         }
         validate_worker_identity(uid, gid)?;
+        let name = entry.server_names.first().map_or("", String::as_str);
+        cgroup_for_vhost(entry, fallback, uid, gid, name)?;
         validate_index(entry.index.as_deref().unwrap_or(&fallback.index))?;
         let root = entry
             .root
@@ -2499,7 +2596,7 @@ fn persist_vhost_file(dir: &Path, path: &Path, content: &str) -> io::Result<()> 
 mod tests {
     use super::{
         FileConfig, Router, TlsSni, Vhost, VhostFile, VhostTable, Worker, WorkerArgs,
-        build_worker_args, ensure_trusted_config, match_score, normalize_host,
+        build_worker_args, cgroup_for_vhost, ensure_trusted_config, match_score, normalize_host,
         normalize_server_name, parse_file_config, render_control_vhost, request_host,
         resolve_identity, scan_vhost_files, select_route, trusted_write_mode, valid_control_name,
         validate_index, validate_vhost_declarations, validate_vhost_waf_declarations,
@@ -2587,6 +2684,10 @@ mod tests {
             fastcgi_timeout: None,
             worker_threads: None,
             worker_idle_timeout: None,
+            cgroup: None,
+            cgroup_memory_max: None,
+            cgroup_cpu_max: None,
+            cgroup_pids_max: None,
             rate_limit: None,
             rate_limit_burst: None,
             bot: None,
@@ -2634,6 +2735,54 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[cfg(feature = "hosting")]
+    #[test]
+    fn validates_and_merges_vhost_cgroup_settings() {
+        let mut valid = declaration(&["*.example.test"], false);
+        valid.cgroup = Some("/charlotte/{uid}/{name}".to_owned());
+        valid.cgroup_memory_max = Some("128M".to_owned());
+        valid.cgroup_cpu_max = Some("50%".to_owned());
+        valid.cgroup_pids_max = Some("24".to_owned());
+        assert!(validate_vhost_declarations([&valid]).is_ok());
+
+        let mut invalid_path = valid.clone();
+        invalid_path.cgroup = Some("../outside".to_owned());
+        assert!(validate_vhost_declarations([&invalid_path]).is_err());
+        let mut invalid_limit = valid.clone();
+        invalid_limit.cgroup_cpu_max = Some("0%".to_owned());
+        assert!(validate_vhost_declarations([&invalid_limit]).is_err());
+
+        let fallback = match Config::parse([
+            "--worker-cgroup".to_owned(),
+            "charlotte/global/{uid}".to_owned(),
+            "--worker-cgroup-pids-max".to_owned(),
+            "48".to_owned(),
+        ])
+        .unwrap()
+        {
+            crate::config::ParseResult::Config(config) => config,
+            crate::config::ParseResult::Help => panic!("expected config"),
+        };
+        let mut inherited = declaration(&["*.example.test"], false);
+        inherited.cgroup_memory_max = Some("1G".to_owned());
+        let inherited = cgroup_for_vhost(&inherited, &fallback, 1001, 1002, "*.example.test")
+            .unwrap()
+            .unwrap();
+        assert_eq!(inherited.path, PathBuf::from("charlotte/global/1001"));
+        assert_eq!(inherited.memory_max.as_deref(), Some("1073741824"));
+        assert_eq!(inherited.pids_max.as_deref(), Some("48"));
+
+        let mut missing_path = declaration(&["example.test"], false);
+        missing_path.cgroup_pids_max = Some("10".to_owned());
+        let no_global_cgroup = match Config::parse(Vec::<String>::new()).unwrap() {
+            crate::config::ParseResult::Config(config) => config,
+            crate::config::ParseResult::Help => panic!("expected config"),
+        };
+        let error =
+            cgroup_for_vhost(&missing_path, &no_global_cgroup, 1, 1, "example.test").unwrap_err();
+        assert!(error.to_string().contains("limits require a cgroup path"));
     }
 
     #[cfg(feature = "proxy")]
@@ -3199,6 +3348,7 @@ mod tests {
                     uid: 0,
                     gid: 0,
                     root: PathBuf::from("/"),
+                    cgroup: None,
                     idle_timeout: None,
                     active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                     last_used: Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
@@ -3753,29 +3903,32 @@ mod feature_tests {
             "{syntax_errors:?}"
         );
 
-        let semantic_path = directory.join("semantic.yaml");
-        fs::write(
-            &semantic_path,
-            concat!(
-                "vhost:\n",
-                "  - server_names: [rate.test]\n",
-                "    proxy_pass: http://127.0.0.1:8080\n",
-                "    rate_limit: invalid\n",
-                "  - server_names: [second-rate.test]\n",
-                "    proxy_pass: http://127.0.0.1:8080\n",
-                "    rate_limit: invalid\n",
-            ),
-        )
-        .unwrap();
-        let semantic_errors = check_file(&semantic_path);
-        for line in [2, 5] {
-            assert!(
-                semantic_errors.iter().any(|error| {
-                    error.starts_with(&format!("{}:{line}:", semantic_path.display()))
-                        && error.contains("rate_limit")
-                }),
-                "{semantic_errors:?}"
-            );
+        #[cfg(feature = "proxy")]
+        {
+            let semantic_path = directory.join("semantic.yaml");
+            fs::write(
+                &semantic_path,
+                concat!(
+                    "vhost:\n",
+                    "  - server_names: [rate.test]\n",
+                    "    proxy_pass: http://127.0.0.1:8080\n",
+                    "    rate_limit: invalid\n",
+                    "  - server_names: [second-rate.test]\n",
+                    "    proxy_pass: http://127.0.0.1:8080\n",
+                    "    rate_limit: invalid\n",
+                ),
+            )
+            .unwrap();
+            let semantic_errors = check_file(&semantic_path);
+            for line in [2, 5] {
+                assert!(
+                    semantic_errors.iter().any(|error| {
+                        error.starts_with(&format!("{}:{line}:", semantic_path.display()))
+                            && error.contains("rate_limit")
+                    }),
+                    "{semantic_errors:?}"
+                );
+            }
         }
         let _ = fs::remove_dir_all(directory);
     }

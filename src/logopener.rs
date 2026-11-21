@@ -33,8 +33,8 @@ use nix::{
 };
 use rustls::pki_types::pem::{self, PemObject};
 
-use crate::config::Config;
 use crate::pathctx::PathContext;
+use crate::{cgroup::CgroupSpec, config::Config};
 
 pub(crate) const HELPER_ARGUMENT: &str = "--internal-root-log-opener";
 
@@ -163,13 +163,14 @@ pub(crate) fn spawn_worker(
     args: &[OsString],
     environment: &[(OsString, OsString)],
     stderr_path: Option<&Path>,
+    cgroup: Option<&CgroupSpec>,
     child_socket: OwnedFd,
 ) -> io::Result<u64> {
     let helper = HELPER
         .get()
         .ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "root helper is not active"))?;
     let stderr_path = stderr_path.map(helper_request_path).transpose()?;
-    let request = spawn_worker_packet(uid, gid, args, environment, stderr_path.as_deref())?;
+    let request = spawn_worker_packet(uid, gid, args, environment, stderr_path.as_deref(), cgroup)?;
     let helper = helper
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -418,6 +419,7 @@ struct SpawnWorkerRequest {
     args: Vec<OsString>,
     environment: Vec<(OsString, OsString)>,
     stderr_path: Option<PathBuf>,
+    cgroup: Option<CgroupSpec>,
 }
 
 #[cfg_attr(not(feature = "hosting"), allow(dead_code))]
@@ -427,6 +429,7 @@ fn spawn_worker_packet(
     args: &[OsString],
     environment: &[(OsString, OsString)],
     stderr_path: Option<&Path>,
+    cgroup: Option<&CgroupSpec>,
 ) -> io::Result<Vec<u8>> {
     let request = SpawnWorkerRequest {
         uid,
@@ -434,6 +437,7 @@ fn spawn_worker_packet(
         args: args.to_vec(),
         environment: environment.to_vec(),
         stderr_path: stderr_path.map(Path::to_path_buf),
+        cgroup: cgroup.cloned(),
     };
     validate_spawn_worker(&request)?;
     let args_count = u16::try_from(args.len())
@@ -455,6 +459,15 @@ fn spawn_worker_packet(
     if let Some(path) = stderr_path {
         packet.push(1);
         push_os_string(&mut packet, path.as_os_str())?;
+    } else {
+        packet.push(0);
+    }
+    if let Some(spec) = cgroup {
+        packet.push(1);
+        push_os_string(&mut packet, spec.path.as_os_str())?;
+        push_optional_string(&mut packet, spec.memory_max.as_deref())?;
+        push_optional_string(&mut packet, spec.cpu_max.as_deref())?;
+        push_optional_string(&mut packet, spec.pids_max.as_deref())?;
     } else {
         packet.push(0);
     }
@@ -480,6 +493,16 @@ fn push_os_string(packet: &mut Vec<u8>, value: &std::ffi::OsStr) -> io::Result<(
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "worker field is too long"))?;
     packet.extend_from_slice(&length.to_be_bytes());
     packet.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn push_optional_string(packet: &mut Vec<u8>, value: Option<&str>) -> io::Result<()> {
+    if let Some(value) = value {
+        packet.push(1);
+        push_os_string(packet, std::ffi::OsStr::new(value))?;
+    } else {
+        packet.push(0);
+    }
     Ok(())
 }
 
@@ -530,6 +553,43 @@ fn parse_spawn_worker(packet: &[u8]) -> io::Result<SpawnWorkerRequest> {
             ));
         }
     };
+    let cgroup = match packet.get(offset).copied() {
+        Some(0) => {
+            offset += 1;
+            None
+        }
+        Some(1) => {
+            offset += 1;
+            let path = read_os_string(packet, &mut offset)?;
+            let path = path.to_str().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "cgroup path must be UTF-8")
+            })?;
+            if path.starts_with('/') {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "worker cgroup path must be relative to /sys/fs/cgroup",
+                ));
+            }
+            let memory_max = read_optional_string(packet, &mut offset)?;
+            let cpu_max = read_optional_string(packet, &mut offset)?;
+            let pids_max = read_optional_string(packet, &mut offset)?;
+            Some(
+                CgroupSpec::new(
+                    path,
+                    memory_max.as_deref(),
+                    cpu_max.as_deref(),
+                    pids_max.as_deref(),
+                )
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+            )
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid worker cgroup flag",
+            ));
+        }
+    };
     if offset != packet.len() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -542,6 +602,7 @@ fn parse_spawn_worker(packet: &[u8]) -> io::Result<SpawnWorkerRequest> {
         args,
         environment,
         stderr_path,
+        cgroup,
     };
     validate_spawn_worker(&request)?;
     Ok(request)
@@ -584,6 +645,28 @@ fn read_os_string(packet: &[u8], offset: &mut usize) -> io::Result<OsString> {
     }
     *offset = end;
     Ok(OsString::from_vec(bytes.to_vec()))
+}
+
+fn read_optional_string(packet: &[u8], offset: &mut usize) -> io::Result<Option<String>> {
+    match packet.get(*offset).copied() {
+        Some(0) => {
+            *offset += 1;
+            Ok(None)
+        }
+        Some(1) => {
+            *offset += 1;
+            read_os_string(packet, offset)?
+                .into_string()
+                .map(Some)
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "cgroup limit must be UTF-8")
+                })
+        }
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid optional cgroup limit flag",
+        )),
+    }
 }
 
 fn validate_spawn_worker(request: &SpawnWorkerRequest) -> io::Result<()> {
@@ -641,6 +724,22 @@ fn validate_spawn_worker(request: &SpawnWorkerRequest) -> io::Result<()> {
             "worker stderr path must be absolute and contain no '..' components",
         ));
     }
+    if let Some(spec) = &request.cgroup {
+        if spec.path.is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "worker cgroup path must be relative to /sys/fs/cgroup",
+            ));
+        }
+        CgroupSpec::new(
+            spec.path.to_str().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "cgroup path must be UTF-8")
+            })?,
+            spec.memory_max.as_deref(),
+            spec.cpu_max.as_deref(),
+            spec.pids_max.as_deref(),
+        )?;
+    }
     Ok(())
 }
 
@@ -679,6 +778,18 @@ fn spawn_worker_process(
     if let Some(path) = request.stderr_path {
         let stderr = open_allowed_file(&path, &directories.logs, true)?;
         command.stderr(Stdio::from(File::from(stderr)));
+    }
+    if let Some(spec) = request.cgroup.as_ref() {
+        let cgroup_procs = crate::cgroup::prepare(spec).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "could not prepare worker cgroup {}: {error}",
+                    spec.path.display()
+                ),
+            )
+        })?;
+        crate::cgroup::apply_to_command(&mut command, cgroup_procs);
     }
     crate::privileges::apply_identity(&mut command, request.uid, request.gid)
         .map_err(io::Error::other)?;
@@ -1520,12 +1631,15 @@ mod tests {
     #[test]
     fn worker_spawn_requests_round_trip_and_are_validated() {
         let environment = vec![(OsString::from("PATH"), OsString::from("/usr/bin"))];
+        let cgroup =
+            CgroupSpec::new("charlotte/{uid}", Some("64M"), Some("max"), Some("8")).unwrap();
         let packet = spawn_worker_packet(
             1000,
             1001,
             &worker_args(1000, 1001),
             &environment,
             Some(Path::new("/var/log/site/error.log")),
+            Some(&cgroup),
         )
         .unwrap();
         let request = parse_spawn_worker(&packet).unwrap();
@@ -1533,6 +1647,7 @@ mod tests {
         assert_eq!(request.gid, 1001);
         assert_eq!(request.args, worker_args(1000, 1001));
         assert_eq!(request.environment, environment);
+        assert_eq!(request.cgroup, Some(cgroup.clone()));
         assert_eq!(
             request.stderr_path.as_deref(),
             Some(Path::new("/var/log/site/error.log"))
@@ -1546,6 +1661,7 @@ mod tests {
                 args,
                 environment: vec![(OsString::from(name), OsString::from("value"))],
                 stderr_path: stderr.map(PathBuf::from),
+                cgroup: None,
             })
         };
         assert!(request(1000, worker_args(1000, 1001), "TZ", None).is_ok());
@@ -1567,6 +1683,7 @@ mod tests {
                     (OsString::from("TZ"), OsString::from("UTC")),
                 ],
                 stderr_path: None,
+                cgroup: None,
             })
             .is_err()
         );
@@ -1590,7 +1707,8 @@ mod tests {
         .unwrap();
         let mut response = [0; 256];
 
-        let packet = spawn_worker_packet(1000, 1001, &worker_args(1000, 1001), &[], None).unwrap();
+        let packet =
+            spawn_worker_packet(1000, 1001, &worker_args(1000, 1001), &[], None, None).unwrap();
         send_packet(client.as_raw_fd(), &packet, None).unwrap();
         let (length, _) = receive_packet(client.as_raw_fd(), &mut response).unwrap();
         assert_eq!(response[0], 1);

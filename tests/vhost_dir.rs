@@ -6,14 +6,17 @@
 mod common;
 
 use std::{
+    error::Error,
     net::SocketAddr,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
+    sync::Arc,
     sync::atomic::{AtomicUsize, Ordering},
     time::Duration,
 };
 
 use nix::unistd::{User, geteuid};
+use rustls::{RootCertStore, pki_types::CertificateDer};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -31,6 +34,14 @@ struct Fixture {
 
 impl Fixture {
     async fn start(main_config: Option<String>, initial_vhost: Option<(&str, &str)>) -> Self {
+        Self::start_with_tls(main_config, initial_vhost, None).await
+    }
+
+    async fn start_with_tls(
+        main_config: Option<String>,
+        initial_vhost: Option<(&str, &str)>,
+        tls_address: Option<SocketAddr>,
+    ) -> Self {
         let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
             "project-charlotte-vhost-dir-{}-{sequence}",
@@ -69,6 +80,9 @@ impl Fixture {
             .stderr(Stdio::null());
         if has_main_config {
             command.arg("--config").arg(path.join("main.yaml"));
+        }
+        if let Some(address) = tls_address {
+            command.arg("--tls-bind").arg(address.to_string());
         }
         let mut server = common::spawn(&mut command).unwrap();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
@@ -169,6 +183,36 @@ impl Fixture {
             sleep(Duration::from_millis(75)).await;
         }
     }
+
+    async fn tls_body(
+        &self,
+        address: SocketAddr,
+        hostname: &str,
+        certificate: CertificateDer<'static>,
+    ) -> Result<String, Box<dyn Error + Send + Sync>> {
+        let mut roots = RootCertStore::empty();
+        roots.add(certificate)?;
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+        let stream = TcpStream::connect(address).await?;
+        let server_name = rustls::pki_types::ServerName::try_from(hostname.to_owned())?;
+        let mut stream = connector.connect(server_name, stream).await?;
+        stream
+            .write_all(
+                format!("GET /page.txt HTTP/1.1\r\nHost: {hostname}\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await?;
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await?;
+        let header_end = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .ok_or("HTTP response headers were incomplete")?;
+        Ok(String::from_utf8_lossy(&response[header_end + 4..]).into_owned())
+    }
 }
 
 impl Drop for Fixture {
@@ -180,6 +224,14 @@ impl Drop for Fixture {
 
 fn current_user_name() -> String {
     User::from_uid(geteuid()).unwrap().unwrap().name
+}
+
+fn worker_user_name() -> String {
+    if geteuid().is_root() {
+        "nobody".to_owned()
+    } else {
+        current_user_name()
+    }
 }
 
 fn vhost_config(hostname: &str, root: &Path) -> String {
@@ -239,4 +291,47 @@ async fn invalid_or_duplicate_files_keep_the_previous_configuration_and_merge_ma
     assert_eq!(fixture.body("main.test").await, "main");
     drop(fixture);
     std::fs::remove_dir_all(main_root).unwrap();
+}
+
+#[tokio::test]
+async fn adding_vhost_tls_certificate_updates_sni_without_restart() {
+    let tls_address = common::reserve_tcp_address();
+    let fixture = Fixture::start_with_tls(None, None, Some(tls_address)).await;
+    let root = fixture.add_root("tls-reload-root", "reloaded TLS certificate");
+    let generated = rcgen::generate_simple_self_signed(vec!["reload.test".to_owned()]).unwrap();
+    let cert_path = fixture.path.join("reload.pem");
+    let key_path = fixture.path.join("reload-key.pem");
+    std::fs::write(&cert_path, generated.cert.pem()).unwrap();
+    std::fs::write(&key_path, generated.signing_key.serialize_pem()).unwrap();
+    let certificate = generated.cert.der().clone();
+    std::fs::write(
+        fixture.vhost_dir.join("reload.yaml"),
+        format!(
+            "vhost:\n  - server_names: [reload.test]\n    root: {:?}\n    user: {:?}\n    tls_cert: {:?}\n    tls_key: {:?}\n",
+            root.to_string_lossy(),
+            worker_user_name(),
+            cert_path.to_string_lossy(),
+            key_path.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    fixture
+        .wait_for_body("reload.test", "reloaded TLS certificate")
+        .await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(body) = fixture
+            .tls_body(tls_address, "reload.test", certificate.clone())
+            .await
+            && body == "reloaded TLS certificate"
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "new vhost certificate was not selected by SNI"
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
 }
