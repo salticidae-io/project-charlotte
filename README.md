@@ -187,6 +187,7 @@ see all command-line options. Common options include:
 | `--check-config` | Validate the virtual-host YAML files and exit, reporting errors with source locations. |
 | `--control-socket PATH` | Serve the local HTTP configuration API on a Unix socket. |
 | `--tls-bind ADDRESS` | Listen for HTTPS; configure a certificate with `--tls-cert` and `--tls-key`, or use eligible ACME virtual hosts. |
+| `--https-redirect` | Redirect plain HTTP requests for certified virtual hosts to HTTPS; a vhost can override this with `https_redirect: false`. |
 | `--http3-bind ADDRESS` | Enable the HTTP/3 listener; TLS configuration is required. |
 | `--rate-limit RATE` | Apply a per-client request limit such as `20/s`, `600/m`, or `36000/h`; disabled by default. |
 | `--rate-limit-burst N` | Set the allowed burst; requires `--rate-limit` and defaults to the rate rounded up per second. |
@@ -630,6 +631,15 @@ vhost:
 Each vhost `index` may be a single filename or an ordered list. Charlotte serves
 the first matching file found in the requested directory, then falls back to a
 directory listing (if enabled).
+
+Set `--https-redirect` to redirect plain HTTP requests to HTTPS when the
+selected vhost has its own TLS certificate or an ACME certificate has been
+issued for the requested host. The TLS TCP listener must be active. A vhost's
+`https_redirect: true` or `https_redirect: false` overrides the global setting.
+ACME HTTP-01 challenge responses are served before redirects, so issuance can
+still complete. GET and HEAD requests receive `301`; other methods receive
+`308`. The redirect preserves the request path and query and uses the bound TLS
+port (omitting `:443`).
 
 Virtual hosts without `rate_limit` inherit the global CLI limit. Set
 `rate_limit: off` to exempt a host, or give it a rate such as `20/s` to create

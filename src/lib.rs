@@ -273,6 +273,13 @@ pub fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         }
         crate::log_debug!("Starting master process");
         logopener::start(&config)?;
+        // Read the main configuration while still privileged; the --user
+        // account may not be able to traverse its directory.
+        let main_config = config
+            .config_file
+            .as_deref()
+            .map(vhost::read_trusted_config)
+            .transpose()?;
         privileges::drop_master(&config)?;
         let mut builder = tokio::runtime::Builder::new_multi_thread();
         if let Some(threads) = config.threads {
@@ -285,7 +292,7 @@ pub fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
                 .map_or_else(|| "Tokio default".to_owned(), |threads| threads.to_string())
         );
         let runtime = builder.enable_all().build()?;
-        runtime.block_on(run_master(config))
+        runtime.block_on(run_master(config, main_config))
     })();
     if report_startup_errors {
         if let Err(error) = &startup_result {
@@ -295,7 +302,10 @@ pub fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     startup_result
 }
 
-async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> {
+async fn run_master(
+    config: Config,
+    main_config: Option<String>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     #[cfg(feature = "hosting")]
     let root = tokio::fs::canonicalize(&config.root)
         .await
@@ -351,6 +361,7 @@ async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> 
     let router = Router::load(
         Arc::new(config.clone()),
         config.config_file.as_ref(),
+        main_config,
         rate_limit,
         waf,
     )
@@ -404,6 +415,9 @@ async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> 
         }
         _ => None,
     };
+    if let Some(listener) = &tls_listener {
+        router.set_https_port(listener.local_addr()?.port());
+    }
     #[cfg(feature = "http3")]
     let http3_endpoint = if let Some(tls) = &tls_setup {
         crate::log_debug!("Binding HTTP/3 endpoint to {}", config.http3_bind);

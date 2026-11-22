@@ -57,6 +57,7 @@ pub struct FastCgiApp {
 pub struct Config {
     pub debug: bool,
     pub plain_http: bool,
+    pub https_redirect: bool,
     pub bind: SocketAddr,
     pub max_connections: usize,
     pub header_read_timeout: Duration,
@@ -159,6 +160,9 @@ struct Cli {
     /// Disable the plain HTTP listener
     #[arg(long)]
     no_plain_http: bool,
+    /// Redirect HTTP requests for certified virtual hosts to HTTPS
+    #[arg(long)]
+    https_redirect: bool,
     /// TLS (HTTP/1.1 and HTTP/2) listen address
     #[arg(long, value_name = "ADDRESS", value_parser = parse_cli_address("TLS socket address"), allow_hyphen_values = true)]
     tls_bind: Option<SocketAddr>,
@@ -502,6 +506,7 @@ impl Config {
             header_read_timeout,
             tls_handshake_timeout,
             no_plain_http,
+            https_redirect,
             tls_bind,
             root,
             index,
@@ -706,6 +711,7 @@ impl Config {
         Ok(ParseResult::Config(Box::new(Self {
             debug,
             plain_http: !no_plain_http,
+            https_redirect,
             bind,
             max_connections,
             header_read_timeout,
@@ -1964,7 +1970,7 @@ mod tests {
     #[test]
     fn parses_global_options_from_config_file_and_resolves_relative_paths() {
         let path = write_config_file(
-            "options:\n  bind: 127.0.0.1:8123\n  debug: true\n  index: [home.htm, index.html]\n  user: charlotte\n  threads: 4\n  access-log-file: logs/access.log\n  log-dir: [logs, audit]\n  tls-dir: certificates\n  worker_cgroup: charlotte/sites/{uid}/{name}\n  worker_cgroup_memory_max: 512M\n  worker_cgroup_cpu_max: 150%\n  worker_cgroup_pids_max: 64\n",
+            "options:\n  bind: 127.0.0.1:8123\n  debug: true\n  https_redirect: true\n  index: [home.htm, index.html]\n  user: charlotte\n  threads: 4\n  access-log-file: logs/access.log\n  log-dir: [logs, audit]\n  tls-dir: certificates\n  worker_cgroup: charlotte/sites/{uid}/{name}\n  worker_cgroup_memory_max: 512M\n  worker_cgroup_cpu_max: 150%\n  worker_cgroup_pids_max: 64\n",
         );
         let parsed =
             Config::parse(["--config".to_owned(), path.to_string_lossy().into_owned()]).unwrap();
@@ -1974,6 +1980,7 @@ mod tests {
 
         assert_eq!(config.bind.to_string(), "127.0.0.1:8123");
         assert!(config.debug);
+        assert!(config.https_redirect);
         assert_eq!(config.index, ["home.htm", "index.html"]);
         assert_eq!(config.master_user.as_deref(), Some("charlotte"));
         assert_eq!(config.threads, Some(4));
@@ -2096,11 +2103,18 @@ mod tests {
             panic!("expected config")
         };
         assert!(!defaults.debug);
+        assert!(!defaults.https_redirect);
 
         let ParseResult::Config(config) = Config::parse(["--debug".to_owned()]).unwrap() else {
             panic!("expected config")
         };
         assert!(config.debug);
+
+        let ParseResult::Config(config) = Config::parse(["--https-redirect".to_owned()]).unwrap()
+        else {
+            panic!("expected config")
+        };
+        assert!(config.https_redirect);
     }
 
     #[test]

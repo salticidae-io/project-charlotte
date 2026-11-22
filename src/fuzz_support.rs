@@ -208,6 +208,7 @@ pub(crate) fn fuzz_config(root: PathBuf) -> Config {
     Config {
         debug: false,
         plain_http: true,
+        https_redirect: false,
         bind: "127.0.0.1:8080".parse().expect("valid fuzz bind"),
         max_connections: 4096,
         header_read_timeout: std::time::Duration::from_secs(30),

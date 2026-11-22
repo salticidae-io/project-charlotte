@@ -1057,6 +1057,7 @@ mod tests {
         Config {
             debug: false,
             plain_http: true,
+            https_redirect: false,
             bind: "127.0.0.1:8080".parse::<SocketAddr>().unwrap(),
             max_connections: 4096,
             header_read_timeout: Duration::from_secs(30),

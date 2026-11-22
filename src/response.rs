@@ -86,6 +86,14 @@ pub(crate) fn bot_response(parts: crate::bot::ResponseParts) -> Response<Respons
     response
 }
 
+pub(crate) fn redirect_response(status: StatusCode, location: String) -> Response<ResponseBody> {
+    let mut response = response(status, full_body(Bytes::new()));
+    if let Ok(value) = HeaderValue::from_str(&location) {
+        response.headers_mut().insert(header::LOCATION, value);
+    }
+    response
+}
+
 #[cfg(feature = "acme")]
 pub(crate) fn text_response(status: StatusCode, text: String) -> Response<ResponseBody> {
     let bytes = Bytes::from(text);

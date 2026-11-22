@@ -51,6 +51,7 @@ struct Fixture {
 struct FixtureOptions {
     global_certificate: bool,
     default_vhost_certificate: bool,
+    https_redirect: bool,
 }
 
 impl Fixture {
@@ -58,6 +59,7 @@ impl Fixture {
         Self::start(FixtureOptions {
             global_certificate: true,
             default_vhost_certificate: true,
+            https_redirect: false,
         })
         .await
     }
@@ -66,6 +68,7 @@ impl Fixture {
         Self::start(FixtureOptions {
             global_certificate: false,
             default_vhost_certificate: true,
+            https_redirect: false,
         })
         .await
     }
@@ -74,6 +77,16 @@ impl Fixture {
         Self::start(FixtureOptions {
             global_certificate: false,
             default_vhost_certificate: false,
+            https_redirect: false,
+        })
+        .await
+    }
+
+    async fn with_https_redirect() -> Self {
+        Self::start(FixtureOptions {
+            global_certificate: true,
+            default_vhost_certificate: true,
+            https_redirect: true,
         })
         .await
     }
@@ -83,10 +96,13 @@ impl Fixture {
         let root = create_root();
         let alpha_root = root.join("alpha");
         let beta_root = root.join("beta");
+        let gamma_root = root.join("gamma");
         std::fs::create_dir_all(&alpha_root).unwrap();
         std::fs::create_dir_all(&beta_root).unwrap();
+        std::fs::create_dir_all(&gamma_root).unwrap();
         std::fs::write(alpha_root.join("index.html"), "alpha vhost").unwrap();
         std::fs::write(beta_root.join("index.html"), "beta vhost").unwrap();
+        std::fs::write(gamma_root.join("index.html"), "gamma vhost").unwrap();
         std::fs::write(root.join("index.html"), "fallback vhost").unwrap();
 
         let (alpha_cert, alpha_cert_path, alpha_key_path) =
@@ -112,7 +128,8 @@ impl Fixture {
                     "vhost:\n  - server_names: [alpha.test]\n    root: {:?}\n    user: {:?}\n",
                     "    tls_cert: {:?}\n    tls_key: {:?}\n",
                     "  - server_names: [\"*.beta.test\"]\n    root: {:?}\n    user: {:?}\n",
-                    "{}    default: true\n"
+                    "    https_redirect: false\n{}    default: true\n",
+                    "  - server_names: [gamma.test]\n    root: {:?}\n    user: {:?}\n"
                 ),
                 alpha_root.to_string_lossy(),
                 username,
@@ -121,6 +138,8 @@ impl Fixture {
                 beta_root.to_string_lossy(),
                 username,
                 default_certificate,
+                gamma_root.to_string_lossy(),
+                username,
             ),
         )
         .unwrap();
@@ -146,6 +165,9 @@ impl Fixture {
                 .arg(fallback_cert_path)
                 .arg("--tls-key")
                 .arg(fallback_key_path);
+        }
+        if options.https_redirect {
+            command.arg("--https-redirect");
         }
         command.stdout(Stdio::null()).stderr(Stdio::null());
         let server = common::spawn(&mut command).unwrap();
@@ -375,18 +397,32 @@ fn client_config_with_versions(
 }
 
 async fn plain_http_request(address: SocketAddr, host: &str) -> (u16, Vec<u8>) {
+    let (status, _, body) =
+        plain_http_request_with_method(address, "GET", host, "/index.html").await;
+    (status, body)
+}
+
+async fn plain_http_request_with_method(
+    address: SocketAddr,
+    method: &str,
+    host: &str,
+    path: &str,
+) -> (u16, Option<String>, Vec<u8>) {
     let mut stream = TcpStream::connect(address).await.unwrap();
     stream
         .write_all(
-            format!("GET /index.html HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n")
+            format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n")
                 .as_bytes(),
         )
         .await
         .unwrap();
     let mut response = Vec::new();
     stream.read_to_end(&mut response).await.unwrap();
-    let response = String::from_utf8_lossy(&response);
-    let status = response
+    let response = String::from_utf8_lossy(&response).into_owned();
+    let headers = response
+        .split_once("\r\n\r\n")
+        .map_or("", |(headers, _)| headers);
+    let status = headers
         .lines()
         .next()
         .unwrap()
@@ -395,10 +431,15 @@ async fn plain_http_request(address: SocketAddr, host: &str) -> (u16, Vec<u8>) {
         .unwrap()
         .parse()
         .unwrap();
+    let location = headers.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("location")
+            .then(|| value.trim().to_owned())
+    });
     let body = response
         .split_once("\r\n\r\n")
         .map_or_else(Vec::new, |(_, body)| body.as_bytes().to_vec());
-    (status, body)
+    (status, location, body)
 }
 
 fn h3_client_endpoint(roots: RootCertStore) -> Endpoint {
@@ -664,6 +705,63 @@ async fn plain_http_routes_hosts_without_tls_sni_checks() {
     let (status, body) = plain_http_request(fixture.tcp_address, "alpha.test").await;
     assert_eq!(status, 200);
     assert_eq!(body, b"alpha vhost");
+}
+
+#[tokio::test]
+async fn http_redirect_uses_the_bound_tls_port_and_preserves_path_and_query() {
+    let fixture = Fixture::with_https_redirect().await;
+    let (status, location, _) = plain_http_request_with_method(
+        fixture.tcp_address,
+        "GET",
+        "alpha.test:18080",
+        "/index.html?from=plain",
+    )
+    .await;
+    assert_eq!(status, 301);
+    assert_eq!(
+        location.as_deref(),
+        Some(
+            format!(
+                "https://alpha.test:{}/index.html?from=plain",
+                fixture.tls_address.port()
+            )
+            .as_str()
+        )
+    );
+
+    let (status, location, _) =
+        plain_http_request_with_method(fixture.tcp_address, "HEAD", "alpha.test", "/head").await;
+    assert_eq!(status, 301);
+    assert_eq!(
+        location.as_deref(),
+        Some(format!("https://alpha.test:{}/head", fixture.tls_address.port()).as_str())
+    );
+
+    let (status, location, _) =
+        plain_http_request_with_method(fixture.tcp_address, "POST", "alpha.test", "/submit").await;
+    assert_eq!(status, 308);
+    assert_eq!(
+        location.as_deref(),
+        Some(format!("https://alpha.test:{}/submit", fixture.tls_address.port()).as_str())
+    );
+}
+
+#[tokio::test]
+async fn http_redirect_requires_a_certificate_and_honors_vhost_opt_out() {
+    let fixture = Fixture::with_https_redirect().await;
+    let (status, location, body) =
+        plain_http_request_with_method(fixture.tcp_address, "GET", "gamma.test", "/index.html")
+            .await;
+    assert_eq!(status, 200);
+    assert_eq!(location, None);
+    assert_eq!(body, b"gamma vhost");
+
+    let (status, location, body) =
+        plain_http_request_with_method(fixture.tcp_address, "GET", "x.beta.test", "/index.html")
+            .await;
+    assert_eq!(status, 200);
+    assert_eq!(location, None);
+    assert_eq!(body, b"beta vhost");
 }
 
 #[tokio::test]

@@ -12,7 +12,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, RwLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU16, AtomicU64, Ordering},
     },
 };
 
@@ -95,6 +95,7 @@ struct VhostFile {
     bot: Option<BotPolicyDeclarationFile>,
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
+    https_redirect: Option<bool>,
     #[serde(default)]
     default: bool,
     #[serde(default)]
@@ -169,6 +170,7 @@ where
 struct Vhost {
     names: Vec<String>,
     tls: Option<TlsFiles>,
+    https_redirect: Option<bool>,
     #[cfg(feature = "acme")]
     acme: bool,
     default: bool,
@@ -206,6 +208,7 @@ pub(crate) struct Router {
     bot_state: Arc<BotState>,
     access_log: Option<Arc<crate::logging::AccessLog>>,
     error_log: Arc<crate::logging::ErrorLog>,
+    https_port: AtomicU16,
     #[cfg(feature = "acme")]
     acme: Option<AcmeManager>,
 }
@@ -243,6 +246,7 @@ impl Router {
     pub(crate) async fn load(
         fallback: Arc<Config>,
         path: Option<&PathBuf>,
+        content: Option<String>,
         rate_limit: Option<Arc<RateLimiter>>,
         waf: Option<Waf>,
     ) -> Result<Self, Box<dyn Error + Send + Sync>> {
@@ -296,7 +300,12 @@ impl Router {
             current_dir.clone()
         };
         let file = if let Some(path) = path {
-            let content = read_trusted_config(path)?;
+            // The master normally reads the file before dropping privileges,
+            // because the unprivileged user may not be able to reach it.
+            let content = match content {
+                Some(content) => content,
+                None => read_trusted_config(path)?,
+            };
             parse_file_config(&content)?
         } else {
             FileConfig {
@@ -860,6 +869,7 @@ impl Router {
                 vhosts.push(Vhost {
                     names: normalized_names,
                     tls,
+                    https_redirect: entry.https_redirect,
                     #[cfg(feature = "acme")]
                     acme: entry.acme.unwrap_or(true),
                     default: entry.default,
@@ -1043,6 +1053,7 @@ impl Router {
                 vhosts.push(Vhost {
                     names: normalized_names,
                     tls,
+                    https_redirect: entry.https_redirect,
                     #[cfg(feature = "acme")]
                     acme: entry.acme.unwrap_or(true),
                     default: entry.default,
@@ -1078,6 +1089,7 @@ impl Router {
             bot_state,
             access_log: global_access_log,
             error_log: global_error_log,
+            https_port: AtomicU16::new(0),
             #[cfg(feature = "acme")]
             acme: None,
         })
@@ -1127,6 +1139,10 @@ impl Router {
 
     pub(crate) fn vhost_dir(&self) -> Option<PathBuf> {
         self.dir.clone()
+    }
+
+    pub(crate) fn set_https_port(&self, port: u16) {
+        self.https_port.store(port, Ordering::Relaxed);
     }
 
     pub(crate) async fn dispatch<B>(
@@ -1238,6 +1254,7 @@ impl Router {
         B::Error: Into<Box<dyn Error + Send + Sync>>,
     {
         let host = host.as_deref();
+        let https_port = self.https_port.load(Ordering::Relaxed);
         #[cfg(feature = "acme")]
         if let Some(acme) = &self.acme {
             if request.method() == http::Method::GET
@@ -1250,6 +1267,40 @@ impl Router {
                 && let Some(host) = host
             {
                 acme.maybe_provision(host);
+            }
+        }
+        if request.extensions().get::<TlsSni>().is_none()
+            && https_port != 0
+            && let Some(index) = selected
+            && let Some(vhost) = table.vhosts.get(index)
+            && vhost.https_redirect.unwrap_or(self.fallback.https_redirect)
+            && let Some(host) = host
+            && (vhost.tls.is_some() || {
+                #[cfg(feature = "acme")]
+                {
+                    self.acme
+                        .as_ref()
+                        .is_some_and(|acme| acme.certificate_store().get(host).is_some())
+                }
+                #[cfg(not(feature = "acme"))]
+                {
+                    false
+                }
+            })
+        {
+            let path_and_query = request
+                .uri()
+                .path_and_query()
+                .map_or("/", |value| value.as_str());
+            let location = https_redirect_location(host, https_port, path_and_query);
+            if http::HeaderValue::from_str(&location).is_ok() {
+                let status = if matches!(request.method(), &http::Method::GET | &http::Method::HEAD)
+                {
+                    StatusCode::MOVED_PERMANENTLY
+                } else {
+                    StatusCode::PERMANENT_REDIRECT
+                };
+                return response::redirect_response(status, location);
             }
         }
         let rate_limit = match selected {
@@ -1471,6 +1522,20 @@ fn request_host<B>(request: &Request<B>) -> Option<String> {
         .and_then(|value| value.parse::<http::uri::Authority>().ok());
     let authority = request.uri().authority().or(host_authority.as_ref())?;
     normalize_host(authority.host())
+}
+
+fn https_redirect_location(host: &str, port: u16, path_and_query: &str) -> String {
+    let host = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_owned()
+    };
+    let authority = if port == 443 {
+        host
+    } else {
+        format!("{host}:{port}")
+    };
+    format!("https://{authority}{path_and_query}")
 }
 
 pub(crate) fn normalize_host(value: &str) -> Option<String> {
@@ -2596,11 +2661,11 @@ fn persist_vhost_file(dir: &Path, path: &Path, content: &str) -> io::Result<()> 
 mod tests {
     use super::{
         FileConfig, Router, TlsSni, Vhost, VhostFile, VhostTable, Worker, WorkerArgs,
-        build_worker_args, cgroup_for_vhost, ensure_trusted_config, match_score, normalize_host,
-        normalize_server_name, parse_file_config, render_control_vhost, request_host,
-        resolve_identity, scan_vhost_files, select_route, trusted_write_mode, valid_control_name,
-        validate_index, validate_vhost_declarations, validate_vhost_waf_declarations,
-        worker_app_env, worker_request,
+        build_worker_args, cgroup_for_vhost, ensure_trusted_config, https_redirect_location,
+        match_score, normalize_host, normalize_server_name, parse_file_config,
+        render_control_vhost, request_host, resolve_identity, scan_vhost_files, select_route,
+        trusted_write_mode, valid_control_name, validate_index, validate_vhost_declarations,
+        validate_vhost_waf_declarations, worker_app_env, worker_request,
     };
     use crate::{
         config::{
@@ -2669,6 +2734,18 @@ mod tests {
         assert!(normalize_server_name("api.*.example.com").is_none());
     }
 
+    #[test]
+    fn https_redirect_location_formats_default_port_and_ipv6() {
+        assert_eq!(
+            https_redirect_location("example.test", 443, "/path?q=1"),
+            "https://example.test/path?q=1"
+        );
+        assert_eq!(
+            https_redirect_location("2001:db8::1", 8443, "/"),
+            "https://[2001:db8::1]:8443/"
+        );
+    }
+
     fn declaration(names: &[&str], is_default: bool) -> VhostFile {
         VhostFile {
             server_names: names.iter().map(|name| (*name).to_owned()).collect(),
@@ -2693,6 +2770,7 @@ mod tests {
             bot: None,
             tls_cert: None,
             tls_key: None,
+            https_redirect: None,
             default: is_default,
             modsecurity_disable_rules: Vec::new(),
             modsecurity_block_status: None,
@@ -3305,7 +3383,7 @@ mod tests {
         let (peer, local) = fuzz_support::addresses();
         let method = request.method().clone();
         let collected = fuzz_support::collect(async {
-            let router = Router::load(Arc::new(config), None, None, None)
+            let router = Router::load(Arc::new(config), None, None, None, None)
                 .await
                 .expect("fallback router loads");
             router.dispatch(request, peer, local).await
@@ -3333,6 +3411,7 @@ mod tests {
             Arc::new(Vhost {
                 names: names.iter().map(|name| (*name).to_owned()).collect(),
                 tls: None,
+                https_redirect: None,
                 #[cfg(feature = "acme")]
                 acme: false,
                 default,
