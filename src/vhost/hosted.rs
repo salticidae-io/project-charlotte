@@ -256,8 +256,10 @@ impl Worker {
             return Err(self.startup_failure(&mut child, &reason).into());
         }
         crate::log_debug!("Virtual-host worker {} is ready", child.id());
-        let handshake =
-            hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(stream)).await;
+        let handshake = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+            .adaptive_window(true)
+            .handshake(TokioIo::new(stream))
+            .await;
         let (sender, connection) = match handshake {
             Ok(handshake) => handshake,
             Err(error) => {
@@ -530,6 +532,16 @@ pub(super) fn build_worker_args(worker: WorkerArgs<'_>) -> Vec<OsString> {
         "--error-log-format".into(),
         error_log_format.into(),
     ];
+    let keepalive = crate::fastcgi::keepalive_limit();
+    if keepalive != crate::config::DEFAULT_FASTCGI_KEEPALIVE {
+        args.push("--fastcgi-keepalive".into());
+        args.push(keepalive.to_string().into());
+    }
+    let cache_ttl = crate::handler::static_cache_ttl().as_millis();
+    if cache_ttl != u128::from(crate::config::DEFAULT_STATIC_CACHE_TTL_MS) {
+        args.push("--static-cache-ttl-ms".into());
+        args.push(cache_ttl.to_string().into());
+    }
     for name in index {
         args.push("--index".into());
         args.push(name.into());
@@ -549,10 +561,8 @@ pub(super) fn build_worker_args(worker: WorkerArgs<'_>) -> Vec<OsString> {
                 args.push("--fastcgi-app-arg".into());
                 args.push(format!("{}={arg}", backend.extension).into());
             }
-            if app.max_workers != 1 {
-                args.push("--fastcgi-app-max-workers".into());
-                args.push(format!("{}={}", backend.extension, app.max_workers).into());
-            }
+            args.push("--fastcgi-app-max-workers".into());
+            args.push(format!("{}={}", backend.extension, app.max_workers).into());
             if app.min_workers != crate::config::DEFAULT_FASTCGI_APP_MIN_WORKERS {
                 args.push("--fastcgi-app-min-workers".into());
                 args.push(format!("{}={}", backend.extension, app.min_workers).into());
@@ -774,13 +784,15 @@ mod tests {
                 Ok::<_, Infallible>(Response::new(Full::new(Bytes::new())))
             });
             let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                .adaptive_window(true)
                 .serve_connection(TokioIo::new(peer), service)
                 .await;
         });
-        let (sender, connection) =
-            hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(client))
-                .await
-                .unwrap();
+        let (sender, connection) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+            .adaptive_window(true)
+            .handshake(TokioIo::new(client))
+            .await
+            .unwrap();
         tokio::spawn(connection);
         let child = Command::new("sleep").arg("60").spawn().unwrap();
 

@@ -260,6 +260,8 @@ fn server_config(
         .with_protocol_versions(versions)?
         .with_no_client_auth()
         .with_cert_resolver(resolver);
+    config.session_storage = rustls::server::ServerSessionMemoryCache::new(16_384);
+    config.ticketer = rustls::crypto::ring::Ticketer::new()?;
     config.alpn_protocols = alpn_protocols.to_vec();
     Ok(Arc::new(config))
 }

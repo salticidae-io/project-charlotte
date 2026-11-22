@@ -1,0 +1,67 @@
+# salticidae.io: reverse proxy to a local Node.js app, with ModSecurity and
+# bot detection that challenges suspicious clients.
+#
+#     project-charlotte --config /etc/charlotte/salticidae.io.yaml
+#
+# Install this file owned by root and not group/world-writable; the server
+# refuses to load untrusted configuration files.
+
+options:
+  bind: 0.0.0.0:80
+  tls_bind: 0.0.0.0:443
+  http3_bind: 0.0.0.0:443
+  user: charlotte
+  group: charlotte
+
+  # Certificates for salticidae.io are issued and renewed over HTTP-01.
+  acme_directory: letsencrypt
+  acme_cache: /var/lib/charlotte/acme
+  acme_contact: mailto:hostmaster@salticidae.io
+
+  # ModSecurity rules apply to every request before it reaches the app.
+  # Point this at your ruleset, e.g. a modsecurity.conf that includes OWASP CRS.
+  modsecurity_rules: [/etc/charlotte/modsecurity/main.conf]
+  modsecurity_block_status: 403
+
+  # Enables the built-in bot policy; the vhost below refines it.
+  bot_detection: true
+
+  access_log_file: /var/log/charlotte/access.log
+  access_log_format: combined
+  error_log_file: /var/log/charlotte/error.log
+
+vhost:
+  - server_names: [salticidae.io, www.salticidae.io]
+
+    # The Node.js app (e.g. `node server.js` listening on 127.0.0.1:3000).
+    # Charlotte adds X-Forwarded-For/-Proto/-Host; preserve Host so the app
+    # sees the public name.
+    proxy_pass: http://127.0.0.1:3000
+    proxy_preserve_host: true
+    proxy_timeout: 60
+
+    acme: true
+    default: true
+
+    # Enforce mode with challenges enabled: scores at or above
+    # challenge_threshold receive the JavaScript proof-of-work challenge,
+    # scores at or above block_threshold are rejected outright.
+    bot:
+      mode: enforce
+      challenge: true
+      challenge_threshold: 40
+      block_threshold: 80
+      challenge_difficulty: 16
+      challenge_ttl: 3600
+      verify_crawlers: true
+      # Health checks and machine clients the app exposes should not be
+      # challenged.
+      exempt_paths: [/health, /robots.txt]
+      honeypot_paths: [/wp-login.php, /.env, /xmlrpc.php]
+      honeypot_ban: 3600
+
+    # Uncomment to silence individual ModSecurity rules for this host only.
+    # modsecurity_disable_rules: [920350]
+
+    access_log: /var/log/charlotte/salticidae.io-access.log
+    error_log: /var/log/charlotte/salticidae.io-error.log

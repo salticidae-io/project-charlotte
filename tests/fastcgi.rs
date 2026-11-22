@@ -22,6 +22,7 @@ use tokio::{
 };
 
 static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
+static BACKEND_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
 static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 struct Fixture {
@@ -34,6 +35,10 @@ struct Fixture {
 
 impl Fixture {
     async fn tcp(timeout_seconds: u64, start_backend: bool) -> Self {
+        Self::tcp_with_args(timeout_seconds, start_backend, &[]).await
+    }
+
+    async fn tcp_with_args(timeout_seconds: u64, start_backend: bool, extra: &[&str]) -> Self {
         let serial_guard = TEST_LOCK.lock().await;
         let root = create_document_root();
         create_documents(&root);
@@ -43,8 +48,9 @@ impl Fixture {
         let backend_task = if start_backend {
             Some(tokio::spawn(async move {
                 while let Ok((mut stream, _)) = backend_listener.accept().await {
+                    BACKEND_CONNECTIONS.fetch_add(1, Ordering::SeqCst);
                     tokio::spawn(async move {
-                        serve_mock_request(&mut stream).await;
+                        serve_mock_connection(&mut stream).await;
                     });
                 }
             }))
@@ -57,6 +63,7 @@ impl Fixture {
             &root,
             &format!("127.0.0.1:{}", backend_address.port()),
             timeout_seconds,
+            extra,
         )
         .await;
 
@@ -81,12 +88,13 @@ impl Fixture {
         let backend_task = tokio::spawn(async move {
             while let Ok((mut stream, _)) = backend_listener.accept().await {
                 tokio::spawn(async move {
-                    serve_mock_request(&mut stream).await;
+                    serve_mock_connection(&mut stream).await;
                 });
             }
         });
         let backend_address = format!("unix:{}", socket_path.display());
-        let (server, server_address) = start_server(&root, &backend_address, timeout_seconds).await;
+        let (server, server_address) =
+            start_server(&root, &backend_address, timeout_seconds, &[]).await;
 
         Self {
             root,
@@ -134,6 +142,7 @@ async fn start_server(
     root: &std::path::Path,
     backend_address: &str,
     timeout_seconds: u64,
+    extra: &[&str],
 ) -> (Child, std::net::SocketAddr) {
     let server_address = common::reserve_tcp_address();
 
@@ -149,6 +158,7 @@ async fn start_server(
         .arg(format!("php={backend_address}"))
         .arg("--fastcgi-timeout")
         .arg(timeout_seconds.to_string())
+        .args(extra)
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     let mut child = common::spawn(&mut command).unwrap();
@@ -277,11 +287,35 @@ fn decode_chunked_body(mut input: &[u8]) -> Vec<u8> {
     body
 }
 
-async fn serve_mock_request<S>(stream: &mut S)
+/// Serves requests on one backend connection. Like php-fpm, it keeps the
+/// connection open for another request only when FCGI_KEEP_CONN was set.
+async fn serve_mock_connection<S>(stream: &mut S)
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let (params, stdin) = read_fastcgi_request(stream).await.unwrap();
+    loop {
+        let Ok((params, stdin, keep_conn)) = read_fastcgi_request(stream).await else {
+            return;
+        };
+        let close = params
+            .get("QUERY_STRING")
+            .is_some_and(|query| query.contains("mode=close"));
+        serve_mock_request(stream, params, stdin).await;
+        if close {
+            return;
+        }
+        if !keep_conn {
+            let mut remaining = Vec::new();
+            let _ = stream.read_to_end(&mut remaining).await;
+            return;
+        }
+    }
+}
+
+async fn serve_mock_request<S>(stream: &mut S, params: HashMap<String, String>, stdin: Vec<u8>)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let query = params.get("QUERY_STRING").map(String::as_str).unwrap_or("");
     if query.contains("mode=slow") {
         sleep(Duration::from_secs(3)).await;
@@ -322,18 +356,19 @@ where
     write_fastcgi_record(stream, 6, 1, &[]).await.unwrap();
     write_fastcgi_record(stream, 3, 1, &[0; 8]).await.unwrap();
     let _ = stream.flush().await;
-    let mut remaining = Vec::new();
-    let _ = stream.read_to_end(&mut remaining).await;
 }
 
 fn parameter<'a>(params: &'a HashMap<String, String>, name: &str) -> &'a str {
     params.get(name).map(String::as_str).unwrap_or("<missing>")
 }
 
-async fn read_fastcgi_request<S>(stream: &mut S) -> io::Result<(HashMap<String, String>, Vec<u8>)>
+async fn read_fastcgi_request<S>(
+    stream: &mut S,
+) -> io::Result<(HashMap<String, String>, Vec<u8>, bool)>
 where
     S: AsyncRead + Unpin,
 {
+    let mut keep_conn = false;
     let mut encoded_params = Vec::new();
     let mut params_done = false;
     let mut stdin = Vec::new();
@@ -353,6 +388,7 @@ where
             stream.read_exact(&mut padding).await?;
         }
         match record_type {
+            1 => keep_conn = content.get(2).is_some_and(|flags| flags & 1 != 0),
             4 if content.is_empty() => params_done = true,
             4 => encoded_params.extend_from_slice(&content),
             5 if content.is_empty() && params_done => break,
@@ -360,7 +396,7 @@ where
             _ => {}
         }
     }
-    Ok((decode_params(&encoded_params), stdin))
+    Ok((decode_params(&encoded_params), stdin, keep_conn))
 }
 
 fn decode_params(mut input: &[u8]) -> HashMap<String, String> {
@@ -590,4 +626,54 @@ async fn static_fallback_methods_and_traversal_remain_unchanged() {
 
     let traversal = request(fixture.server_address, "GET", "/../Cargo.toml", &[], b"").await;
     assert!(matches!(traversal.status, 400 | 404));
+}
+
+#[tokio::test]
+async fn reuses_keep_alive_backend_connections() {
+    let fixture = Fixture::tcp(5, true).await;
+    BACKEND_CONNECTIONS.store(0, Ordering::SeqCst);
+    for query in ["first", "second", "third"] {
+        let response = request(
+            fixture.server_address,
+            "GET",
+            &format!("/script.php?{query}"),
+            &[],
+            b"",
+        )
+        .await;
+        assert_eq!(response.status, 200);
+        assert!(String::from_utf8_lossy(&response.body).contains(&format!("query={query}")));
+    }
+    assert_eq!(BACKEND_CONNECTIONS.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn keep_alive_can_be_disabled() {
+    let fixture = Fixture::tcp_with_args(5, true, &["--fastcgi-keepalive", "0"]).await;
+    BACKEND_CONNECTIONS.store(0, Ordering::SeqCst);
+    for _ in 0..2 {
+        let response = request(fixture.server_address, "GET", "/script.php", &[], b"").await;
+        assert_eq!(response.status, 200);
+    }
+    assert_eq!(BACKEND_CONNECTIONS.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn retries_when_backend_closed_a_pooled_connection() {
+    let fixture = Fixture::tcp(5, true).await;
+    BACKEND_CONNECTIONS.store(0, Ordering::SeqCst);
+    let response = request(
+        fixture.server_address,
+        "GET",
+        "/script.php?mode=close",
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(response.status, 200);
+    sleep(Duration::from_millis(50)).await;
+    let response = request(fixture.server_address, "GET", "/script.php?after", &[], b"").await;
+    assert_eq!(response.status, 200);
+    assert!(String::from_utf8_lossy(&response.body).contains("query=after"));
+    assert_eq!(BACKEND_CONNECTIONS.load(Ordering::SeqCst), 2);
 }

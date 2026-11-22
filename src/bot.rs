@@ -402,7 +402,7 @@ struct TtlEntry<T> {
 pub(crate) struct BotState {
     key: hmac::Key,
     bans: Vec<Mutex<HashMap<IpAddr, TtlEntry<()>>>>,
-    crawlers: Vec<Mutex<HashMap<(IpAddr, &'static str), TtlEntry<CrawlerCheck>>>>,
+    crawlers: Arc<Vec<Mutex<HashMap<(IpAddr, &'static str), TtlEntry<CrawlerCheck>>>>>,
     crawler_dns_slots: Arc<Semaphore>,
     traffic: TrafficMeter,
 }
@@ -418,9 +418,11 @@ impl BotState {
             bans: (0..CACHE_SHARDS)
                 .map(|_| Mutex::new(HashMap::new()))
                 .collect(),
-            crawlers: (0..CACHE_SHARDS)
-                .map(|_| Mutex::new(HashMap::new()))
-                .collect(),
+            crawlers: Arc::new(
+                (0..CACHE_SHARDS)
+                    .map(|_| Mutex::new(HashMap::new()))
+                    .collect(),
+            ),
             crawler_dns_slots: Arc::new(Semaphore::new(16)),
             traffic: TrafficMeter::new(),
         }))
@@ -468,50 +470,14 @@ impl BotState {
         let shard = self.shard(ip);
         let key = (ip, suffix);
         let now = Instant::now();
-        {
-            let mut cache = self.crawlers[shard]
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            cache.retain(|_, entry| entry.expires > now);
-            if let Some(entry) = cache.get(&key) {
-                return entry.value;
-            }
-        }
-
-        let lookup = tokio::time::timeout(Duration::from_secs(2), async {
-            let permit = Arc::clone(&self.crawler_dns_slots)
-                .try_acquire_owned()
-                .ok()?;
-            let reverse_ip = ip;
-            let (hostname, _permit) =
-                tokio::task::spawn_blocking(move || (dns_lookup::lookup_addr(&reverse_ip), permit))
-                    .await
-                    .ok()?;
-            let hostname = hostname.ok()?;
-            let hostname = hostname.trim_end_matches('.').to_ascii_lowercase();
-            if !hostname.ends_with(suffix) {
-                return Some(false);
-            }
-            let mut addresses = tokio::net::lookup_host((hostname.as_str(), 80))
-                .await
-                .ok()?;
-            Some(addresses.any(|address| address.ip() == ip))
-        })
-        .await;
-        let check = match lookup {
-            Ok(Some(true)) => CrawlerCheck::Verified,
-            Ok(Some(false)) => CrawlerCheck::Impostor,
-            Ok(None) | Err(_) => CrawlerCheck::Error,
-        };
-        let ttl = if check == CrawlerCheck::Error {
-            Duration::from_secs(60)
-        } else {
-            Duration::from_secs(3600)
-        };
         let mut cache = self.crawlers[shard]
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         cache.retain(|_, entry| entry.expires > now);
+        if let Some(entry) = cache.get(&key) {
+            return entry.value;
+        }
+        let pending_ttl = Duration::from_secs(5);
         if cache.len() >= CACHE_CAPACITY {
             if let Some(key) = cache.keys().next().copied() {
                 cache.remove(&key);
@@ -520,11 +486,68 @@ impl BotState {
         cache.insert(
             key,
             TtlEntry {
-                expires: now + ttl,
-                value: check,
+                expires: now + pending_ttl,
+                value: CrawlerCheck::Error,
             },
         );
-        check
+        drop(cache);
+
+        let Some(permit) = Arc::clone(&self.crawler_dns_slots).try_acquire_owned().ok() else {
+            return CrawlerCheck::Error;
+        };
+        let crawlers = Arc::clone(&self.crawlers);
+        tokio::spawn(async move {
+            let check = tokio::time::timeout(Duration::from_secs(2), async move {
+                let reverse_ip = ip;
+                let (hostname, _permit) = tokio::task::spawn_blocking(move || {
+                    (dns_lookup::lookup_addr(&reverse_ip), permit)
+                })
+                .await
+                .ok()?;
+                let hostname = hostname.ok()?;
+                let hostname = hostname.trim_end_matches('.').to_ascii_lowercase();
+                if !hostname.ends_with(suffix) {
+                    return Some(false);
+                }
+                let mut addresses = tokio::net::lookup_host((hostname.as_str(), 80))
+                    .await
+                    .ok()?;
+                Some(addresses.any(|address| address.ip() == ip))
+            })
+            .await;
+            let check = match check {
+                Ok(Some(true)) => CrawlerCheck::Verified,
+                Ok(Some(false)) => CrawlerCheck::Impostor,
+                Ok(None) | Err(_) => CrawlerCheck::Error,
+            };
+            let now = Instant::now();
+            let ttl = if check == CrawlerCheck::Error {
+                Duration::from_secs(60)
+            } else {
+                Duration::from_secs(3600)
+            };
+            let shard = match ip {
+                IpAddr::V4(ip) => usize::from(ip.octets()[3]) % CACHE_SHARDS,
+                IpAddr::V6(ip) => usize::from(ip.octets()[15]) % CACHE_SHARDS,
+            };
+            let mut cache = crawlers[shard]
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            cache.retain(|_, entry| entry.expires > now);
+            if cache.len() >= CACHE_CAPACITY {
+                if let Some(key) = cache.keys().next().copied() {
+                    cache.remove(&key);
+                }
+            }
+            cache.insert(
+                (ip, suffix),
+                TtlEntry {
+                    expires: now + ttl,
+                    value: check,
+                },
+            );
+        });
+        CrawlerCheck::Error
     }
 
     fn signature(&self, data: &[u8]) -> String {
@@ -1089,6 +1112,31 @@ mod tests {
                 value,
             },
         );
+    }
+
+    #[tokio::test]
+    async fn crawler_cache_miss_returns_without_waiting_for_dns_capacity() {
+        let state = BotState::new().unwrap();
+        let permits = (0..16)
+            .map(|_| state.crawler_dns_slots.clone().try_acquire_owned().unwrap())
+            .collect::<Vec<_>>();
+        let ip = IpAddr::from([192, 0, 2, 1]);
+        let started = Instant::now();
+
+        assert_eq!(
+            state.crawler_check(ip, ".googlebot.com").await,
+            CrawlerCheck::Error
+        );
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert_eq!(
+            state.crawlers[state.shard(ip)]
+                .lock()
+                .unwrap()
+                .get(&(ip, ".googlebot.com"))
+                .map(|entry| entry.value),
+            Some(CrawlerCheck::Error)
+        );
+        drop(permits);
     }
 
     fn signed_cookie(state: &BotState, ip: IpAddr, expires: u64) -> String {

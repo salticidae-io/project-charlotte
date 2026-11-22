@@ -1,13 +1,18 @@
 //! Request handling for static files, listings, ranges, and validators.
 
 use std::{
+    collections::HashMap,
     convert::Infallible,
     fmt::Write as _,
     fs as std_fs,
     io::{self, Read, Seek, SeekFrom as StdSeekFrom},
     net::SocketAddr,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
 use bytes::Bytes;
@@ -36,6 +41,101 @@ pub(crate) use crate::response::{
 };
 
 const SMALL_FILE_LIMIT: u64 = 64 * 1024;
+const STATIC_CACHE_MAX_ENTRIES: usize = 1024;
+const STATIC_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
+
+static STATIC_CACHE_TTL_MS: AtomicU64 = AtomicU64::new(crate::config::DEFAULT_STATIC_CACHE_TTL_MS);
+static STATIC_CACHE: OnceLock<Mutex<StaticCache>> = OnceLock::new();
+
+type StaticCacheKey = (PathBuf, PathBuf, bool);
+
+#[derive(Clone)]
+struct CachedFile {
+    path: PathBuf,
+    contents: Bytes,
+    modified: DateTime<Utc>,
+    cached: Instant,
+}
+
+#[derive(Default)]
+struct StaticCache {
+    entries: HashMap<StaticCacheKey, CachedFile>,
+    bytes: usize,
+}
+
+/// Records the server-wide static cache lifetime that is passed on to vhost
+/// workers. Zero also drops everything cached so far.
+pub(crate) fn set_static_cache_ttl(ttl: Duration) {
+    STATIC_CACHE_TTL_MS.store(
+        u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
+    if ttl.is_zero()
+        && let Some(cache) = STATIC_CACHE.get()
+    {
+        let mut cache = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.entries.clear();
+        cache.bytes = 0;
+    }
+}
+
+pub(crate) fn static_cache_ttl() -> Duration {
+    Duration::from_millis(STATIC_CACHE_TTL_MS.load(Ordering::Relaxed))
+}
+
+fn static_cache() -> &'static Mutex<StaticCache> {
+    STATIC_CACHE.get_or_init(|| Mutex::new(StaticCache::default()))
+}
+
+fn cached_static_file(key: &StaticCacheKey, ttl: Duration) -> Option<CachedFile> {
+    if ttl.is_zero() {
+        return None;
+    }
+    let mut cache = static_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let entry = cache.entries.get(key)?;
+    if entry.cached.elapsed() < ttl {
+        return Some(entry.clone());
+    }
+    if let Some(entry) = cache.entries.remove(key) {
+        cache.bytes -= entry.contents.len();
+    }
+    None
+}
+
+fn cache_static_file(key: StaticCacheKey, file: CachedFile, ttl: Duration) {
+    if ttl.is_zero() {
+        return;
+    }
+    let mut cache = static_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if cache.entries.len() >= STATIC_CACHE_MAX_ENTRIES
+        || cache.bytes + file.contents.len() > STATIC_CACHE_MAX_BYTES
+    {
+        cache
+            .entries
+            .retain(|_, entry| entry.cached.elapsed() < ttl);
+        cache.bytes = cache
+            .entries
+            .values()
+            .map(|entry| entry.contents.len())
+            .sum();
+        if cache.entries.len() >= STATIC_CACHE_MAX_ENTRIES
+            || cache.bytes + file.contents.len() > STATIC_CACHE_MAX_BYTES
+        {
+            cache.entries.clear();
+            cache.bytes = 0;
+        }
+    }
+    cache.bytes += file.contents.len();
+    if let Some(previous) = cache.entries.insert(key, file) {
+        cache.bytes -= previous.contents.len();
+    }
+}
 
 enum StaticResolution {
     NotFound,
@@ -265,6 +365,21 @@ where
         None => return error_response(StatusCode::NOT_FOUND, "Not found\n"),
     };
     let raw_path_is_dir = raw_path.ends_with('/');
+    let cacheable = matches!(*request.method(), Method::GET | Method::HEAD);
+    let cache_key = (config.root.clone(), relative_path.clone(), raw_path_is_dir);
+    let cache_ttl = config.static_cache_ttl;
+    if cacheable && let Some(cached) = cached_static_file(&cache_key, cache_ttl) {
+        let length = cached.contents.len() as u64;
+        return serve_file(
+            request,
+            &cached.path,
+            None,
+            length,
+            cached.modified,
+            Some(cached.contents),
+        )
+        .await;
+    }
     let read_small = request.method() == Method::GET;
     let blocking_config = Arc::clone(config);
     let resolution = tokio::task::spawn_blocking(move || {
@@ -302,7 +417,28 @@ where
             metadata,
             path,
             contents,
-        }) => serve_file(request, &path, file, metadata, contents).await,
+        }) => {
+            let length = metadata.len();
+            let modified = metadata
+                .modified()
+                .map(DateTime::<Utc>::from)
+                .unwrap_or(DateTime::<Utc>::UNIX_EPOCH);
+            if let Some(contents) = &contents
+                && contents.len() as u64 == length
+            {
+                cache_static_file(
+                    cache_key,
+                    CachedFile {
+                        path: path.clone(),
+                        contents: contents.clone(),
+                        modified,
+                        cached: Instant::now(),
+                    },
+                    cache_ttl,
+                );
+            }
+            serve_file(request, &path, Some(file), length, modified, contents).await
+        }
         Ok(StaticResolution::NotFound) | Err(_) => {
             error_response(StatusCode::NOT_FOUND, "Not found\n")
         }
@@ -414,18 +550,14 @@ fn open_static_file(
 async fn serve_file<B>(
     request: &Request<B>,
     path: &Path,
-    file: std_fs::File,
-    metadata: std_fs::Metadata,
+    file: Option<std_fs::File>,
+    length: u64,
+    modified: DateTime<Utc>,
     contents: Option<Bytes>,
 ) -> Response<ResponseBody>
 where
     B: Body<Data = Bytes>,
 {
-    let length = metadata.len();
-    let modified = metadata
-        .modified()
-        .map(DateTime::<Utc>::from)
-        .unwrap_or(DateTime::<Utc>::UNIX_EPOCH);
     let modified_secs = modified.timestamp().max(0);
     let etag = format!("\"{:x}-{:x}\"", length, modified_secs);
     let last_modified = format_http_date(modified);
@@ -476,6 +608,9 @@ where
     } else if let Some(contents) = contents {
         full_body(contents.slice(start as usize..(end + 1) as usize))
     } else {
+        let Some(file) = file else {
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Unable to read file\n");
+        };
         let mut file = File::from_std(file);
         if start > 0 && file.seek(SeekFrom::Start(start)).await.is_err() {
             return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Unable to read file\n");
@@ -845,6 +980,37 @@ mod tests {
                 .as_path(),
             Path::new(".well-known/security.txt")
         );
+    }
+
+    #[tokio::test]
+    async fn small_static_files_are_cached_until_the_ttl_expires() {
+        let root = temp_root().await;
+        tokio::fs::write(root.join("cached.txt"), "first")
+            .await
+            .unwrap();
+        let mut config = try_files_config(root.clone(), &[]);
+        config.static_cache_ttl = std::time::Duration::from_millis(200);
+        let config = Arc::new(config);
+        let fetch = || async {
+            let request = http::Request::builder()
+                .uri("/cached.txt")
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+            let (peer, local) = fuzz_support::addresses();
+            let response = super::handle_request(request, Arc::clone(&config), peer, local).await;
+            assert_eq!(response.status(), http::StatusCode::OK);
+            response.into_body().collect().await.unwrap().to_bytes()
+        };
+
+        assert_eq!(fetch().await, Bytes::from_static(b"first"));
+        tokio::fs::write(root.join("cached.txt"), "second!")
+            .await
+            .unwrap();
+        assert_eq!(fetch().await, Bytes::from_static(b"first"));
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        assert_eq!(fetch().await, Bytes::from_static(b"second!"));
+
+        tokio::fs::remove_dir_all(root).await.unwrap();
     }
 
     #[tokio::test]

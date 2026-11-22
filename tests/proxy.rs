@@ -92,6 +92,10 @@ impl Fixture {
         let http_upstream_address = http_upstream.local_addr().unwrap();
         let http_task = spawn_http_upstream(http_upstream);
 
+        let h2c_upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let h2c_upstream_address = h2c_upstream.local_addr().unwrap();
+        let h2c_task = spawn_h2c_upstream(h2c_upstream);
+
         let tls_upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let tls_upstream_address = tls_upstream.local_addr().unwrap();
         let tls_server_config = rustls::ServerConfig::builder()
@@ -111,7 +115,7 @@ impl Fixture {
         std::fs::write(
             &config_path,
             format!(
-                "vhost:\n  - server_names: [plain.example.test]\n    proxy_pass: \"http://{http_upstream_address}/base\"\n  - server_names: [h2.example.test]\n    proxy_pass: \"https://localhost:{}/secure\"\n    proxy_ca_root: upstream-ca.pem\n  - server_names: [h3.example.test]\n    proxy_pass: \"https://localhost:{}/secure\"\n    proxy_ca_root: upstream-ca.pem\n  - server_names: [upstream-host.example.test]\n    proxy_pass: \"http://{http_upstream_address}/override\"\n    proxy_preserve_host: false\n  - server_names: [timeout.example.test]\n    proxy_pass: \"http://{http_upstream_address}/base\"\n    proxy_timeout: 1\n  - server_names: [unreachable.example.test]\n    proxy_pass: \"http://{dead_address}\"\n",
+                "vhost:\n  - server_names: [plain.example.test]\n    proxy_pass: \"http://{http_upstream_address}/base\"\n  - server_names: [h2.example.test]\n    proxy_pass: \"https://localhost:{}/secure\"\n    proxy_ca_root: upstream-ca.pem\n  - server_names: [h3.example.test]\n    proxy_pass: \"https://localhost:{}/secure\"\n    proxy_ca_root: upstream-ca.pem\n  - server_names: [h2c.example.test]\n    proxy_pass: \"http://{h2c_upstream_address}/cleartext\"\n    proxy_http2: true\n  - server_names: [upstream-host.example.test]\n    proxy_pass: \"http://{http_upstream_address}/override\"\n    proxy_preserve_host: false\n  - server_names: [timeout.example.test]\n    proxy_pass: \"http://{http_upstream_address}/base\"\n    proxy_timeout: 1\n  - server_names: [unreachable.example.test]\n    proxy_pass: \"http://{dead_address}\"\n",
                 tls_upstream_address.port(),
                 tls_upstream_address.port(),
             ),
@@ -158,7 +162,7 @@ impl Fixture {
             http3_only,
             certificate,
             server,
-            backend_tasks: vec![http_task, tls_task],
+            backend_tasks: vec![http_task, h2c_task, tls_task],
             _serial_guard: serial_guard,
         };
         fixture.wait_until_ready().await;
@@ -283,6 +287,19 @@ async fn proxies_http1_http2_http3_and_handles_upstream_failures() {
     assert!(body.contains("proto=https"), "{body}");
     assert!(body.ends_with("body=h2 body"), "{body}");
 
+    let response = http1_request(
+        fixture.http_address,
+        "GET",
+        "/item",
+        "h2c.example.test",
+        &[],
+        b"",
+    )
+    .await;
+    assert_eq!(response.status, 200);
+    let body = String::from_utf8(response.body).unwrap();
+    assert!(body.contains("path=/cleartext/item"), "{body}");
+
     #[cfg(feature = "http3")]
     {
         let response = h3_request(&fixture, "/item?q=three", b"h3 body").await;
@@ -361,6 +378,23 @@ fn spawn_http_upstream(listener: TcpListener) -> JoinHandle<()> {
                 let service = hyper::service::service_fn(echo_upstream);
                 let builder = auto::Builder::new(TokioExecutor::new());
                 let _ = builder
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    })
+}
+
+fn spawn_h2c_upstream(listener: TcpListener) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let service = hyper::service::service_fn(echo_upstream);
+                let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                    .adaptive_window(true)
                     .serve_connection(TokioIo::new(stream), service)
                     .await;
             });

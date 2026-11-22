@@ -204,6 +204,8 @@ see all command-line options. Common options include:
 | `--bot-config FILE` | Load bot-detection settings from YAML; enables detection and overrides the defaults. |
 | `--bot-busy-threshold RATE` | Apply the global bot policy only when server traffic reaches a rate such as `100/s`; requires `--bot-detection` or `--bot-config`. |
 | `--fastcgi EXT=ADDR` | Route a file extension to a FastCGI TCP or Unix-socket backend. |
+| `--fastcgi-keepalive N` | Idle keep-alive connections kept per FastCGI TCP/Unix backend (0–1024, default 8; 0 opens a connection per request). |
+| `--static-cache-ttl-ms MS` | Keep static files of up to 64 KiB in memory for this long (0–3,600,000 ms, default 1000; 0 disables the cache). |
 | `--cgi EXT[=INTERPRETER]` | Execute matching scripts directly or with an interpreter; repeatable. |
 | `--fastcgi-app EXT=PROGRAM` | Start and supervise a FastCGI application for an extension. |
 | `--fastcgi-app-max-workers EXT=N` | Set the FastCGI app pool limit (1–256); defaults to the CPU count, capped at 8. |
@@ -244,6 +246,28 @@ append `X-Forwarded-For`; trusting arbitrary clients lets them spoof their
 address for rate limiting and access logs. `--access-log` writes the resolved
 client address and direct peer address, request line, status, host, and user
 agent to stdout; quotes, backslashes, and control characters are escaped.
+
+### Swarm access checks
+
+The optional `swarm` feature checks each resolved client IP against the Redis
+data populated by logchomper's `redis-accessproxy`. Enable it with
+`--swarm-redis URL` (or `swarm_redis` in the main config's `options` mapping).
+The default vhost threshold is 1000; `--swarm-vhost-threshold` can override it.
+Other `--swarm-*` options configure a second Redis URL for customer
+blocklists, classification thresholds, whitelist CIDRs, the machine blocklist
+key, the Redis timeout, and cache lifetimes. See `project-charlotte --help`
+for the complete option list.
+
+Charlotte reads, but does not write, logchomper's keys: `<ip>_vhosts`,
+`<HHMM>_hits`, `<HHMM>_<ip>_classes`, `blocklist:global`, and the configured
+machine key. A local Redis instance can provide `customer_blocklist_<ip>`
+entries; these return `403`, while other blocks return `429` with a
+`block-reason` header. The client address honors `--trusted-proxy`, and a vhost
+can opt out with `swarm: false`. Redis connection errors and timeouts fail open;
+the failed Redis instance is temporarily skipped. Nftables allow/deny sets and
+traffic recording are not implemented here—logchomper remains responsible
+for populating the shared data. This feature is included in the default build;
+builds without it reject `--swarm-*` options and vhost `swarm` settings.
 
 ### Logging
 
@@ -428,7 +452,10 @@ it. The checks run in this order:
    and resolve forward to the same IP. A verified crawler is allowed unless a
    deny rule matched; an impostor adds 100. Lookups time out after 2 seconds,
    at most 16 run at once, and results are cached for an hour (60 seconds after
-   a lookup error, which adds nothing to the score).
+   a lookup error, which adds nothing to the score). Lookups run in the
+   background: the request that triggers one is scored as a lookup error and
+   is never held up by a slow resolver, and later requests from that address
+   use the cached verdict.
 
 #### What happens next
 
@@ -761,10 +788,32 @@ PEM CA bundle; that path is relative to the YAML file. Request bodies and
 upstream response bodies are streamed. Upstream sockets use `TCP_NODELAY` and,
 on Linux, `TCP_QUICKACK` after each read, so a backend that leaves Nagle's
 algorithm on is not held back by delayed acknowledgements (about 40 ms per
-response on a reused connection). Charlotte removes hop-by-hop headers and
+response on a reused connection). Up to 64 idle upstream connections per host
+are kept for 90 seconds. Set `proxy_http2: true` to speak HTTP/2 only to the
+upstream; for an `http://` upstream that means prior-knowledge cleartext
+HTTP/2 (h2c), which multiplexes requests over one connection. Charlotte removes hop-by-hop headers and
 sets `X-Forwarded-For`, `X-Forwarded-Proto`, and `X-Forwarded-Host`. Connection
 upgrades, WebSockets, and CONNECT tunnelling are not supported; upstream
 connection failures return 502 and response-header timeouts return 504.
+
+### Performance notes
+
+- Log files are written by a background thread per file, in batches with one
+  flush per batch, so a slow disk does not stall request threads. A full queue
+  (8,192 lines) makes writers wait rather than drop lines, and every queued line
+  is flushed when the server exits. Logs to stdout and stderr stay synchronous.
+- TLS listeners keep a 16,384-entry session cache and issue session tickets,
+  so returning clients resume without a full handshake.
+- HTTP/2 connections, from clients and to hosted workers, use adaptive
+  flow-control windows; clients may open up to 256 concurrent streams.
+- FastCGI TCP and Unix-socket backends reuse connections (`FCGI_KEEP_CONN`).
+  A connection is pooled again only after its response was read in full, idle
+  connections are dropped after 30 seconds, and a request whose pooled
+  connection was closed by the backend is retried once on a new connection.
+  Server-managed FastCGI apps are not affected.
+- Static files of up to 64 KiB are cached in memory for `--static-cache-ttl-ms`
+  (1 second by default; at most 1,024 files and 32 MiB). A change to a file can
+  therefore take up to that long to be served.
 
 ### HTTP/3-only reverse proxy
 

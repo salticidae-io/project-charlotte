@@ -173,6 +173,7 @@ impl ReverseProxy {
     pub(crate) fn new(
         upstream: &str,
         preserve_host: bool,
+        http2_only: bool,
         timeout: Duration,
         ca_root: Option<&Path>,
     ) -> Result<Self, Box<dyn Error + Send + Sync>> {
@@ -208,7 +209,11 @@ impl ReverseProxy {
             .wrap_connector(QuickAckConnector {
                 inner: http_connector,
             });
-        let client = Client::builder(TokioExecutor::new()).build::<_, ProxyRequestBody>(connector);
+        let client = Client::builder(TokioExecutor::new())
+            .pool_idle_timeout(Duration::from_secs(90))
+            .pool_max_idle_per_host(64)
+            .http2_only(http2_only)
+            .build::<_, ProxyRequestBody>(connector);
 
         Ok(Self {
             client,
@@ -369,12 +374,20 @@ mod tests {
     #[test]
     fn validates_upstream_urls() {
         assert!(
-            ReverseProxy::new("ftp://example.test", true, Duration::from_secs(1), None).is_err()
+            ReverseProxy::new(
+                "ftp://example.test",
+                true,
+                false,
+                Duration::from_secs(1),
+                None
+            )
+            .is_err()
         );
         assert!(
             ReverseProxy::new(
                 "http://example.test/path?query=1",
                 true,
+                false,
                 Duration::from_secs(1),
                 None
             )
@@ -384,6 +397,7 @@ mod tests {
             ReverseProxy::new(
                 "http://user@example.test",
                 true,
+                false,
                 Duration::from_secs(1),
                 None
             )
@@ -415,6 +429,7 @@ mod tests {
         let proxy = ReverseProxy::new(
             "http://upstream.test/base/",
             true,
+            false,
             Duration::from_secs(1),
             None,
         )

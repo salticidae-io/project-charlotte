@@ -31,6 +31,8 @@ mod proxy;
 mod ratelimit;
 mod reload;
 mod response;
+#[cfg(feature = "swarm")]
+mod swarm;
 mod tls;
 mod vhost;
 mod waf;
@@ -196,6 +198,11 @@ pub fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     }
     #[cfg(feature = "hosting")]
     let mut config = config;
+    #[cfg(feature = "hosting")]
+    {
+        fastcgi::set_keepalive_limit(config.fastcgi_keepalive);
+        handler::set_static_cache_ttl(config.static_cache_ttl);
+    }
     #[cfg(not(feature = "hosting"))]
     let config = config;
 
@@ -299,6 +306,7 @@ pub fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
             crate::log_error!("Startup failed: {error}");
         }
     }
+    logging::flush_logs();
     startup_result
 }
 
@@ -667,11 +675,13 @@ where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let io = TokioIo::new(stream);
+    let alt_svc = alt_svc_port.and_then(|port| format!("h3=\":{port}\"").parse().ok());
     let (request_seen, mut first_request) = watch::channel(false);
     let service = service_fn(move |mut request: Request<hyper::body::Incoming>| {
         let router = Arc::clone(&router);
         let sni = sni.clone();
         let fingerprint = fingerprint.clone();
+        let alt_svc = alt_svc.clone();
         request_seen.send_replace(true);
         async move {
             if let Some(sni) = sni {
@@ -681,9 +691,7 @@ where
                 request.extensions_mut().insert(TlsFingerprint(fingerprint));
             }
             let mut response = router.dispatch(request, peer, local).await;
-            if let Some(port) = alt_svc_port
-                && let Ok(value) = format!("h3=\":{port}\"").parse()
-            {
+            if let Some(value) = alt_svc {
                 response.headers_mut().insert(http::header::ALT_SVC, value);
             }
             Ok::<_, std::convert::Infallible>(response)
@@ -699,6 +707,8 @@ where
     builder
         .http2()
         .timer(TokioTimer::new())
+        .adaptive_window(true)
+        .max_concurrent_streams(256)
         .keep_alive_interval(HTTP2_KEEP_ALIVE_INTERVAL)
         .keep_alive_timeout(HTTP2_KEEP_ALIVE_TIMEOUT);
     let mut connection = Box::pin(builder.serve_connection(io, service));

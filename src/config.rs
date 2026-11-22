@@ -10,6 +10,8 @@
 
 #[cfg(feature = "hosting")]
 use crate::cgroup::CgroupSpec;
+#[cfg(feature = "swarm")]
+use crate::swarm::SwarmConfig;
 use crate::{
     bot::{BotPolicy, BotPolicyFile},
     forwarded::TrustedProxy,
@@ -75,12 +77,16 @@ pub struct Config {
     pub try_files: Vec<String>,
     pub fastcgi: Vec<FastCgiBackend>,
     pub fastcgi_timeout: Duration,
+    pub fastcgi_keepalive: usize,
+    pub static_cache_ttl: Duration,
     pub threads: Option<usize>,
     pub worker_threads: usize,
     pub worker_idle_timeout: Duration,
     #[cfg(feature = "hosting")]
     pub worker_cgroup: Option<CgroupSpec>,
     pub(crate) rate_limit: Option<RateLimit>,
+    #[cfg(feature = "swarm")]
+    pub(crate) swarm: Option<SwarmConfig>,
     pub(crate) trusted_proxies: Vec<TrustedProxy>,
     pub(crate) access_log: bool,
     pub(crate) access_log_file: Option<PathBuf>,
@@ -126,6 +132,7 @@ pub enum ParseResult {
 const HOSTING: bool = cfg!(feature = "hosting");
 const ACME: bool = cfg!(feature = "acme");
 const HTTP3: bool = cfg!(feature = "http3");
+const SWARM: bool = cfg!(feature = "swarm");
 
 /// Command-line options. Every build accepts the same set so that options of
 /// a compiled-out feature can be refused with a clear message; those options
@@ -210,6 +217,12 @@ struct Cli {
     /// FastCGI/CGI timeout in seconds
     #[arg(long, value_name = "SECS", default_value = "60", value_parser = parse_cli_fastcgi_timeout, hide = !HOSTING, allow_hyphen_values = true)]
     fastcgi_timeout: Duration,
+    /// Idle keep-alive connections kept per FastCGI TCP/Unix backend (0 disables reuse)
+    #[arg(long, value_name = "N", default_value = "8", value_parser = parse_fastcgi_keepalive, hide = !HOSTING, allow_hyphen_values = true)]
+    fastcgi_keepalive: usize,
+    /// Milliseconds small static files stay cached in memory (0 disables the cache)
+    #[arg(long, value_name = "MS", default_value = "1000", value_parser = parse_static_cache_ttl, hide = !HOSTING, allow_hyphen_values = true)]
+    static_cache_ttl_ms: u64,
     /// Runtime threads of the master process
     #[arg(long, value_name = "N", value_parser = parse_thread_count, allow_hyphen_values = true)]
     threads: Option<usize>,
@@ -240,6 +253,51 @@ struct Cli {
     /// Trusted reverse-proxy address or CIDR; may be repeated
     #[arg(long, value_name = "CIDR", allow_hyphen_values = true)]
     trusted_proxy: Vec<String>,
+    /// Redis URL containing logchomper's access data
+    #[arg(long, value_name = "URL", hide = !SWARM, allow_hyphen_values = true)]
+    swarm_redis: Option<String>,
+    /// Local Redis URL containing customer blocklists
+    #[arg(long, value_name = "URL", hide = !SWARM, allow_hyphen_values = true)]
+    swarm_local_redis: Option<String>,
+    /// Maximum number of vhosts before a client is blocked
+    #[arg(long, value_name = "N", hide = !SWARM, allow_hyphen_values = true)]
+    swarm_vhost_threshold: Option<u64>,
+    /// Minimum vhost count before classification limits apply
+    #[arg(long, value_name = "N", hide = !SWARM, allow_hyphen_values = true)]
+    swarm_class_min_vhost_count: Option<u64>,
+    /// Hit count that activates traffic classification limits
+    #[arg(long, value_name = "N", hide = !SWARM, allow_hyphen_values = true)]
+    swarm_hit_threshold: Option<u64>,
+    /// Maximum malicious traffic fraction (0 to 1)
+    #[arg(long, value_name = "FRACTION", hide = !SWARM, allow_hyphen_values = true)]
+    swarm_malicious_pct: Option<f64>,
+    /// Maximum dynamic traffic fraction (0 to 1)
+    #[arg(long, value_name = "FRACTION", hide = !SWARM, allow_hyphen_values = true)]
+    swarm_dynamic_pct: Option<f64>,
+    /// Maximum spam traffic fraction (0 to 1)
+    #[arg(long, value_name = "FRACTION", hide = !SWARM, allow_hyphen_values = true)]
+    swarm_spam_pct: Option<f64>,
+    /// Enable classification-based thresholds
+    #[arg(long, hide = !SWARM)]
+    swarm_classification_limits: bool,
+    /// Whitelisted client address or CIDR; may be repeated
+    #[arg(long, value_name = "CIDR", hide = !SWARM, allow_hyphen_values = true)]
+    swarm_whitelist: Vec<String>,
+    /// Redis sorted-set key for this machine's blocklist
+    #[arg(long, value_name = "KEY", hide = !SWARM, allow_hyphen_values = true)]
+    swarm_machine_key: Option<String>,
+    /// Maximum time spent checking Redis in milliseconds
+    #[arg(long, value_name = "MS", hide = !SWARM, allow_hyphen_values = true)]
+    swarm_timeout_ms: Option<u64>,
+    /// Negative-result cache lifetime in seconds
+    #[arg(long, value_name = "SECS", hide = !SWARM, allow_hyphen_values = true)]
+    swarm_neg_cache_ttl: Option<u64>,
+    /// Positive-result cache lifetime in seconds
+    #[arg(long, value_name = "SECS", hide = !SWARM, allow_hyphen_values = true)]
+    swarm_pos_cache_ttl: Option<u64>,
+    /// Positive-result cache idle lifetime in seconds
+    #[arg(long, value_name = "SECS", hide = !SWARM, allow_hyphen_values = true)]
+    swarm_pos_cache_tti: Option<u64>,
     /// Write access-log records to stdout
     #[arg(long)]
     access_log: bool,
@@ -346,6 +404,8 @@ const FEATURE_OPTIONS: &[(&str, bool, &[&str])] = &[
             "fastcgi_app_idle_timeout",
             "fastcgi_app_env",
             "fastcgi_timeout",
+            "fastcgi_keepalive",
+            "static_cache_ttl_ms",
             "worker_threads",
             "worker_idle_timeout",
             "worker_cgroup",
@@ -365,6 +425,27 @@ const FEATURE_OPTIONS: &[(&str, bool, &[&str])] = &[
         ],
     ),
     ("http3", HTTP3, &["http3_bind"]),
+    (
+        "swarm",
+        SWARM,
+        &[
+            "swarm_redis",
+            "swarm_local_redis",
+            "swarm_vhost_threshold",
+            "swarm_class_min_vhost_count",
+            "swarm_hit_threshold",
+            "swarm_malicious_pct",
+            "swarm_dynamic_pct",
+            "swarm_spam_pct",
+            "swarm_classification_limits",
+            "swarm_whitelist",
+            "swarm_machine_key",
+            "swarm_timeout_ms",
+            "swarm_neg_cache_ttl",
+            "swarm_pos_cache_ttl",
+            "swarm_pos_cache_tti",
+        ],
+    ),
 ];
 
 impl Config {
@@ -431,6 +512,52 @@ impl Config {
         };
         reject_compiled_out_options(&matches)?;
         let cli = Cli::from_arg_matches(&matches).map_err(|error| error.to_string())?;
+
+        #[cfg(feature = "swarm")]
+        let swarm = match cli.swarm_redis.clone() {
+            Some(upstream) => {
+                let whitelist = cli
+                    .swarm_whitelist
+                    .iter()
+                    .map(|value| value.parse())
+                    .collect::<Result<Vec<TrustedProxy>, String>>()?;
+                Some(SwarmConfig::new(
+                    upstream,
+                    cli.swarm_local_redis.clone(),
+                    cli.swarm_vhost_threshold,
+                    cli.swarm_class_min_vhost_count,
+                    cli.swarm_hit_threshold,
+                    cli.swarm_malicious_pct,
+                    cli.swarm_dynamic_pct,
+                    cli.swarm_spam_pct,
+                    cli.swarm_classification_limits,
+                    whitelist,
+                    cli.swarm_machine_key.clone(),
+                    cli.swarm_timeout_ms,
+                    cli.swarm_neg_cache_ttl,
+                    cli.swarm_pos_cache_ttl,
+                    cli.swarm_pos_cache_tti,
+                )?)
+            }
+            None if cli.swarm_local_redis.is_some()
+                || cli.swarm_vhost_threshold.is_some()
+                || cli.swarm_class_min_vhost_count.is_some()
+                || cli.swarm_hit_threshold.is_some()
+                || cli.swarm_malicious_pct.is_some()
+                || cli.swarm_dynamic_pct.is_some()
+                || cli.swarm_spam_pct.is_some()
+                || cli.swarm_classification_limits
+                || !cli.swarm_whitelist.is_empty()
+                || cli.swarm_machine_key.is_some()
+                || cli.swarm_timeout_ms.is_some()
+                || cli.swarm_neg_cache_ttl.is_some()
+                || cli.swarm_pos_cache_ttl.is_some()
+                || cli.swarm_pos_cache_tti.is_some() =>
+            {
+                return Err("swarm options require --swarm-redis".to_owned());
+            }
+            None => None,
+        };
 
         let mut backend_values = indexed_values(&matches, "fastcgi", &cli.fastcgi);
         backend_values.extend(indexed_values(&matches, "cgi", &cli.cgi));
@@ -547,6 +674,8 @@ impl Config {
             no_listing,
             try_files,
             fastcgi_timeout,
+            fastcgi_keepalive,
+            static_cache_ttl_ms,
             fastcgi_app_min_workers: _,
             fastcgi_app_max_workers: _,
             threads,
@@ -792,12 +921,16 @@ impl Config {
             try_files,
             fastcgi,
             fastcgi_timeout,
+            fastcgi_keepalive,
+            static_cache_ttl: Duration::from_millis(static_cache_ttl_ms),
             threads,
             worker_threads,
             worker_idle_timeout: Duration::from_secs(worker_idle_timeout),
             #[cfg(feature = "hosting")]
             worker_cgroup,
             rate_limit,
+            #[cfg(feature = "swarm")]
+            swarm,
             trusted_proxies,
             access_log,
             access_log_file,
@@ -998,6 +1131,7 @@ fn compiled_features() -> String {
         ("hosting", cfg!(feature = "hosting")),
         ("http3", cfg!(feature = "http3")),
         ("proxy", cfg!(feature = "proxy")),
+        ("swarm", cfg!(feature = "swarm")),
     ]
     .into_iter()
     .filter_map(|(name, enabled)| enabled.then_some(name))
@@ -1077,6 +1211,31 @@ fn parse_cli_id(
             .parse()
             .map_err(|_| format!("invalid worker {what}: {value}"))
     }
+}
+
+pub const DEFAULT_FASTCGI_KEEPALIVE: usize = 8;
+pub const MAX_FASTCGI_KEEPALIVE: usize = 1024;
+pub const DEFAULT_STATIC_CACHE_TTL_MS: u64 = 1000;
+pub const MAX_STATIC_CACHE_TTL_MS: u64 = 3_600_000;
+
+fn parse_fastcgi_keepalive(value: &str) -> Result<usize, String> {
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|count| *count <= MAX_FASTCGI_KEEPALIVE)
+        .ok_or_else(|| {
+            format!("invalid FastCGI keep-alive count: {value}; expected 0-{MAX_FASTCGI_KEEPALIVE}")
+        })
+}
+
+fn parse_static_cache_ttl(value: &str) -> Result<u64, String> {
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|ttl| *ttl <= MAX_STATIC_CACHE_TTL_MS)
+        .ok_or_else(|| {
+            format!("invalid static cache TTL: {value}; expected 0-{MAX_STATIC_CACHE_TTL_MS} milliseconds")
+        })
 }
 
 fn parse_cli_fastcgi_timeout(value: &str) -> Result<Duration, String> {
@@ -1581,6 +1740,60 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[cfg(feature = "swarm")]
+    #[test]
+    fn parses_swarm_options_and_requires_upstream_redis() {
+        let parsed = Config::parse([
+            "--swarm-redis".to_owned(),
+            "redis://127.0.0.1:6379/".to_owned(),
+            "--swarm-vhost-threshold".to_owned(),
+            "250".to_owned(),
+            "--swarm-classification-limits".to_owned(),
+            "--swarm-whitelist".to_owned(),
+            "192.0.2.0/24".to_owned(),
+            "--swarm-timeout-ms".to_owned(),
+            "25".to_owned(),
+        ])
+        .unwrap();
+        let ParseResult::Config(config) = parsed else {
+            panic!("expected config")
+        };
+        let swarm = config.swarm.expect("swarm config");
+        assert_eq!(swarm.vhost_threshold, 250);
+        assert!(swarm.classification_limits);
+        assert_eq!(swarm.whitelist, ["192.0.2.0/24".parse().unwrap()]);
+        assert_eq!(swarm.timeout, Duration::from_millis(25));
+
+        assert!(
+            Config::parse([
+                "--swarm-local-redis".to_owned(),
+                "redis://localhost/".to_owned()
+            ])
+            .is_err()
+        );
+        assert!(
+            Config::parse([
+                "--swarm-redis".to_owned(),
+                "redis://127.0.0.1:6379/".to_owned(),
+                "--swarm-malicious-pct".to_owned(),
+                "1.1".to_owned(),
+            ])
+            .is_err()
+        );
+    }
+
+    #[cfg(not(feature = "swarm"))]
+    #[test]
+    fn rejects_swarm_options_when_feature_is_disabled() {
+        let Err(error) = Config::parse([
+            "--swarm-redis".to_owned(),
+            "redis://127.0.0.1:6379/".to_owned(),
+        ]) else {
+            panic!("expected swarm options to be rejected")
+        };
+        assert!(error.contains("requires the `swarm` feature"), "{error}");
     }
 
     #[test]

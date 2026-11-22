@@ -6,7 +6,7 @@ default-run = "project-charlotte"
 description = "General-purpose webserver and reverse proxy meant for large-scale environments"
 
 [features]
-default = ["acme", "hosting", "http3", "proxy"]
+default = ["acme", "hosting", "http3", "proxy", "swarm"]
 # ACME (HTTP-01) certificate provisioning and renewal.
 acme = ["dep:instant-acme", "dep:x509-parser"]
 # The fallback site and virtual hosts with a document root: static files,
@@ -16,6 +16,8 @@ hosting = ["dep:fastcgi-client", "hyper/client"]
 http3 = ["dep:h3", "dep:h3-quinn", "dep:quinn"]
 # Virtual hosts that forward to an HTTP or HTTPS upstream.
 proxy = ["dep:hyper-rustls", "dep:tower-service", "hyper/client", "hyper-util/client-legacy"]
+# Optional Redis-backed access checks compatible with logchomper.
+swarm = ["dep:redis"]
 
 [dependencies]
 bytes = "1"
@@ -35,9 +37,10 @@ hyper-rustls = { version = "0.27", default-features = false, features = ["http1"
 hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
 instant-acme = { version = "0.8.5", default-features = false, features = ["ring", "hyper-rustls", "rcgen"], optional = true }
 libmodsecurity3-rs = { version = "0.1.1" }
-nix = { version = "0.31.3", features = ["fs", "poll", "process", "signal", "socket", "uio", "user"] }
+nix = { version = "0.31.3", features = ["fs", "hostname", "poll", "process", "signal", "socket", "uio", "user"] }
 notify = { version = "8", default-features = false }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"], optional = true }
+redis = { version = "0.29", default-features = false, features = ["aio", "tokio-comp", "connection-manager"], optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 ring = "0.17"
 serde = { version = "1", features = ["derive"] }

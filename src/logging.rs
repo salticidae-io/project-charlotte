@@ -10,6 +10,7 @@ use std::{
     sync::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc::{self, Receiver, SyncSender, TryRecvError},
     },
     time::{Duration, Instant, SystemTime},
 };
@@ -208,31 +209,111 @@ pub(crate) fn server_timing_value(timing: &RequestTiming) -> String {
     metrics.join(", ")
 }
 
+enum LogMessage {
+    Line(String),
+    Flush(mpsc::Sender<()>),
+}
+
 #[derive(Clone)]
-pub(crate) struct LogTarget(Arc<Mutex<Box<dyn Write + Send>>>);
+pub(crate) struct LogTarget(Arc<LogTargetKind>);
+
+enum LogTargetKind {
+    Synchronous(Mutex<Box<dyn Write + Send>>),
+    Asynchronous(SyncSender<LogMessage>),
+}
+
+static FILE_LOGS: OnceLock<Mutex<Vec<SyncSender<LogMessage>>>> = OnceLock::new();
+
+const LOG_QUEUE_CAPACITY: usize = 8192;
 
 impl LogTarget {
     pub(crate) fn file(path: &Path) -> io::Result<Self> {
         let file = open_log_file(path)?;
-        Ok(Self(Arc::new(Mutex::new(Box::new(file)))))
+        let (sender, receiver) = mpsc::sync_channel(LOG_QUEUE_CAPACITY);
+        std::thread::Builder::new()
+            .name("charlotte-log-writer".to_owned())
+            .spawn(move || file_log_writer(file, receiver))?;
+        FILE_LOGS
+            .get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(sender.clone());
+        Ok(Self(Arc::new(LogTargetKind::Asynchronous(sender))))
     }
 
     pub(crate) fn stdout() -> Self {
-        Self(Arc::new(Mutex::new(Box::new(io::stdout()))))
+        Self(Arc::new(LogTargetKind::Synchronous(Mutex::new(Box::new(
+            io::stdout(),
+        )))))
     }
 
     pub(crate) fn stderr() -> Self {
-        Self(Arc::new(Mutex::new(Box::new(io::stderr()))))
+        Self(Arc::new(LogTargetKind::Synchronous(Mutex::new(Box::new(
+            io::stderr(),
+        )))))
     }
 
     fn write_line(&self, line: &str) {
-        let mut writer = self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _ = writer.write_all(line.as_bytes());
-        let _ = writer.write_all(b"\n");
-        let _ = writer.flush();
+        match self.0.as_ref() {
+            LogTargetKind::Synchronous(writer) => {
+                let mut writer = writer
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let _ = writer.write_all(line.as_bytes());
+                let _ = writer.write_all(b"\n");
+                let _ = writer.flush();
+            }
+            LogTargetKind::Asynchronous(sender) => {
+                let _ = sender.send(LogMessage::Line(line.to_owned()));
+            }
+        }
+    }
+}
+
+fn file_log_writer(mut file: std::fs::File, receiver: Receiver<LogMessage>) {
+    while let Ok(message) = receiver.recv() {
+        match message {
+            LogMessage::Line(line) => {
+                let mut failed =
+                    file.write_all(line.as_bytes()).is_err() || file.write_all(b"\n").is_err();
+                while !failed {
+                    match receiver.try_recv() {
+                        Ok(LogMessage::Line(line)) => {
+                            failed = file.write_all(line.as_bytes()).is_err()
+                                || file.write_all(b"\n").is_err();
+                        }
+                        Ok(LogMessage::Flush(acknowledge)) => {
+                            let _ = file.flush();
+                            let _ = acknowledge.send(());
+                        }
+                        Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+                    }
+                }
+                let _ = file.flush();
+            }
+            LogMessage::Flush(acknowledge) => {
+                let _ = file.flush();
+                let _ = acknowledge.send(());
+            }
+        }
+    }
+    let _ = file.flush();
+}
+
+/// Flushes all file-backed log targets, waiting briefly for each writer thread.
+pub fn flush_logs() {
+    let Some(logs) = FILE_LOGS.get() else {
+        return;
+    };
+    let logs = logs
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    for sender in logs {
+        let (acknowledge, receiver) = mpsc::channel();
+        if sender.send(LogMessage::Flush(acknowledge)).is_ok() {
+            let _ = receiver.recv_timeout(Duration::from_secs(2));
+        }
     }
 }
 
@@ -1148,6 +1229,27 @@ pub(crate) fn open_log_file(path: &Path) -> io::Result<std::fs::File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_log_target_flushes_queued_lines() {
+        let path = std::env::temp_dir().join(format!(
+            "charlotte-log-writer-{}-{}.log",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("system time is after the epoch")
+                .as_nanos()
+        ));
+        let target = LogTarget::file(&path).expect("create file log target");
+
+        target.write_line("queued log line");
+        flush_logs();
+
+        let contents = std::fs::read_to_string(&path).expect("read flushed log file");
+        assert_eq!(contents, "queued log line\n");
+        drop(target);
+        std::fs::remove_file(path).expect("remove test log file");
+    }
 
     #[test]
     fn parses_common_and_combined_formats() {

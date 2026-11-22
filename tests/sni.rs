@@ -226,6 +226,7 @@ struct HttpsResponse {
     body: Vec<u8>,
     certificate: Vec<u8>,
     alpn: Option<Vec<u8>>,
+    handshake_kind: Option<rustls::HandshakeKind>,
 }
 
 async fn https_request(
@@ -249,12 +250,27 @@ async fn https_request_with_config(
     host: &str,
     config: rustls::ClientConfig,
 ) -> HttpsResponse {
-    let connector = TlsConnector::from(Arc::new(config));
+    https_request_with_connector(
+        fixture,
+        server_name,
+        host,
+        TlsConnector::from(Arc::new(config)),
+    )
+    .await
+}
+
+async fn https_request_with_connector(
+    fixture: &Fixture,
+    server_name: ServerName<'static>,
+    host: &str,
+    connector: TlsConnector,
+) -> HttpsResponse {
     let stream = TcpStream::connect(fixture.tls_address).await.unwrap();
     let mut tls = connector.connect(server_name, stream).await.unwrap();
     let state = tls.get_ref().1;
     let certificate = state.peer_certificates().unwrap()[0].as_ref().to_vec();
     let alpn = state.alpn_protocol().map(<[u8]>::to_vec);
+    let handshake_kind = state.handshake_kind();
     tls.write_all(
         format!("GET /index.html HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").as_bytes(),
     )
@@ -280,6 +296,7 @@ async fn https_request_with_config(
         body,
         certificate,
         alpn,
+        handshake_kind,
     }
 }
 
@@ -297,6 +314,7 @@ async fn https_h2_request(
     let state = tls.get_ref().1;
     let certificate = state.peer_certificates().unwrap()[0].as_ref().to_vec();
     let alpn = state.alpn_protocol().map(<[u8]>::to_vec);
+    let handshake_kind = state.handshake_kind();
     let (mut sender, connection) =
         hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls))
             .await
@@ -325,6 +343,7 @@ async fn https_h2_request(
         body,
         certificate,
         alpn,
+        handshake_kind,
     }
 }
 
@@ -394,6 +413,34 @@ fn client_config_with_versions(
         .with_no_client_auth();
     config.alpn_protocols = alpn_protocols;
     config
+}
+
+#[tokio::test]
+async fn tls_session_resumes_for_a_returning_client() {
+    let fixture = Fixture::new().await;
+    let connector = TlsConnector::from(Arc::new(client_config(
+        fixture.roots(),
+        vec![b"http/1.1".to_vec()],
+    )));
+    let first = https_request_with_connector(
+        &fixture,
+        current_name("alpha.test"),
+        "alpha.test",
+        connector.clone(),
+    )
+    .await;
+    assert_eq!(first.status, 200);
+    assert_eq!(first.handshake_kind, Some(rustls::HandshakeKind::Full));
+
+    let second = https_request_with_connector(
+        &fixture,
+        current_name("alpha.test"),
+        "alpha.test",
+        connector,
+    )
+    .await;
+    assert_eq!(second.status, 200);
+    assert_eq!(second.handshake_kind, Some(rustls::HandshakeKind::Resumed));
 }
 
 async fn plain_http_request(address: SocketAddr, host: &str) -> (u16, Vec<u8>) {

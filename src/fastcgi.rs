@@ -2,20 +2,25 @@
 
 use std::{
     borrow::Cow,
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fmt::Display,
     io,
     net::SocketAddr,
     path::{Component, Path, PathBuf},
     pin::Pin,
     process::Stdio,
-    sync::Arc,
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use bytes::{Bytes, BytesMut};
-use fastcgi_client::{Client, Params, Request as FastCgiRequest, response::Content};
+use fastcgi_client::{
+    Client, Params, Request as FastCgiRequest, conn::KeepAlive, io::TokioCompat, response::Content,
+};
 use futures_util::{Stream, StreamExt, stream};
 use http::{HeaderMap, HeaderName, HeaderValue, Response, StatusCode, header, request::Parts};
 use http_body::{Body, Frame};
@@ -40,6 +45,199 @@ const MAX_CGI_HEADER: usize = 64 * 1024;
 const FASTCGI_HEADER_LEN: usize = 8;
 const FASTCGI_END_REQUEST: u8 = 3;
 const FASTCGI_END_REQUEST_CONTENT_LEN: usize = 8;
+const KEEPALIVE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+static KEEPALIVE_LIMIT: AtomicUsize = AtomicUsize::new(crate::config::DEFAULT_FASTCGI_KEEPALIVE);
+static KEEPALIVE_POOL: OnceLock<Mutex<HashMap<String, Vec<IdleConnection>>>> = OnceLock::new();
+
+trait BackendStream: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<S: AsyncRead + AsyncWrite + Unpin + Send> BackendStream for S {}
+
+type KeepAliveClient =
+    Client<TokioCompat<BufWriter<RecordGuard<Box<dyn BackendStream>>>>, KeepAlive>;
+
+struct IdleConnection {
+    since: Instant,
+    client: KeepAliveClient,
+    ended: Arc<AtomicBool>,
+}
+
+/// Sets how many idle connections are kept for each FastCGI TCP or Unix
+/// backend. Zero opens a new connection for every request.
+pub(crate) fn set_keepalive_limit(limit: usize) {
+    KEEPALIVE_LIMIT.store(limit, Ordering::Relaxed);
+    if limit == 0
+        && let Some(pool) = KEEPALIVE_POOL.get()
+    {
+        pool.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+}
+
+pub(crate) fn keepalive_limit() -> usize {
+    KEEPALIVE_LIMIT.load(Ordering::Relaxed)
+}
+
+fn keepalive_pool() -> &'static Mutex<HashMap<String, Vec<IdleConnection>>> {
+    KEEPALIVE_POOL.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn take_idle_connection(key: &str) -> Option<IdleConnection> {
+    let mut pool = keepalive_pool()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let idle = pool.get_mut(key)?;
+    idle.retain(|connection| connection.since.elapsed() < KEEPALIVE_IDLE_TIMEOUT);
+    idle.pop()
+}
+
+fn return_idle_connection(key: String, client: KeepAliveClient, ended: Arc<AtomicBool>) {
+    let limit = keepalive_limit();
+    if limit == 0 {
+        return;
+    }
+    let mut pool = keepalive_pool()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let idle = pool.entry(key).or_default();
+    idle.retain(|connection| connection.since.elapsed() < KEEPALIVE_IDLE_TIMEOUT);
+    if idle.len() < limit {
+        idle.push(IdleConnection {
+            since: Instant::now(),
+            client,
+            ended,
+        });
+    }
+}
+
+#[derive(Clone)]
+enum KeepAliveTarget {
+    Tcp(String),
+    #[cfg(unix)]
+    Unix(PathBuf),
+}
+
+impl KeepAliveTarget {
+    fn key(&self) -> String {
+        match self {
+            Self::Tcp(address) => format!("tcp:{address}"),
+            #[cfg(unix)]
+            Self::Unix(path) => format!("unix:{}", path.display()),
+        }
+    }
+
+    async fn connect(&self) -> Result<(KeepAliveClient, Arc<AtomicBool>), String> {
+        let stream: Box<dyn BackendStream> = match self {
+            Self::Tcp(address) => {
+                let stream = TcpStream::connect(address.as_str())
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let _ = stream.set_nodelay(true);
+                Box::new(stream)
+            }
+            #[cfg(unix)]
+            Self::Unix(path) => Box::new(
+                tokio::net::UnixStream::connect(path)
+                    .await
+                    .map_err(|error| error.to_string())?,
+            ),
+        };
+        let guard = RecordGuard::new(stream);
+        let ended = Arc::clone(&guard.ended);
+        let client = Client::new_keep_alive_tokio(BufWriter::with_capacity(64 * 1024, guard));
+        Ok((client, ended))
+    }
+}
+
+fn owned_params(params: Params<'_>) -> Params<'static> {
+    let mut owned = Params::default();
+    owned.clear();
+    for (key, value) in HashMap::from(params) {
+        owned.insert(Cow::Owned(key.into_owned()), Cow::Owned(value.into_owned()));
+    }
+    owned
+}
+
+/// Runs a request over a pooled keep-alive connection. The exchange runs in
+/// its own task, which owns the connection and hands output to the response
+/// over a channel; the connection is pooled again only after the backend's
+/// END_REQUEST record was read and the response consumed in full.
+async fn execute_keepalive(
+    target: KeepAliveTarget,
+    params: Params<'static>,
+    request_body: Bytes,
+    timeout: Duration,
+) -> Result<Response<ResponseBody>, String> {
+    let (sender, mut receiver) = tokio::sync::mpsc::channel::<Result<Content, String>>(16);
+    tokio::spawn(async move {
+        let key = target.key();
+        let exchange = async {
+            let mut fresh_only = false;
+            loop {
+                let idle = if fresh_only {
+                    None
+                } else {
+                    take_idle_connection(&key)
+                };
+                let reused = idle.is_some();
+                let (mut client, ended) = match idle {
+                    Some(idle) => (idle.client, idle.ended),
+                    None => match target.connect().await {
+                        Ok(connection) => connection,
+                        Err(error) => {
+                            let _ = sender.send(Err(error)).await;
+                            return;
+                        }
+                    },
+                };
+                ended.store(false, Ordering::Release);
+                let stdin = tokio::io::BufReader::new(std::io::Cursor::new(request_body.clone()));
+                let request = FastCgiRequest::new_tokio(params.clone(), stdin);
+                let mut delivered = false;
+                let outcome = async {
+                    let mut output = client
+                        .execute_stream(request)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    while let Some(content) = output.next().await {
+                        let content = content.map_err(|error| error.to_string())?;
+                        delivered = true;
+                        if sender.send(Ok(content)).await.is_err() {
+                            return Err("FastCGI response was abandoned".to_owned());
+                        }
+                    }
+                    Ok::<_, String>(())
+                }
+                .await;
+                match outcome {
+                    Ok(()) if !delivered && reused && !ended.load(Ordering::Acquire) => {
+                        // The backend closed the idle connection before it
+                        // processed anything; send the request again.
+                        fresh_only = true;
+                    }
+                    Ok(()) => {
+                        if ended.load(Ordering::Acquire) {
+                            return_idle_connection(key, client, ended);
+                        }
+                        return;
+                    }
+                    Err(_) if !delivered && reused => fresh_only = true,
+                    Err(error) => {
+                        let _ = sender.send(Err(error)).await;
+                        return;
+                    }
+                }
+            }
+        };
+        tokio::select! {
+            () = exchange => {}
+            () = sender.closed() => {}
+        }
+    });
+    let output = Box::pin(stream::poll_fn(move |context| receiver.poll_recv(context)));
+    respond(output, timeout).await
+}
 
 pub struct ResolvedScript {
     path: PathBuf,
@@ -251,11 +449,31 @@ where
     let timeout = config.fastcgi_timeout;
     let operation = async {
         match &config.fastcgi[script.backend].address {
+            FastCgiAddress::Tcp(address) if keepalive_limit() > 0 => {
+                execute_keepalive(
+                    KeepAliveTarget::Tcp(address.clone()),
+                    owned_params(params),
+                    request_body,
+                    timeout,
+                )
+                .await
+            }
             FastCgiAddress::Tcp(address) => {
                 let stream = TcpStream::connect(address.as_str())
                     .await
                     .map_err(|error| error.to_string())?;
+                let _ = stream.set_nodelay(true);
                 execute(stream, params, request_body, timeout).await
+            }
+            #[cfg(unix)]
+            FastCgiAddress::Unix(path) if keepalive_limit() > 0 => {
+                execute_keepalive(
+                    KeepAliveTarget::Unix(path.clone()),
+                    owned_params(params),
+                    request_body,
+                    timeout,
+                )
+                .await
             }
             FastCgiAddress::Unix(path) => {
                 #[cfg(unix)]
@@ -694,6 +912,9 @@ struct RecordGuard<S> {
     header_read: usize,
     header_offset: usize,
     record_remaining: usize,
+    record_type: u8,
+    /// Set once a complete END_REQUEST record, padding included, was read.
+    ended: Arc<AtomicBool>,
 }
 
 impl<S> RecordGuard<S> {
@@ -704,6 +925,8 @@ impl<S> RecordGuard<S> {
             header_read: 0,
             header_offset: 0,
             record_remaining: 0,
+            record_type: 0,
+            ended: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -746,6 +969,9 @@ impl<S: AsyncRead + Unpin> AsyncRead for RecordGuard<S> {
                 }
                 this.record_remaining -= read;
                 buf.advance(read);
+                if this.record_remaining == 0 && this.record_type == FASTCGI_END_REQUEST {
+                    this.ended.store(true, Ordering::Release);
+                }
                 return Poll::Ready(Ok(()));
             }
 
@@ -773,6 +999,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for RecordGuard<S> {
                     )));
                 }
                 this.record_remaining = content_len + usize::from(this.header[6]);
+                this.record_type = this.header[1];
             }
         }
     }
@@ -811,10 +1038,20 @@ where
     ));
     let stdin = tokio::io::BufReader::new(std::io::Cursor::new(request_body));
     let request = FastCgiRequest::new_tokio(params, stdin);
-    let mut output = client
+    let output = client
         .execute_once_stream(request)
         .await
         .map_err(|error| error.to_string())?;
+    respond(output, timeout).await
+}
+
+/// Reads the CGI headers from a FastCGI output stream and streams the rest
+/// of it as the response body.
+async fn respond<O, E>(mut output: O, timeout: Duration) -> Result<Response<ResponseBody>, String>
+where
+    O: Stream<Item = Result<Content, E>> + Unpin + Send + 'static,
+    E: Display + Send + 'static,
+{
     // Holds the headers only when they span more than one chunk. Usually the
     // first chunk carries all of them, and is parsed and sliced where it is.
     let mut partial = BytesMut::new();
@@ -1077,11 +1314,15 @@ mod tests {
                 address: FastCgiAddress::Tcp("127.0.0.1:9000".to_owned()),
             }],
             fastcgi_timeout: Duration::from_secs(60),
+            fastcgi_keepalive: 8,
+            static_cache_ttl: Duration::ZERO,
             threads: None,
             worker_threads: 2,
             worker_idle_timeout: Duration::from_secs(300),
             worker_cgroup: None,
             rate_limit: None,
+            #[cfg(feature = "swarm")]
+            swarm: None,
             trusted_proxies: Vec::new(),
             access_log: false,
             access_log_file: None,

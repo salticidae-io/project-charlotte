@@ -35,6 +35,8 @@ use crate::forwarded::DirectPeer;
 use crate::handler;
 #[cfg(feature = "proxy")]
 use crate::proxy::ReverseProxy;
+#[cfg(feature = "swarm")]
+use crate::swarm::Swarm;
 use crate::{
     bot::{self, BotAction, BotPolicy, BotPolicyFile, BotState},
     config::{Config, TlsFiles},
@@ -105,6 +107,8 @@ struct VhostFile {
     acme: Option<bool>,
     proxy_pass: Option<String>,
     proxy_preserve_host: Option<bool>,
+    proxy_http2: Option<bool>,
+    swarm: Option<bool>,
     proxy_timeout: Option<u64>,
     proxy_ca_root: Option<PathBuf>,
     access_log: Option<PathBuf>,
@@ -181,6 +185,8 @@ struct Vhost {
     bot: VhostBot,
     access_log: Option<Arc<crate::logging::AccessLog>>,
     error_log: Arc<crate::logging::ErrorLog>,
+    #[cfg(feature = "swarm")]
+    swarm_enabled: bool,
     #[cfg(feature = "hosting")]
     worker: Option<Arc<Worker>>,
     #[cfg(feature = "proxy")]
@@ -208,6 +214,8 @@ pub(crate) struct Router {
     rate_limit: Option<Arc<RateLimiter>>,
     bot: Option<Arc<BotPolicy>>,
     bot_state: Arc<BotState>,
+    #[cfg(feature = "swarm")]
+    swarm: Option<Arc<Swarm>>,
     access_log: Option<Arc<crate::logging::AccessLog>>,
     error_log: Arc<crate::logging::ErrorLog>,
     https_port: AtomicU16,
@@ -287,6 +295,13 @@ impl Router {
             .transpose()?
             .map(Arc::new);
         let bot_state = BotState::new().map_err(io::Error::other)?;
+        #[cfg(feature = "swarm")]
+        let swarm = fallback
+            .swarm
+            .clone()
+            .map(Swarm::new)
+            .transpose()?
+            .map(Arc::new);
         let current_dir = std::env::current_dir()?;
         let config_dir = if let Some(path) = path {
             let config_dir = path
@@ -337,6 +352,10 @@ impl Router {
             Arc::clone(&error_log),
         )
         .await?;
+        #[cfg(feature = "swarm")]
+        {
+            router.swarm = swarm;
+        }
         router.dir = dir;
         if router.dir.is_some() {
             router.reload_dir().await?;
@@ -870,6 +889,7 @@ impl Router {
                 let proxy = Arc::new(ReverseProxy::new(
                     &upstream,
                     entry.proxy_preserve_host.unwrap_or(true),
+                    entry.proxy_http2.unwrap_or(false),
                     Duration::from_secs(entry.proxy_timeout.unwrap_or(60)),
                     ca_root.as_deref(),
                 )?);
@@ -883,6 +903,8 @@ impl Router {
                     waf: vhost_waf,
                     rate_limit: vhost_rate_limit,
                     bot: vhost_bot,
+                    #[cfg(feature = "swarm")]
+                    swarm_enabled: entry.swarm.unwrap_or(true),
                     access_log: access_log.clone(),
                     error_log: Arc::clone(&error_log),
                     #[cfg(feature = "hosting")]
@@ -1075,6 +1097,8 @@ impl Router {
                     waf: vhost_waf,
                     rate_limit: vhost_rate_limit,
                     bot: vhost_bot,
+                    #[cfg(feature = "swarm")]
+                    swarm_enabled: entry.swarm.unwrap_or(true),
                     access_log,
                     error_log,
                     #[cfg(feature = "hosting")]
@@ -1102,6 +1126,8 @@ impl Router {
             rate_limit,
             bot,
             bot_state,
+            #[cfg(feature = "swarm")]
+            swarm: None,
             access_log: global_access_log,
             error_log: global_error_log,
             https_port: AtomicU16::new(0),
@@ -1355,6 +1381,17 @@ impl Router {
             && let Err(retry_after) = rate_limit.check(peer.ip())
         {
             return crate::ratelimit::too_many_requests(retry_after);
+        }
+        #[cfg(feature = "swarm")]
+        if let Some(swarm) = &self.swarm
+            && selected.is_none_or(|index| table.vhosts[index].swarm_enabled)
+            && let Some(blocked) = swarm.check(peer.ip()).await
+        {
+            let mut response = response::error_response(blocked.status, "Blocked\n");
+            if let Ok(reason) = HeaderValue::from_str(&blocked.reason) {
+                response.headers_mut().insert("block-reason", reason);
+            }
+            return response;
         }
         let bot_policy = match selected {
             Some(index) => match &table.vhosts[index].bot {
@@ -1734,6 +1771,7 @@ fn validate_vhost_declarations<'a>(
                 .into());
             }
             if entry.proxy_preserve_host.is_some()
+                || entry.proxy_http2.is_some()
                 || entry.proxy_timeout.is_some()
                 || entry.proxy_ca_root.is_some()
             {
@@ -1906,6 +1944,9 @@ fn missing_feature(entry: &VhostFile) -> Option<&'static str> {
     }
     if entry.acme == Some(true) && !cfg!(feature = "acme") {
         return Some("acme");
+    }
+    if entry.swarm.is_some() && !cfg!(feature = "swarm") {
+        return Some("swarm");
     }
     None
 }
@@ -2482,6 +2523,7 @@ fn validate_vhost_entry(
         ReverseProxy::new(
             upstream,
             entry.proxy_preserve_host.unwrap_or(true),
+            entry.proxy_http2.unwrap_or(false),
             Duration::from_secs(entry.proxy_timeout.unwrap_or(60)),
             ca_root.as_deref(),
         )?;
@@ -2853,6 +2895,8 @@ mod tests {
             acme: None,
             proxy_pass: None,
             proxy_preserve_host: None,
+            proxy_http2: None,
+            swarm: None,
             proxy_timeout: None,
             proxy_ca_root: None,
             access_log: None,
@@ -3495,6 +3539,8 @@ mod tests {
                 waf: None,
                 rate_limit: super::VhostRateLimit::Inherit,
                 bot: super::VhostBot::Inherit,
+                #[cfg(feature = "swarm")]
+                swarm_enabled: true,
                 access_log: None,
                 error_log: Arc::new(crate::logging::ErrorLog::new(
                     crate::logging::LogTarget::stderr(),
