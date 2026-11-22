@@ -201,6 +201,7 @@ see all command-line options. Common options include:
 | `--error-log-format FORMAT` | Apache `ErrorLogFormat` string; defaults to `[%t] [%l] [pid %P] [module %m] %M`. |
 | `--bot-detection` | Enable the built-in bot policy in enforcing mode. |
 | `--bot-config FILE` | Load bot-detection settings from YAML; enables detection and overrides the defaults. |
+| `--bot-busy-threshold RATE` | Apply the global bot policy only when server traffic reaches a rate such as `100/s`; requires `--bot-detection` or `--bot-config`. |
 | `--fastcgi EXT=ADDR` | Route a file extension to a FastCGI TCP or Unix-socket backend. |
 | `--cgi EXT[=INTERPRETER]` | Execute matching scripts directly or with an interpreter; repeatable. |
 | `--fastcgi-app EXT=PROGRAM` | Start and supervise a FastCGI application for an extension. |
@@ -458,6 +459,9 @@ A policy file, a vhost `bot` map, and the built-in defaults accept these keys:
 | `honeypot_ban` | `3600` | Ban length in seconds (at most 30 days). |
 | `exempt_paths` | `[]` | Path prefixes that skip bot detection. |
 | `verify_crawlers` | `true` | Verify claimed search-engine crawlers through DNS. |
+| `busy_threshold` | disabled | Activate the bot policy when total server traffic reaches this rate, such as `100/s`, `6000/m`, or `360000/h`. |
+| `busy_window` | `10` | Seconds over which the average server request rate is measured (1–60). |
+| `busy_cooldown` | `300` | Seconds to keep the policy active after traffic falls below the threshold (1–86400). |
 
 Unknown keys are rejected, and paths must be local absolute paths.
 
@@ -471,7 +475,16 @@ exempt_paths: [/health, /api/]
 honeypot_paths: [/wp-login.php]
 honeypot_ban: 86400
 verify_crawlers: true
+busy_threshold: 100/s
+busy_window: 10
+busy_cooldown: 300
 ```
+
+Busy gating is disabled unless `busy_threshold` is set. The meter counts all
+requests handled by the server, including vhosts without bot protection, so a
+traffic surge on one site can activate the global policy on another. When the
+threshold is reached, bot protection remains active through the cooldown; the
+global `--bot-busy-threshold` overrides `busy_threshold` in the global policy.
 
 The `--bot-config` file is the global policy. A virtual host inherits it, turns
 it off with `bot: off`, or replaces it with its own policy map (a replacement,

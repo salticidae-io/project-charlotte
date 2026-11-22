@@ -259,6 +259,9 @@ struct Cli {
     /// Load a bot-detection policy from YAML (also enables detection)
     #[arg(long, value_name = "FILE", allow_hyphen_values = true)]
     bot_config: Option<PathBuf>,
+    /// Only activate bot protection while server traffic is busy (N/s, N/m, or N/h)
+    #[arg(long, value_name = "RATE", allow_hyphen_values = true)]
+    bot_busy_threshold: Option<String>,
     /// ModSecurity rules file (repeatable)
     #[arg(long, value_name = "FILE", allow_hyphen_values = true)]
     modsecurity_rules: Vec<PathBuf>,
@@ -532,6 +535,7 @@ impl Config {
             error_log_format,
             bot_detection,
             bot_config,
+            bot_busy_threshold,
             modsecurity_rules,
             modsecurity_block_status,
             modsecurity_body_limit: body_limit,
@@ -574,12 +578,22 @@ impl Config {
             let content = std::fs::read_to_string(&path).map_err(|error| {
                 format!("could not read bot policy {}: {error}", path.display())
             })?;
-            let policy: BotPolicyFile = serde_yaml_ng::from_str(&content)
+            let mut policy: BotPolicyFile = serde_yaml_ng::from_str(&content)
                 .map_err(|error| format!("invalid bot policy {}: {error}", path.display()))?;
+            if let Some(threshold) = bot_busy_threshold {
+                policy.set_busy_threshold(threshold);
+            }
             BotPolicy::parse(policy.clone())?;
             Some(policy)
         } else if bot_detection {
-            Some(BotPolicyFile::default())
+            let mut policy = BotPolicyFile::default();
+            if let Some(threshold) = bot_busy_threshold {
+                policy.set_busy_threshold(threshold);
+            }
+            BotPolicy::parse(policy.clone())?;
+            Some(policy)
+        } else if bot_busy_threshold.is_some() {
+            return Err("--bot-busy-threshold requires --bot-detection or --bot-config".to_owned());
         } else {
             None
         };
@@ -1548,6 +1562,50 @@ mod tests {
             panic!("expected config")
         };
         assert!(config.bot.is_some());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn bot_busy_threshold_requires_and_configures_bot_detection() {
+        let parsed = Config::parse([
+            "--bot-detection".to_owned(),
+            "--bot-busy-threshold".to_owned(),
+            "20/s".to_owned(),
+        ])
+        .unwrap();
+        let ParseResult::Config(config) = parsed else {
+            panic!("expected config")
+        };
+        assert!(config.bot.is_some());
+
+        let error = Config::parse(["--bot-busy-threshold".to_owned(), "20/s".to_owned()])
+            .err()
+            .unwrap();
+        assert!(error.contains("requires --bot-detection or --bot-config"));
+        assert!(
+            Config::parse([
+                "--bot-detection".to_owned(),
+                "--bot-busy-threshold".to_owned(),
+                "invalid".to_owned(),
+            ])
+            .is_err()
+        );
+
+        let path = std::env::temp_dir().join(format!(
+            "project-charlotte-bot-busy-config-{}-{}.yaml",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::write(&path, "busy_threshold: invalid\n").unwrap();
+        assert!(
+            Config::parse([
+                "--bot-config".to_owned(),
+                path.to_string_lossy().into_owned(),
+                "--bot-busy-threshold".to_owned(),
+                "20/s".to_owned(),
+            ])
+            .is_ok()
+        );
         std::fs::remove_file(path).unwrap();
     }
 

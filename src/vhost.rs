@@ -1253,6 +1253,7 @@ impl Router {
         B: Body<Data = Bytes> + Send + 'static,
         B::Error: Into<Box<dyn Error + Send + Sync>>,
     {
+        self.bot_state.record_request();
         let host = host.as_deref();
         let https_port = self.https_port.load(Ordering::Relaxed);
         #[cfg(feature = "acme")]

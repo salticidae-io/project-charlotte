@@ -224,6 +224,50 @@ async fn default_policy_blocks_scanners_and_challenges_automation() {
 }
 
 #[tokio::test]
+async fn busy_bot_policy_is_inactive_until_server_traffic_crosses_threshold() {
+    let fixture = Fixture::start(
+        Some("busy_threshold: 20/s\nbusy_window: 1\nbusy_cooldown: 30\nverify_crawlers: false\n"),
+        None,
+    )
+    .await;
+    let scanner = [("user-agent", "nuclei/3.0")];
+    assert_eq!(
+        request(fixture.address, "localhost", "/", &scanner)
+            .await
+            .status,
+        200
+    );
+
+    let mut requests = tokio::task::JoinSet::new();
+    for _ in 0..30 {
+        let address = fixture.address;
+        requests.spawn(async move {
+            request(
+                address,
+                "localhost",
+                "/",
+                &[
+                    ("user-agent", "Mozilla/5.0 Chrome/130.0"),
+                    ("accept", "text/html"),
+                    ("accept-language", "en-US"),
+                ],
+            )
+            .await
+        });
+    }
+    while let Some(result) = requests.join_next().await {
+        result.unwrap();
+    }
+
+    assert_eq!(
+        request(fixture.address, "localhost", "/", &scanner)
+            .await
+            .status,
+        403
+    );
+}
+
+#[tokio::test]
 async fn challenge_completion_sets_cookie_and_allows_follow_up() {
     let fixture = Fixture::start(Some("verify_crawlers: false\n"), None).await;
     let challenge = request(

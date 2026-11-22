@@ -4,7 +4,10 @@ use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     str::FromStr,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -20,6 +23,7 @@ use crate::{forwarded::TrustedProxy, ja4::ClientHelloInfo};
 
 const CACHE_SHARDS: usize = 16;
 const CACHE_CAPACITY: usize = 256;
+const BUSY_BUCKETS: usize = 60;
 pub(crate) const CHALLENGE_PATH: &str = "/.well-known/charlotte-bot-challenge";
 const BOT_COOKIE: &str = "charlotte_bot";
 const SHA256_JS: &str = r#"const sha256K=[],sha256H=[];function sha256(input){if(!sha256K.length){const marked={};for(let candidate=2,n=0;n<64;candidate++){if(!marked[candidate]){for(let multiple=candidate*candidate;multiple<313;multiple+=candidate)marked[multiple]=true;if(n<8)sha256H[n]=(Math.sqrt(candidate)%1*4294967296)|0;sha256K[n]=(Math.pow(candidate,1/3)%1*4294967296)|0;n++}}}const bitLength=input.length*8;input+='\x80';while(input.length%64!==56)input+='\x00';const words=[];for(let i=0;i<input.length;i++)words[i>>2]=(words[i>>2]||0)|(input.charCodeAt(i)<<(24-(i%4)*8));words.push((bitLength/4294967296)|0,bitLength|0);const hash=sha256H.slice(),rotate=(x,n)=>(x>>>n)|(x<<(32-n));for(let offset=0;offset<words.length;offset+=16){const schedule=words.slice(offset,offset+16);for(let i=16;i<64;i++){const x=schedule[i-15],y=schedule[i-2],s0=rotate(x,7)^rotate(x,18)^(x>>>3),s1=rotate(y,17)^rotate(y,19)^(y>>>10);schedule[i]=(schedule[i-16]+s0+schedule[i-7]+s1)|0}let[a,b,c,d,e,f,g,h]=hash;for(let i=0;i<64;i++){const s1=rotate(e,6)^rotate(e,11)^rotate(e,25),choice=(e&f)^(~e&g),t1=(h+s1+choice+sha256K[i]+schedule[i])|0,s0=rotate(a,2)^rotate(a,13)^rotate(a,22),majority=(a&b)^(a&c)^(b&c),t2=(s0+majority)|0;h=g;g=f;f=e;e=(d+t1)|0;d=c;c=b;b=a;a=(t1+t2)|0}hash[0]=(hash[0]+a)|0;hash[1]=(hash[1]+b)|0;hash[2]=(hash[2]+c)|0;hash[3]=(hash[3]+d)|0;hash[4]=(hash[4]+e)|0;hash[5]=(hash[5]+f)|0;hash[6]=(hash[6]+g)|0;hash[7]=(hash[7]+h)|0}return hash.map(value=>(value>>>0).toString(16).padStart(8,'0')).join('')}"#;
@@ -70,6 +74,12 @@ pub(crate) struct BotPolicyFile {
     ja4_allow: Vec<String>,
     #[serde(default)]
     ja4_deny: Vec<String>,
+    #[serde(default)]
+    busy_threshold: Option<String>,
+    #[serde(default = "default_busy_window")]
+    busy_window: u64,
+    #[serde(default = "default_busy_cooldown")]
+    busy_cooldown: u64,
 }
 
 impl Default for BotPolicyFile {
@@ -92,7 +102,16 @@ impl Default for BotPolicyFile {
             verify_crawlers: true,
             ja4_allow: Vec::new(),
             ja4_deny: Vec::new(),
+            busy_threshold: None,
+            busy_window: default_busy_window(),
+            busy_cooldown: default_busy_cooldown(),
         }
+    }
+}
+
+impl BotPolicyFile {
+    pub(crate) fn set_busy_threshold(&mut self, threshold: String) {
+        self.busy_threshold = Some(threshold);
     }
 }
 
@@ -120,6 +139,14 @@ const fn default_ban_ttl() -> u64 {
     3600
 }
 
+const fn default_busy_window() -> u64 {
+    10
+}
+
+const fn default_busy_cooldown() -> u64 {
+    300
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct BotPolicy {
     mode: BotMode,
@@ -139,6 +166,77 @@ pub(crate) struct BotPolicy {
     verify_crawlers: bool,
     ja4_allow: Vec<String>,
     ja4_deny: Vec<String>,
+    busy: Option<BusyGate>,
+}
+
+#[derive(Clone, Debug)]
+struct BusyGate {
+    requests: u64,
+    period_seconds: u64,
+    window_seconds: u64,
+    cooldown_seconds: u64,
+    active_until: Arc<AtomicU64>,
+}
+
+struct TrafficMeter {
+    started: Instant,
+    buckets: [AtomicU64; BUSY_BUCKETS],
+}
+
+impl TrafficMeter {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
+
+    fn now_seconds(&self) -> u64 {
+        self.started.elapsed().as_secs()
+    }
+
+    fn record_request(&self) {
+        self.record_request_at(self.now_seconds());
+    }
+
+    fn record_request_at(&self, second: u64) {
+        let stamp = bucket_stamp(second);
+        let bucket = &self.buckets[(second % BUSY_BUCKETS as u64) as usize];
+        let mut current = bucket.load(Ordering::Relaxed);
+        loop {
+            let current_stamp = (current >> 32) as u32;
+            let count = if current_stamp == stamp {
+                (current as u32).saturating_add(1)
+            } else {
+                1
+            };
+            let next = (u64::from(stamp) << 32) | u64::from(count);
+            match bucket.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => return,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    fn rate_over_at(&self, window_seconds: u64, now: u64) -> u64 {
+        let window_seconds = window_seconds.clamp(1, BUSY_BUCKETS as u64);
+        let start = now.saturating_sub(window_seconds - 1);
+        (start..=now).fold(0_u64, |total, second| {
+            let stamp = bucket_stamp(second);
+            let bucket =
+                self.buckets[(second % BUSY_BUCKETS as u64) as usize].load(Ordering::Relaxed);
+            if (bucket >> 32) as u32 == stamp {
+                total.saturating_add(u64::from(bucket as u32))
+            } else {
+                total
+            }
+        })
+    }
+}
+
+fn bucket_stamp(second: u64) -> u32 {
+    u32::try_from(second.min(u64::from(u32::MAX) - 1)).unwrap_or(u32::MAX - 1) + 1
 }
 
 impl BotPolicy {
@@ -162,6 +260,12 @@ impl BotPolicy {
                     .to_owned(),
             );
         }
+        if !(1..=60).contains(&file.busy_window) {
+            return Err("bot busy_window must be between 1 and 60 seconds".to_owned());
+        }
+        if !(1..=24 * 3600).contains(&file.busy_cooldown) {
+            return Err("bot busy_cooldown must be between 1 second and 1 day".to_owned());
+        }
         if file
             .allow_user_agents
             .iter()
@@ -184,6 +288,18 @@ impl BotPolicy {
                 return Err(format!("bot paths must be local absolute paths: {path}"));
             }
         }
+        let busy = file
+            .busy_threshold
+            .as_deref()
+            .map(parse_busy_threshold)
+            .transpose()?
+            .map(|(requests, period_seconds)| BusyGate {
+                requests,
+                period_seconds,
+                window_seconds: file.busy_window,
+                cooldown_seconds: file.busy_cooldown,
+                active_until: Arc::new(AtomicU64::new(0)),
+            });
         Ok(Self {
             mode: file.mode,
             challenge_threshold: file.challenge_threshold,
@@ -202,6 +318,7 @@ impl BotPolicy {
             verify_crawlers: file.verify_crawlers,
             ja4_allow: file.ja4_allow,
             ja4_deny: file.ja4_deny,
+            busy,
         })
     }
 
@@ -212,6 +329,54 @@ impl BotPolicy {
 
     pub(crate) fn challenge_parameters(&self) -> (u8, u64) {
         (self.challenge_difficulty, self.challenge_ttl)
+    }
+
+    fn is_active(&self, state: &BotState) -> bool {
+        self.busy.as_ref().is_none_or(|busy| busy.is_active(state))
+    }
+}
+
+fn parse_busy_threshold(value: &str) -> Result<(u64, u64), String> {
+    let (amount, period_seconds) = if let Some(amount) = value.strip_suffix("/s") {
+        (amount, 1)
+    } else if let Some(amount) = value.strip_suffix("/m") {
+        (amount, 60)
+    } else if let Some(amount) = value.strip_suffix("/h") {
+        (amount, 3600)
+    } else {
+        return Err(format!(
+            "invalid bot busy_threshold: {value}; expected N/s, N/m, or N/h"
+        ));
+    };
+    let requests = amount
+        .parse::<u64>()
+        .ok()
+        .filter(|requests| *requests > 0)
+        .ok_or_else(|| format!("invalid bot busy_threshold: {value}; rate must be positive"))?;
+    Ok((requests, period_seconds))
+}
+
+impl BusyGate {
+    fn is_active(&self, state: &BotState) -> bool {
+        self.is_active_at(state, state.traffic.now_seconds())
+    }
+
+    fn is_active_at(&self, state: &BotState, now: u64) -> bool {
+        let request_count = state.traffic.rate_over_at(self.window_seconds, now);
+        if u128::from(request_count) * u128::from(self.period_seconds)
+            >= u128::from(self.requests) * u128::from(self.window_seconds)
+        {
+            let active_until = now.saturating_add(self.cooldown_seconds);
+            let previous = self.active_until.fetch_max(active_until, Ordering::Relaxed);
+            if previous <= now {
+                crate::log_notice!(
+                    "bot protection activated during busy traffic: {} requests per {} seconds",
+                    request_count,
+                    self.window_seconds
+                );
+            }
+        }
+        now < self.active_until.load(Ordering::Relaxed)
     }
 }
 
@@ -239,6 +404,7 @@ pub(crate) struct BotState {
     bans: Vec<Mutex<HashMap<IpAddr, TtlEntry<()>>>>,
     crawlers: Vec<Mutex<HashMap<(IpAddr, &'static str), TtlEntry<CrawlerCheck>>>>,
     crawler_dns_slots: Arc<Semaphore>,
+    traffic: TrafficMeter,
 }
 
 impl BotState {
@@ -256,7 +422,12 @@ impl BotState {
                 .map(|_| Mutex::new(HashMap::new()))
                 .collect(),
             crawler_dns_slots: Arc::new(Semaphore::new(16)),
+            traffic: TrafficMeter::new(),
         }))
+    }
+
+    pub(crate) fn record_request(&self) {
+        self.traffic.record_request();
     }
 
     fn shard(&self, ip: IpAddr) -> usize {
@@ -510,6 +681,7 @@ pub(crate) async fn evaluate<B>(
 ) -> Verdict {
     let path = request.uri().path();
     if policy.mode == BotMode::Off
+        || !policy.is_active(state)
         || policy
             .exempt_paths
             .iter()
@@ -887,7 +1059,7 @@ fn javascript_string(value: &str) -> String {
 mod tests {
     use super::{
         BotAction, BotMode, BotPolicy, BotPolicyFile, BotState, CHALLENGE_PATH, CrawlerCheck,
-        TtlEntry, evaluate, javascript_string, unix_time, verify_pow,
+        TrafficMeter, TtlEntry, evaluate, javascript_string, unix_time, verify_pow,
     };
     use http::{HeaderMap, HeaderValue, Request, StatusCode, Version, header};
     use std::{
@@ -924,6 +1096,94 @@ mod tests {
             "charlotte_bot={expires}.{}",
             state.cookie_value(ip, expires)
         )
+    }
+
+    #[test]
+    fn traffic_meter_counts_only_requests_inside_the_window() {
+        let meter = TrafficMeter::new();
+        meter.record_request_at(10);
+        meter.record_request_at(10);
+        meter.record_request_at(11);
+
+        assert_eq!(meter.rate_over_at(2, 11), 3);
+        assert_eq!(meter.rate_over_at(1, 11), 1);
+        assert_eq!(meter.rate_over_at(1, 12), 0);
+        assert_eq!(meter.rate_over_at(60, 11), 3);
+    }
+
+    #[test]
+    fn busy_gate_activates_and_remains_active_for_its_cooldown() {
+        let policy = BotPolicy::parse(BotPolicyFile {
+            busy_threshold: Some("2/s".to_owned()),
+            busy_window: 1,
+            busy_cooldown: 3,
+            ..BotPolicyFile::default()
+        })
+        .unwrap();
+        let state = BotState::new().unwrap();
+        let gate = policy.busy.as_ref().unwrap();
+        state.traffic.record_request_at(10);
+        state.traffic.record_request_at(10);
+
+        assert!(gate.is_active_at(&state, 10));
+        assert!(gate.is_active_at(&state, 12));
+        assert!(!gate.is_active_at(&state, 13));
+    }
+
+    #[tokio::test]
+    async fn inactive_busy_gate_skips_scoring() {
+        let policy = BotPolicy::parse(BotPolicyFile {
+            busy_threshold: Some("1/s".to_owned()),
+            verify_crawlers: false,
+            ..BotPolicyFile::default()
+        })
+        .unwrap();
+        let state = BotState::new().unwrap();
+        let scanner = Request::builder()
+            .header("user-agent", "nuclei/3.0")
+            .body(())
+            .unwrap();
+
+        assert_eq!(
+            evaluate(&policy, &state, &scanner, address("192.0.2.18:80"), None)
+                .await
+                .action,
+            BotAction::Allow
+        );
+    }
+
+    #[test]
+    fn busy_gate_rejects_invalid_rate_and_window_values() {
+        for threshold in ["0/s", "20", "10/sec", "-1/m", "5/d"] {
+            assert!(
+                BotPolicy::parse(BotPolicyFile {
+                    busy_threshold: Some(threshold.to_owned()),
+                    ..BotPolicyFile::default()
+                })
+                .is_err(),
+                "accepted threshold {threshold}"
+            );
+        }
+        for file in [
+            BotPolicyFile {
+                busy_window: 0,
+                ..BotPolicyFile::default()
+            },
+            BotPolicyFile {
+                busy_window: 61,
+                ..BotPolicyFile::default()
+            },
+            BotPolicyFile {
+                busy_cooldown: 0,
+                ..BotPolicyFile::default()
+            },
+            BotPolicyFile {
+                busy_cooldown: 24 * 3600 + 1,
+                ..BotPolicyFile::default()
+            },
+        ] {
+            assert!(BotPolicy::parse(file).is_err());
+        }
     }
 
     #[tokio::test]
