@@ -146,6 +146,79 @@ async fn writes_global_and_vhost_access_and_error_logs() {
 }
 
 #[tokio::test]
+async fn logs_request_timing_in_access_log_header_and_debug_output() {
+    let root = std::env::temp_dir().join(format!("project-charlotte-ttfb-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("index.html"), "timed response").unwrap();
+    let access_log = root.join("access.log");
+    let address = common::reserve_tcp_address();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_project-charlotte"));
+    command
+        .arg("--debug")
+        .arg("--server-timing")
+        .arg("--bind")
+        .arg(address.to_string())
+        .arg("--root")
+        .arg(&root)
+        .arg("--access-log-file")
+        .arg(&access_log)
+        .arg("--access-log-format")
+        .arg("%{ttfb}T %{headers}T %{total}T %{backend}T")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut server = common::spawn(&mut command).unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while TcpStream::connect(address).await.is_err() {
+        if let Some(status) = server.try_wait().unwrap() {
+            panic!("server exited before becoming ready: {status}");
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "server did not start"
+        );
+        sleep(Duration::from_millis(20)).await;
+    }
+
+    let response = get(address, "/", "localhost").await;
+    let response = String::from_utf8_lossy(&response);
+    let server_timing = response
+        .lines()
+        .find(|line| line.to_ascii_lowercase().starts_with("server-timing:"))
+        .unwrap_or_else(|| panic!("missing Server-Timing header: {response}"));
+    assert!(server_timing.contains("backend;dur="), "{server_timing}");
+    assert!(server_timing.contains("ttfb;"), "{server_timing}");
+    assert!(server_timing.contains(";dur="), "{server_timing}");
+
+    let access = wait_for_line(&access_log, " ").await;
+    let fields = access.split_whitespace().collect::<Vec<_>>();
+    assert_eq!(fields.len(), 4, "{access}");
+    let ttfb = fields[0].parse::<u64>().unwrap();
+    let headers = fields[1].parse::<u64>().unwrap();
+    let total = fields[2].parse::<u64>().unwrap();
+    assert!(ttfb <= total, "ttfb={ttfb}, total={total}, {access}");
+    assert!(
+        headers <= total,
+        "headers={headers}, total={total}, {access}"
+    );
+    assert!(fields[3].parse::<u64>().is_ok(), "{access}");
+
+    common::shutdown(&mut server);
+    let mut debug_log = String::new();
+    server
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut debug_log)
+        .unwrap();
+    assert!(
+        debug_log.contains("request timing: GET / status=200"),
+        "{debug_log}"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn debug_startup_logs_listener_binding_to_stderr() {
     let root = std::env::temp_dir().join(format!(
         "project-charlotte-debug-logging-{}",

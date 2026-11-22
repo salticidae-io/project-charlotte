@@ -346,6 +346,7 @@ impl Worker {
                 .is_none_or(|process| process.sender.is_closed())
             {
                 *process_guard = None;
+                let _spawn_timing = crate::logging::StageTimer::new(crate::logging::Stage::Spawn);
                 *process_guard = Some(self.spawn_process().await?);
             }
             process_guard
@@ -354,6 +355,7 @@ impl Worker {
                 .sender
                 .clone()
         };
+        let _backend_timing = crate::logging::StageTimer::new(crate::logging::Stage::Backend);
         match sender.send_request(request).await {
             Ok(response) => Ok(response),
             Err(error) => {
@@ -550,6 +552,10 @@ pub(super) fn build_worker_args(worker: WorkerArgs<'_>) -> Vec<OsString> {
             if app.max_workers != 1 {
                 args.push("--fastcgi-app-max-workers".into());
                 args.push(format!("{}={}", backend.extension, app.max_workers).into());
+            }
+            if app.min_workers != crate::config::DEFAULT_FASTCGI_APP_MIN_WORKERS {
+                args.push("--fastcgi-app-min-workers".into());
+                args.push(format!("{}={}", backend.extension, app.min_workers).into());
             }
             if app.idle_timeout.as_secs() != crate::config::DEFAULT_FASTCGI_APP_IDLE_TIMEOUT_SECS {
                 args.push("--fastcgi-app-idle-timeout".into());

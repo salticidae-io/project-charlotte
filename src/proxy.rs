@@ -1,6 +1,14 @@
 //! Pooled HTTP/HTTPS upstream clients and reverse-proxy request/response handling.
 
-use std::{error::Error, io, path::Path, time::Duration};
+use std::{
+    error::Error,
+    future::Future,
+    io,
+    path::Path,
+    pin::Pin,
+    task::{Context, Poll},
+    time::Duration,
+};
 
 use bytes::Bytes;
 use http::{
@@ -9,17 +17,130 @@ use http::{
 };
 use http_body::Body;
 use http_body_util::{BodyExt, combinators::UnsyncBoxBody};
-use hyper_rustls::HttpsConnectorBuilder;
+use hyper::rt::{Read, ReadBufCursor, Write};
+use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::{
-    client::legacy::{Client, connect::HttpConnector},
-    rt::TokioExecutor,
+    client::legacy::{
+        Client,
+        connect::{Connected, Connection, HttpConnector},
+    },
+    rt::{TokioExecutor, TokioIo},
 };
 use rustls::pki_types::{CertificateDer, pem::PemObject};
+use tokio::net::TcpStream;
+use tower_service::Service;
 
 use crate::response::{self, ResponseBody};
 
 type ProxyRequestBody = UnsyncBoxBody<Bytes, io::Error>;
-type ProxyClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, ProxyRequestBody>;
+type ProxyClient = Client<HttpsConnector<QuickAckConnector>, ProxyRequestBody>;
+
+#[derive(Clone)]
+struct QuickAckConnector {
+    inner: HttpConnector,
+}
+
+struct QuickAckStream(TokioIo<TcpStream>);
+
+impl Service<Uri> for QuickAckConnector {
+    type Response = QuickAckStream;
+    type Error = <HttpConnector as Service<Uri>>::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(context)
+    }
+
+    fn call(&mut self, uri: Uri) -> Self::Future {
+        let connecting = self.inner.call(uri);
+        Box::pin(async move { connecting.await.map(QuickAckStream) })
+    }
+}
+
+impl Connection for QuickAckStream {
+    fn connected(&self) -> Connected {
+        self.0.connected()
+    }
+}
+
+impl Read for QuickAckStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: ReadBufCursor<'_>,
+    ) -> Poll<Result<(), io::Error>> {
+        let this = self.as_mut().get_mut();
+        let result = Pin::new(&mut this.0).poll_read(context, buffer);
+        if matches!(result, Poll::Ready(Ok(()))) {
+            set_tcp_quickack(this.0.inner());
+        }
+        result
+    }
+}
+
+impl Write for QuickAckStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<Result<usize, io::Error>> {
+        Pin::new(&mut self.as_mut().get_mut().0).poll_write(context, buffer)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<(), io::Error>> {
+        Pin::new(&mut self.as_mut().get_mut().0).poll_flush(context)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<(), io::Error>> {
+        Pin::new(&mut self.as_mut().get_mut().0).poll_shutdown(context)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.0.is_write_vectored()
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffers: &[io::IoSlice<'_>],
+    ) -> Poll<Result<usize, io::Error>> {
+        Pin::new(&mut self.as_mut().get_mut().0).poll_write_vectored(context, buffers)
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn set_tcp_quickack(stream: &TcpStream) {
+    use std::os::fd::AsRawFd;
+
+    let enabled: nix::libc::c_int = 1;
+    // SAFETY: the file descriptor is borrowed from a live TcpStream, and the
+    // value pointer and length describe a valid c_int for the duration of the call.
+    let result = unsafe {
+        nix::libc::setsockopt(
+            stream.as_raw_fd(),
+            nix::libc::IPPROTO_TCP,
+            nix::libc::TCP_QUICKACK,
+            (&enabled as *const nix::libc::c_int).cast(),
+            std::mem::size_of_val(&enabled) as nix::libc::socklen_t,
+        )
+    };
+    if result != 0 {
+        crate::log_debug!(
+            "could not enable TCP_QUICKACK on proxy upstream: {}",
+            io::Error::last_os_error()
+        );
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_tcp_quickack(_stream: &TcpStream) {}
 
 const HOP_BY_HOP_HEADERS: [&str; 9] = [
     "connection",
@@ -77,11 +198,16 @@ impl ReverseProxy {
         } else {
             HttpsConnectorBuilder::new().with_native_roots()?
         };
+        let mut http_connector = HttpConnector::new();
+        http_connector.enforce_http(false);
+        http_connector.set_nodelay(true);
         let connector = builder
             .https_or_http()
             .enable_http1()
             .enable_http2()
-            .build();
+            .wrap_connector(QuickAckConnector {
+                inner: http_connector,
+            });
         let client = Client::builder(TokioExecutor::new()).build::<_, ProxyRequestBody>(connector);
 
         Ok(Self {

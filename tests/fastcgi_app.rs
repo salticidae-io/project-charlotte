@@ -418,6 +418,8 @@ async fn reaps_all_workers_after_the_pool_becomes_idle() {
         &[
             "--fastcgi-app-max-workers",
             "php=3",
+            "--fastcgi-app-min-workers",
+            "php=0",
             "--fastcgi-app-idle-timeout",
             "php=2",
         ],
@@ -501,6 +503,8 @@ async fn scales_pool_within_max_workers_and_back_up_from_zero_after_reaping() {
         &[
             "--fastcgi-app-max-workers",
             "php=2",
+            "--fastcgi-app-min-workers",
+            "php=0",
             "--fastcgi-app-idle-timeout",
             "php=2",
         ],
@@ -604,6 +608,8 @@ async fn starts_no_worker_until_requested_and_scales_up_after_reaping_to_zero() 
         &[
             "--fastcgi-app-max-workers",
             "php=2",
+            "--fastcgi-app-min-workers",
+            "php=0",
             "--fastcgi-app-idle-timeout",
             "php=1",
         ],
@@ -655,6 +661,72 @@ async fn starts_no_worker_until_requested_and_scales_up_after_reaping_to_zero() 
     assert_ne!(
         second_pid, first_pid,
         "a request should spawn a fresh worker"
+    );
+}
+
+#[tokio::test]
+async fn prewarms_minimum_workers_and_keeps_them_after_idle_timeout() {
+    let root = new_root();
+    std::fs::create_dir_all(&root).unwrap();
+    let worker_pid_file = root.join("worker-pids");
+    let app_script = root.join("fastcgi-wrapper.sh");
+    std::fs::write(
+        &app_script,
+        "#!/bin/sh\nprintf '%s\\n' \"$$\" >> \"$CHARLOTTE_FCGI_WORKER_PID_FILE\"\nexec \"$CHARLOTTE_FCGI_HELPER_BIN\" --exact fcgi_app_helper --nocapture\n",
+    )
+    .unwrap();
+    let pid_file_env = format!(
+        "CHARLOTTE_FCGI_WORKER_PID_FILE={}",
+        worker_pid_file.display()
+    );
+    let helper_bin_env = format!(
+        "CHARLOTTE_FCGI_HELPER_BIN={}",
+        std::env::current_exe().unwrap().display()
+    );
+    let fixture = Fixture::start_with_program(
+        root,
+        PathBuf::from("/bin/sh"),
+        vec![app_script.display().to_string()],
+        &[pid_file_env.as_str(), helper_bin_env.as_str()],
+        &[
+            "--fastcgi-app-max-workers",
+            "php=2",
+            "--fastcgi-app-min-workers",
+            "php=1",
+            "--fastcgi-app-idle-timeout",
+            "php=1",
+        ],
+    )
+    .await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let warm_pid = loop {
+        if let Ok(pids) = std::fs::read_to_string(&worker_pid_file)
+            && let Some(pid) = pids.lines().next()
+        {
+            break pid.parse::<u32>().unwrap();
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the pool should prewarm its minimum worker before the first request"
+        );
+        sleep(Duration::from_millis(20)).await;
+    };
+    sleep(Duration::from_millis(2_500)).await;
+    let pid = response_pid(
+        request(
+            fixture.address,
+            "localhost",
+            "GET",
+            "/echo.php?pool=warm",
+            &[],
+            b"",
+        )
+        .await,
+    );
+    assert_eq!(
+        pid, warm_pid,
+        "the minimum worker should survive idle reaping"
     );
 }
 
@@ -747,6 +819,8 @@ async fn cleans_up_fastcgi_descendants_on_reap_and_sigterm() {
         &[
             "--fastcgi-app-max-workers",
             "php=3",
+            "--fastcgi-app-min-workers",
+            "php=0",
             "--fastcgi-app-idle-timeout",
             "php=1",
         ],

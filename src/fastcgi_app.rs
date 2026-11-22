@@ -37,6 +37,7 @@ use tokio::{
 
 use crate::{
     config::{Config, FastCgiAddress, FastCgiApp},
+    logging::{Stage, StageTimer},
     pathctx::PathContext,
 };
 
@@ -48,6 +49,7 @@ const MAX_REAPER_INTERVAL: Duration = Duration::from_secs(1);
 pub(crate) struct AppPool {
     app: FastCgiApp,
     root: PathBuf,
+    min_workers: usize,
     max_workers: usize,
     idle_timeout: Duration,
     socket_dir: PathBuf,
@@ -78,6 +80,7 @@ impl fmt::Debug for AppPool {
         formatter
             .debug_struct("AppPool")
             .field("program", &self.app.program)
+            .field("min_workers", &self.min_workers)
             .field("max_workers", &self.max_workers)
             .field("idle_timeout", &self.idle_timeout)
             .finish()
@@ -88,8 +91,10 @@ impl AppPool {
     fn new(app: FastCgiApp, root: PathBuf) -> io::Result<Arc<Self>> {
         validate_app_program(&app, &root)?;
         let socket_dir = create_socket_dir()?;
+        let min_workers = app.min_workers.min(app.max_workers);
         let max_workers = app.max_workers;
         let pool = Arc::new(Self {
+            min_workers,
             max_workers,
             idle_timeout: app.idle_timeout,
             app,
@@ -99,6 +104,12 @@ impl AppPool {
             permits: Arc::new(Semaphore::new(max_workers)),
             reaper: Mutex::new(None),
         });
+        {
+            let mut slots = pool.slots.lock().expect("FastCGI pool mutex poisoned");
+            for _ in 0..pool.min_workers {
+                slots.push(pool.spawn_slot()?);
+            }
+        }
         pool.start_reaper();
         Ok(pool)
     }
@@ -126,6 +137,7 @@ impl AppPool {
         if slots.len() >= self.max_workers {
             return Err(io::Error::other("FastCGI app worker pool is at capacity"));
         }
+        let _spawn_timer = StageTimer::new(Stage::Spawn);
         let mut slot = self.spawn_slot()?;
         slot.busy = true;
         let lease = WorkerLease {
@@ -185,7 +197,10 @@ impl AppPool {
         let mut index = 0;
         while index < slots.len() {
             let slot = &slots[index];
-            if !slot.busy && now.duration_since(slot.last_used) >= self.idle_timeout {
+            if slots.len() > self.min_workers
+                && !slot.busy
+                && now.duration_since(slot.last_used) >= self.idle_timeout
+            {
                 let slot = slots.remove(index);
                 stop_slot(slot);
             } else {
@@ -267,9 +282,10 @@ pub(crate) async fn start_apps(config: &mut Config) -> Result<(), Box<dyn Error 
         };
         let pool = AppPool::new(app.clone(), root.clone())?;
         crate::log_error!(
-            "Started FastCGI app pool .{}: {} (0–{} workers on demand)",
+            "Started FastCGI app pool .{}: {} ({} warm, up to {} workers)",
             backend.extension,
             app.program.display(),
+            app.min_workers,
             app.max_workers,
         );
         backend.address = FastCgiAddress::Pool(pool);

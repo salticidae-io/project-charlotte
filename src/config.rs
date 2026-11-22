@@ -49,6 +49,7 @@ pub struct FastCgiApp {
     pub program: PathBuf,
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
+    pub min_workers: usize,
     pub max_workers: usize,
     pub idle_timeout: Duration,
 }
@@ -56,6 +57,7 @@ pub struct FastCgiApp {
 #[derive(Clone, Debug)]
 pub struct Config {
     pub debug: bool,
+    pub server_timing: bool,
     pub plain_http: bool,
     pub https_redirect: bool,
     pub bind: SocketAddr,
@@ -139,6 +141,9 @@ struct Cli {
     /// Log verbose startup details
     #[arg(long)]
     debug: bool,
+    /// Add per-request stage durations to the Server-Timing response header
+    #[arg(long)]
+    server_timing: bool,
     /// Drop privileges to this user after binding the listeners
     #[arg(long, value_name = "USER", value_parser = parse_cli_name("--user", "user"), allow_hyphen_values = true)]
     user: Option<String>,
@@ -193,6 +198,9 @@ struct Cli {
     /// Maximum worker processes of a spawned FastCGI application
     #[arg(long, alias = "fastcgi-app-workers", value_name = "EXT=N", hide = !HOSTING, allow_hyphen_values = true)]
     fastcgi_app_max_workers: Vec<String>,
+    /// Minimum number of warm spawned FastCGI application workers
+    #[arg(long, value_name = "EXT=N", hide = !HOSTING, allow_hyphen_values = true)]
+    fastcgi_app_min_workers: Vec<String>,
     /// Seconds an idle FastCGI application worker is kept before it is stopped
     #[arg(long, value_name = "EXT=SECS", hide = !HOSTING, allow_hyphen_values = true)]
     fastcgi_app_idle_timeout: Vec<String>,
@@ -268,9 +276,12 @@ struct Cli {
     /// HTTP status returned for blocking interventions
     #[arg(long, value_name = "CODE", value_parser = parse_modsecurity_block_status, allow_hyphen_values = true)]
     modsecurity_block_status: Option<u16>,
-    /// Request and response body inspection limit
+    /// Request body inspection limit
     #[arg(long, value_name = "BYTES", value_parser = parse_cli_body_limit, allow_hyphen_values = true)]
     modsecurity_body_limit: Option<usize>,
+    /// Response body inspection limit (defaults to 64 KiB)
+    #[arg(long, value_name = "BYTES", value_parser = parse_cli_body_limit, allow_hyphen_values = true)]
+    modsecurity_response_body_limit: Option<usize>,
     /// Virtual-host YAML file
     #[arg(long = "config", value_name = "YAML_FILE", allow_hyphen_values = true)]
     config_file: Option<PathBuf>,
@@ -331,6 +342,7 @@ const FEATURE_OPTIONS: &[(&str, bool, &[&str])] = &[
             "fastcgi_app",
             "fastcgi_app_arg",
             "fastcgi_app_max_workers",
+            "fastcgi_app_min_workers",
             "fastcgi_app_idle_timeout",
             "fastcgi_app_env",
             "fastcgi_timeout",
@@ -463,6 +475,24 @@ impl Config {
             fastcgi_app_max_workers.push((extension, max_workers));
         }
 
+        let mut fastcgi_app_min_workers = Vec::new();
+        for value in &cli.fastcgi_app_min_workers {
+            let (extension, min_workers) = value.split_once('=').ok_or_else(|| {
+                format!("invalid FastCGI app min worker count: {value}; expected EXT=N")
+            })?;
+            let extension = normalize_extension(extension)?;
+            let min_workers = parse_fastcgi_app_min_workers(min_workers)?;
+            if fastcgi_app_min_workers
+                .iter()
+                .any(|(existing, _): &(String, usize)| existing == &extension)
+            {
+                return Err(format!(
+                    "duplicate FastCGI app min worker count for extension: {extension}"
+                ));
+            }
+            fastcgi_app_min_workers.push((extension, min_workers));
+        }
+
         let mut fastcgi_app_idle_timeouts = Vec::new();
         for value in &cli.fastcgi_app_idle_timeout {
             let (extension, timeout) = value.split_once('=').ok_or_else(|| {
@@ -504,6 +534,7 @@ impl Config {
             user: master_user,
             group: master_group,
             debug,
+            server_timing,
             bind,
             max_connections,
             header_read_timeout,
@@ -516,6 +547,8 @@ impl Config {
             no_listing,
             try_files,
             fastcgi_timeout,
+            fastcgi_app_min_workers: _,
+            fastcgi_app_max_workers: _,
             threads,
             worker_threads,
             worker_idle_timeout,
@@ -539,6 +572,7 @@ impl Config {
             modsecurity_rules,
             modsecurity_block_status,
             modsecurity_body_limit: body_limit,
+            modsecurity_response_body_limit: response_body_limit,
             config_file,
             vhost_dir,
             control_socket,
@@ -598,7 +632,8 @@ impl Config {
             None
         };
         let modsecurity_body_limit = body_limit.unwrap_or(16 * 1024 * 1024);
-        let modsecurity_response_body_limit = body_limit.unwrap_or(1024 * 1024);
+        let modsecurity_response_body_limit =
+            response_body_limit.or(body_limit).unwrap_or(64 * 1024);
 
         validate_index_names(&index).map_err(|error| format!("--index {error}"))?;
         validate_try_files(&try_files)?;
@@ -630,6 +665,21 @@ impl Config {
                 ));
             };
             app.max_workers = max_workers;
+            app.min_workers = app.min_workers.min(max_workers);
+        }
+        for (extension, min_workers) in fastcgi_app_min_workers {
+            let Some(FastCgiBackend {
+                address: FastCgiAddress::Spawn(app),
+                ..
+            }) = fastcgi
+                .iter_mut()
+                .find(|backend| backend.extension == extension)
+            else {
+                return Err(format!(
+                    "FastCGI app min worker count references undeclared app extension: {extension}"
+                ));
+            };
+            app.min_workers = min_workers.min(app.max_workers);
         }
         for (extension, idle_timeout) in fastcgi_app_idle_timeouts {
             let Some(FastCgiBackend {
@@ -724,6 +774,7 @@ impl Config {
 
         Ok(ParseResult::Config(Box::new(Self {
             debug,
+            server_timing,
             plain_http: !no_plain_http,
             https_redirect,
             bind,
@@ -1249,7 +1300,8 @@ pub(crate) fn parse_fastcgi_app(value: &str) -> Result<FastCgiBackend, String> {
             program: PathBuf::from(program),
             args: Vec::new(),
             env: BTreeMap::new(),
-            max_workers: 1,
+            min_workers: 1,
+            max_workers: default_fastcgi_app_max_workers(),
             idle_timeout: Duration::from_secs(DEFAULT_FASTCGI_APP_IDLE_TIMEOUT_SECS),
         }),
     })
@@ -1277,8 +1329,13 @@ pub(crate) fn validate_env_key(key: &str) -> Result<(), String> {
 pub const DEFAULT_WORKER_THREADS: usize = 2;
 pub const MAX_THREADS: usize = 1024;
 pub const MAX_FASTCGI_APP_WORKERS: usize = 256;
+pub const DEFAULT_FASTCGI_APP_MIN_WORKERS: usize = 1;
 pub const DEFAULT_FASTCGI_APP_IDLE_TIMEOUT_SECS: u64 = 60;
 pub const MAX_FASTCGI_APP_IDLE_TIMEOUT_SECS: u64 = 86_400;
+
+pub(crate) fn default_fastcgi_app_max_workers() -> usize {
+    std::thread::available_parallelism().map_or(1, |count| count.get().min(8))
+}
 
 pub fn parse_modsecurity_block_status(value: &str) -> Result<u16, String> {
     value
@@ -1296,6 +1353,18 @@ pub fn parse_fastcgi_app_max_workers(value: &str) -> Result<usize, String> {
         .ok_or_else(|| {
             format!(
                 "invalid FastCGI app max worker count: {value}; expected 1-{MAX_FASTCGI_APP_WORKERS}"
+            )
+        })
+}
+
+pub fn parse_fastcgi_app_min_workers(value: &str) -> Result<usize, String> {
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|workers| *workers <= MAX_FASTCGI_APP_WORKERS)
+        .ok_or_else(|| {
+            format!(
+                "invalid FastCGI app min worker count: {value}; expected 0-{MAX_FASTCGI_APP_WORKERS}"
             )
         })
 }
@@ -1325,7 +1394,10 @@ pub fn parse_thread_count(value: &str) -> Result<usize, String> {
 mod tests {
     use super::{Config, ParseResult, parse_modsecurity_block_status};
     #[cfg(feature = "hosting")]
-    use super::{DEFAULT_FASTCGI_APP_IDLE_TIMEOUT_SECS, FastCgiAddress, validate_try_files};
+    use super::{
+        DEFAULT_FASTCGI_APP_IDLE_TIMEOUT_SECS, FastCgiAddress, default_fastcgi_app_max_workers,
+        validate_try_files,
+    };
     use crate::forwarded::TrustedProxy;
     use crate::ratelimit::RateLimit;
     use std::time::Duration;
@@ -1762,7 +1834,7 @@ mod tests {
 
     #[cfg(feature = "hosting")]
     #[test]
-    fn fastcgi_app_defaults_to_one_worker() {
+    fn fastcgi_app_defaults_to_one_warm_worker_and_cpu_bound_maximum() {
         let parsed = Config::parse(["--fastcgi-app".to_owned(), "php=php-cgi".to_owned()]).unwrap();
         let ParseResult::Config(config) = parsed else {
             panic!("expected config")
@@ -1770,10 +1842,60 @@ mod tests {
         let FastCgiAddress::Spawn(app) = &config.fastcgi[0].address else {
             panic!("expected spawned FastCGI app")
         };
-        assert_eq!(app.max_workers, 1);
+        assert_eq!(app.min_workers, 1);
+        assert_eq!(app.max_workers, default_fastcgi_app_max_workers());
+        assert!((1..=8).contains(&app.max_workers));
+        assert_eq!(config.modsecurity_response_body_limit, 64 * 1024);
         assert_eq!(
             app.idle_timeout,
             Duration::from_secs(DEFAULT_FASTCGI_APP_IDLE_TIMEOUT_SECS)
+        );
+    }
+
+    #[cfg(feature = "hosting")]
+    #[test]
+    fn fastcgi_app_min_workers_and_response_body_limit_options() {
+        let parsed = Config::parse([
+            "--fastcgi-app".to_owned(),
+            "php=php-cgi".to_owned(),
+            "--fastcgi-app-max-workers".to_owned(),
+            "php=2".to_owned(),
+            "--fastcgi-app-min-workers".to_owned(),
+            "php=5".to_owned(),
+            "--modsecurity-body-limit".to_owned(),
+            "1000".to_owned(),
+        ])
+        .unwrap();
+        let ParseResult::Config(config) = parsed else {
+            panic!("expected config")
+        };
+        let FastCgiAddress::Spawn(app) = &config.fastcgi[0].address else {
+            panic!("expected spawned FastCGI app")
+        };
+        assert_eq!(app.min_workers, 2, "the minimum is clamped to the maximum");
+        assert_eq!(config.modsecurity_response_body_limit, 1000);
+        let ParseResult::Config(config) = Config::parse([
+            "--modsecurity-body-limit".to_owned(),
+            "1000".to_owned(),
+            "--modsecurity-response-body-limit".to_owned(),
+            "2000".to_owned(),
+        ])
+        .unwrap() else {
+            panic!("expected config")
+        };
+        assert_eq!(config.modsecurity_body_limit, 1000);
+        assert_eq!(config.modsecurity_response_body_limit, 2000);
+        assert!(
+            Config::parse(["--fastcgi-app-min-workers".to_owned(), "php=1".to_owned()]).is_err()
+        );
+        assert!(
+            Config::parse([
+                "--fastcgi-app".to_owned(),
+                "php=php-cgi".to_owned(),
+                "--fastcgi-app-min-workers".to_owned(),
+                "php=257".to_owned(),
+            ])
+            .is_err()
         );
     }
 

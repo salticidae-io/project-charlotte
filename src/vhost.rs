@@ -101,6 +101,7 @@ struct VhostFile {
     #[serde(default)]
     modsecurity_disable_rules: Vec<RuleIdFile>,
     modsecurity_block_status: Option<u16>,
+    modsecurity_response_body: Option<bool>,
     acme: Option<bool>,
     proxy_pass: Option<String>,
     proxy_preserve_host: Option<bool>,
@@ -145,6 +146,7 @@ struct FastCgiAppFile {
     env: BTreeMap<String, String>,
     #[serde(default, alias = "workers")]
     max_workers: Option<usize>,
+    min_workers: Option<usize>,
     idle_timeout: Option<u64>,
 }
 
@@ -837,7 +839,12 @@ impl Router {
                         .without_rules(&disabled_rules)?,
                 )
             };
-            let vhost_waf = vhost_waf.map(|waf| waf.with_block_status(block_status));
+            let vhost_waf = vhost_waf.map(|waf| {
+                let waf = waf.with_block_status(block_status);
+                entry
+                    .modsecurity_response_body
+                    .map_or(waf, |inspect| waf.with_response_body(inspect))
+            });
             let mut normalized_names = Vec::with_capacity(entry.server_names.len());
             for name in &entry.server_names {
                 let normalized = normalize_server_name(name)
@@ -957,8 +964,15 @@ impl Router {
                     if app_file.command.iter().any(|part| part.contains('\0')) {
                         return Err("vhost FastCGI app command cannot contain NUL".into());
                     }
-                    let max_workers = app_file.max_workers.unwrap_or(1);
+                    let max_workers = app_file
+                        .max_workers
+                        .unwrap_or_else(crate::config::default_fastcgi_app_max_workers);
                     crate::config::parse_fastcgi_app_max_workers(&max_workers.to_string())
+                        .map_err(|error| format!("vhost FastCGI app .{extension}: {error}"))?;
+                    let min_workers = app_file
+                        .min_workers
+                        .unwrap_or(crate::config::DEFAULT_FASTCGI_APP_MIN_WORKERS);
+                    crate::config::parse_fastcgi_app_min_workers(&min_workers.to_string())
                         .map_err(|error| format!("vhost FastCGI app .{extension}: {error}"))?;
                     let idle_timeout = app_file
                         .idle_timeout
@@ -985,6 +999,7 @@ impl Router {
                         app.args = app_file.command.into_iter().skip(1).collect();
                         app.env = app_file.env;
                         app.max_workers = max_workers;
+                        app.min_workers = min_workers.min(max_workers);
                         app.idle_timeout = idle_timeout;
                     }
                     fastcgi.push(backend);
@@ -1155,6 +1170,8 @@ impl Router {
         B: Body<Data = Bytes> + Send + 'static,
         B::Error: Into<Box<dyn Error + Send + Sync>>,
     {
+        let timing = Arc::new(crate::logging::RequestTiming::new());
+        let request_started = std::time::SystemTime::now();
         let mut request = request;
         let (client, trusted_chain) =
             forwarded::resolve(peer, request.headers(), &self.fallback.trusted_proxies);
@@ -1188,52 +1205,74 @@ impl Router {
         );
         let access_log =
             vhost.map_or_else(|| self.access_log.clone(), |vhost| vhost.access_log.clone());
+        let debug = crate::logging::debug_enabled();
+        let capture_request = access_log.is_some() || debug;
         let received = access_log
             .as_ref()
             .map(|_| Arc::new(std::sync::atomic::AtomicU64::new(0)));
-        let access_request = received
-            .as_ref()
-            .map(|received| crate::logging::AccessRequest {
-                method: request.method().clone(),
-                path: request
-                    .uri()
-                    .path_and_query()
-                    .map_or("/", |value| value.as_str())
-                    .to_owned(),
-                version: request.version(),
-                client,
-                peer,
-                local,
-                server_name: server_name.clone(),
-                ja4: request
-                    .extensions()
-                    .get::<TlsFingerprint>()
-                    .map_or_else(|| "-".to_owned(), |fingerprint| fingerprint.0.ja4.clone()),
-                headers: request.headers().clone(),
-                received: Arc::clone(received),
-                started: std::time::SystemTime::now(),
-            });
-        let request = request.map(|body| crate::logging::CountedBody::new(body, received));
+        let access_request = capture_request.then(|| crate::logging::AccessRequest {
+            method: request.method().clone(),
+            path: request
+                .uri()
+                .path_and_query()
+                .map_or("/", |value| value.as_str())
+                .to_owned(),
+            version: request.version(),
+            client,
+            peer,
+            local,
+            server_name: server_name.clone(),
+            ja4: request
+                .extensions()
+                .get::<TlsFingerprint>()
+                .map_or_else(|| "-".to_owned(), |fingerprint| fingerprint.0.ja4.clone()),
+            headers: request.headers().clone(),
+            received: received
+                .clone()
+                .unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicU64::new(0))),
+            started: request_started,
+        });
+        let request = request.map(|body| crate::logging::CountedBody::new(body, received.clone()));
         let context = crate::logging::RequestContext {
             client: Some(client),
             local: Some(local),
             server_name,
             error_log: Some(error_log),
+            timing: Some(Arc::clone(&timing)),
         };
         let response = crate::logging::with_request_context(
-            context,
+            context.clone(),
             self.dispatch_inner(request, client, local, table, host, selected),
         )
         .await;
-        if let (Some(log), Some(access_request)) = (access_log, access_request) {
+        timing.mark_headers();
+        let mut response = response;
+        if self.fallback.server_timing
+            && let Ok(value) = HeaderValue::from_str(&crate::logging::server_timing_value(&timing))
+        {
+            response.headers_mut().append(
+                http::header::HeaderName::from_static("server-timing"),
+                value,
+            );
+        }
+        if access_log.is_some() || debug || self.fallback.server_timing {
             let (parts, body) = response.into_parts();
-            let access_response = crate::logging::AccessResponse {
-                status: parts.status.as_u16(),
-                version: parts.version,
-                headers: parts.headers.clone(),
-            };
-            let body = crate::logging::LoggedBody::new(body, log, access_request, access_response)
-                .boxed_unsync();
+            let access_response =
+                (access_log.is_some() || debug).then(|| crate::logging::AccessResponse {
+                    status: parts.status.as_u16(),
+                    version: parts.version,
+                    headers: parts.headers.clone(),
+                });
+            let body = crate::logging::LoggedBody::new(
+                body,
+                access_log,
+                access_request,
+                access_response,
+                timing,
+                debug,
+                context,
+            )
+            .boxed_unsync();
             Response::from_parts(parts, body)
         } else {
             response
@@ -1326,6 +1365,7 @@ impl Router {
             None => self.bot.as_ref(),
         };
         if let Some(policy) = bot_policy {
+            let _bot_timing = crate::logging::StageTimer::new(crate::logging::Stage::Bot);
             let tls = request.extensions().get::<TlsSni>().is_some();
             if request.uri().path() == bot::CHALLENGE_PATH {
                 if request.method() != http::Method::GET {
@@ -1423,8 +1463,17 @@ impl Router {
             Ok(Some(index)) => index,
             Ok(None) => {
                 #[cfg(feature = "hosting")]
-                return handler::handle_request(request, Arc::clone(&self.fallback), peer, local)
+                {
+                    let _backend_timing =
+                        crate::logging::StageTimer::new(crate::logging::Stage::Backend);
+                    return handler::handle_request(
+                        request,
+                        Arc::clone(&self.fallback),
+                        peer,
+                        local,
+                    )
                     .await;
+                }
                 // Without hosting there is no fallback site to serve.
                 #[cfg(not(feature = "hosting"))]
                 return response::error_response(StatusCode::NOT_FOUND, "Not found\n");
@@ -1439,6 +1488,7 @@ impl Router {
                 .extensions()
                 .get::<DirectPeer>()
                 .map_or(peer, |direct_peer| direct_peer.0);
+            let _backend_timing = crate::logging::StageTimer::new(crate::logging::Stage::Backend);
             let response = proxy.forward(request, direct_peer, tls).await;
             let (parts, body) = response.into_parts();
             return Response::from_parts(parts, response::coalesce_ready_body(body));
@@ -1785,6 +1835,17 @@ fn validate_vhost_declarations<'a>(
                     },
                 )?;
             }
+            if let Some(min_workers) = app.min_workers {
+                crate::config::parse_fastcgi_app_min_workers(&min_workers.to_string()).map_err(
+                    |error| {
+                        format!(
+                            "vhost {} FastCGI app .{}: {error}",
+                            index + 1,
+                            app.extension
+                        )
+                    },
+                )?;
+            }
             if let Some(idle_timeout) = app.idle_timeout {
                 crate::config::parse_fastcgi_app_idle_timeout(&idle_timeout.to_string()).map_err(
                     |error| {
@@ -1861,8 +1922,15 @@ fn validate_vhost_waf_declarations<'a>(
     {
         return Err("modsecurity_disable_rules requires --modsecurity-rules".into());
     }
-    if !has_global_waf && entries.any(|entry| entry.modsecurity_block_status.is_some()) {
+    if !has_global_waf
+        && entries
+            .clone()
+            .any(|entry| entry.modsecurity_block_status.is_some())
+    {
         return Err("modsecurity_block_status requires --modsecurity-rules".into());
+    }
+    if !has_global_waf && entries.any(|entry| entry.modsecurity_response_body.is_some()) {
+        return Err("modsecurity_response_body requires --modsecurity-rules".into());
     }
     Ok(())
 }
@@ -2479,8 +2547,14 @@ fn validate_vhost_entry(
                 return Err("vhost FastCGI app command cannot contain NUL".into());
             }
             crate::config::parse_fastcgi_app(&format!("{extension}={program}"))?;
-            crate::config::parse_fastcgi_app_max_workers(
-                &app.max_workers.unwrap_or(1).to_string(),
+            let max_workers = app
+                .max_workers
+                .unwrap_or_else(crate::config::default_fastcgi_app_max_workers);
+            crate::config::parse_fastcgi_app_max_workers(&max_workers.to_string())?;
+            crate::config::parse_fastcgi_app_min_workers(
+                &app.min_workers
+                    .unwrap_or(crate::config::DEFAULT_FASTCGI_APP_MIN_WORKERS)
+                    .to_string(),
             )?;
             crate::config::parse_fastcgi_app_idle_timeout(
                 &app.idle_timeout
@@ -2775,6 +2849,7 @@ mod tests {
             default: is_default,
             modsecurity_disable_rules: Vec::new(),
             modsecurity_block_status: None,
+            modsecurity_response_body: None,
             acme: None,
             proxy_pass: None,
             proxy_preserve_host: None,
@@ -3216,6 +3291,7 @@ mod tests {
                     program: "/usr/bin/php8.4-cgi".into(),
                     args: vec!["--foreground".to_owned()],
                     env: BTreeMap::from([("APP_MODE".to_owned(), "worker".to_owned())]),
+                    min_workers: 1,
                     max_workers: 4,
                     idle_timeout: Duration::from_secs(12),
                 }),

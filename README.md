@@ -175,7 +175,8 @@ see all command-line options. Common options include:
 | `--max-connections N` | Maximum concurrent client connections across TCP listeners; defaults to 4096 and must be positive. |
 | `--header-read-timeout SECS` | Maximum time to receive a complete request head, including a client that sends no bytes; defaults to 30 seconds. |
 | `--tls-handshake-timeout SECS` | Maximum time to complete a TLS handshake; defaults to 10 seconds. |
-| `--debug` | Log verbose startup details, including listener binding, workers, and TLS initialization. |
+| `--debug` | Log verbose startup details and a per-request timing summary when the response body finishes. |
+| `--server-timing` | Add request-stage durations to the `Server-Timing` response header. |
 | `--no-plain-http` | Disable the plain HTTP listener; incompatible with ACME HTTP-01. |
 | `--root DIRECTORY` | Fallback document root when no virtual host handles a request; defaults to `.`. |
 | `--user USER [--group GROUP]` | Drop the master process to this account before starting; requires root. |
@@ -205,9 +206,11 @@ see all command-line options. Common options include:
 | `--fastcgi EXT=ADDR` | Route a file extension to a FastCGI TCP or Unix-socket backend. |
 | `--cgi EXT[=INTERPRETER]` | Execute matching scripts directly or with an interpreter; repeatable. |
 | `--fastcgi-app EXT=PROGRAM` | Start and supervise a FastCGI application for an extension. |
-| `--fastcgi-app-max-workers EXT=N` | Set the on-demand FastCGI app pool limit (1–256); defaults to one. |
+| `--fastcgi-app-max-workers EXT=N` | Set the FastCGI app pool limit (1–256); defaults to the CPU count, capped at 8. |
+| `--fastcgi-app-min-workers EXT=N` | Keep N app workers warm (0–256, capped at the maximum); defaults to one. |
 | `--fastcgi-app-idle-timeout EXT=SECS` | Reap surplus idle app workers after 1–86,400 seconds; defaults to 60 seconds. |
 | `--modsecurity-rules FILE` | Load ModSecurity rules; can be repeated to load multiple files. |
+| `--modsecurity-response-body-limit BYTES` | Buffer at most this much of an inspected response body; defaults to `--modsecurity-body-limit` if set, otherwise 64 KiB. |
 | `--modsecurity-block-status CODE` | Override the status for ModSecurity blocking interventions (400–599; defaults to the rule status or 403). |
 | `--acme-directory URL --acme-cache DIR` | Configure ACME certificate provisioning and its cache. |
 
@@ -256,6 +259,19 @@ need not be accessible to the website account. The master and website workers
 still perform website operations under their configured users and groups. The
 server sends error output to stderr when no error log is configured, including
 output from the root helper and worker processes.
+
+Access log formats support `%{NAME}T` and `%{NAME:UNIT}T` for request timing.
+Names are `total`, `headers`, `ttfb`, `bot`, `waf`, `waf_response`, `spawn`,
+and `backend`; units are `us` (the default), `ms`, or `s`. For example,
+`%{ttfb:ms}T %{backend:ms}T %{total:ms}T` logs milliseconds, while a stage
+that did not run is written as `-`. Existing `%D` and `%T` directives now
+measure from request dispatch. The opt-in `--server-timing` header reports the
+available stages, time until response headers, `ttfb` (server-side time to
+first byte), and elapsed time when headers are prepared. Because the status line
+and headers are the first bytes sent, the header's `ttfb` is measured when they
+are ready; the access log's `%{ttfb}T` instead marks the first body byte, which
+is not yet known when the header is written. With `--debug`, a `request timing:` line is written when the
+response body finishes or is dropped.
 
 The helper only works inside directories fixed at startup: the directories
 holding the log files and TLS certificate/key files named by the options and
@@ -551,11 +567,28 @@ without it, the rule's `status` is used when valid, otherwise Charlotte returns
 host can override the global setting with `modsecurity_block_status: CODE` in
 its YAML declaration; this requires global ModSecurity rules.
 
-Server-managed FastCGI apps start with no workers. The first request starts one,
-and additional workers are started only when concurrent requests need them, up
-to `--fastcgi-app-max-workers`. Every idle worker is reaped after
-`--fastcgi-app-idle-timeout`, so the pool can scale back to zero; a request after
-that starts a fresh worker. The idle timeout defaults to 60 seconds. The old
+Response bodies are only buffered for inspection when the loaded rules would
+inspect them. At startup Charlotte reads the rule files (following `Include`
+globs) for `SecResponseBodyAccess` and `SecResponseBodyMimeType`, using
+libmodsecurity's defaults (access off; `text/plain` and `text/html`). Responses
+with access off or a `Content-Type` outside the list stream straight through;
+phase 4 still runs, and the transaction is logged when the body ends. Rules
+that switch inspection at runtime (`ctl:responseBodyAccess`,
+`ctl:responseBodyMimeType`), or rule files that cannot be read, make Charlotte
+inspect every response. A vhost can force the choice with
+`modsecurity_response_body: true` or `false`. Before the first byte is sent, at
+most `--modsecurity-response-body-limit` (64 KiB by default) of an inspected
+body is buffered; anything beyond that is streamed.
+
+Server-managed FastCGI apps start `--fastcgi-app-min-workers` workers at
+startup (one by default), so the first request does not pay the app's start-up
+cost. More workers are started when concurrent requests need them, up to
+`--fastcgi-app-max-workers`, which defaults to the CPU count, capped at 8.
+Idle workers beyond the minimum are reaped after `--fastcgi-app-idle-timeout`;
+set the minimum to 0 to let the pool scale to zero. Time spent starting a
+worker for a request is reported as the `spawn` timing stage. In vhost YAML the
+same settings are `min_workers` and `max_workers` on a `fastcgi_app` entry. The
+idle timeout defaults to 60 seconds. The old
 `--fastcgi-app-workers` option remains as a deprecated alias for
 `--fastcgi-app-max-workers`. Workers restart immediately after a clean exit if
 they ran for at least 50 ms; failed or very short-lived processes are delayed
@@ -725,7 +758,10 @@ path and query are appended to that prefix. `proxy_preserve_host` defaults to
 `proxy_timeout` is the response-header timeout in seconds and defaults to 60.
 HTTPS upstreams use the system trust roots unless `proxy_ca_root` points to a
 PEM CA bundle; that path is relative to the YAML file. Request bodies and
-upstream response bodies are streamed. Charlotte removes hop-by-hop headers and
+upstream response bodies are streamed. Upstream sockets use `TCP_NODELAY` and,
+on Linux, `TCP_QUICKACK` after each read, so a backend that leaves Nagle's
+algorithm on is not held back by delayed acknowledgements (about 40 ms per
+response on a reused connection). Charlotte removes hop-by-hop headers and
 sets `X-Forwarded-For`, `X-Forwarded-Proto`, and `X-Forwarded-Host`. Connection
 upgrades, WebSockets, and CONNECT tunnelling are not supported; upstream
 connection failures return 502 and response-header timeouts return 504.

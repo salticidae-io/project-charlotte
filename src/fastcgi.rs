@@ -1056,6 +1056,7 @@ mod tests {
     fn test_config(root: PathBuf) -> Config {
         Config {
             debug: false,
+            server_timing: false,
             plain_http: true,
             https_redirect: false,
             bind: "127.0.0.1:8080".parse::<SocketAddr>().unwrap(),

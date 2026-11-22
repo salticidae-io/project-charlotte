@@ -1435,6 +1435,7 @@ dependencies = [
  "test-fuzz",
  "tokio",
  "tokio-rustls",
+ "tower-service",
  "x509-parser",
 ]
 

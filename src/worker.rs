@@ -156,6 +156,7 @@ async fn dispatch(
             local: Some(local),
             server_name,
             error_log: None,
+            timing: None,
         },
         handler::handle_request(request, config, peer, local),
     )
