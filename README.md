@@ -224,6 +224,19 @@ see all command-line options. Common options include:
 | `--modsecurity-block-status CODE` | Override the status for ModSecurity blocking interventions (400–599; defaults to the rule status or 403). |
 | `--acme-directory URL --acme-cache DIR` | Configure ACME certificate provisioning and its cache. |
 
+Use `charlotte-configure` to create a single virtual-host YAML entry through an
+interactive question-and-answer flow. Fixed-choice settings are presented as
+numbered choices, and Charlotte validates the completed entry with its normal
+configuration validator before writing it. By default YAML is printed to
+stdout, while prompts go to stderr so the output can be redirected safely;
+`--output FILE` writes a new file with mode `0644`, and `--force` permits
+replacing an existing file. The tool only offers hosting, proxy, and ACME
+choices supported by the build you are using. For example:
+
+```sh
+charlotte-configure --output /etc/charlotte/vhosts.d/example.yaml
+```
+
 Any command-line option can also be set as a global default in the main
 configuration file's top-level `options` mapping. Use the long option name with
 hyphens or underscores; flags take YAML booleans, single-value options take a

@@ -2700,6 +2700,70 @@ fn parse_file_config(content: &str) -> Result<FileConfig, serde_yaml_ng::Error> 
     }
 }
 
+pub(crate) fn validate_vhost_document(
+    content: &str,
+    config_dir: &Path,
+    has_waf: bool,
+) -> Result<(), Vec<String>> {
+    let value: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(content).map_err(|error| vec![format!("invalid YAML: {error}")])?;
+    let Some(mapping) = value.as_mapping() else {
+        return Err(vec!["configuration must be a YAML mapping".to_owned()]);
+    };
+    for key in ["options", "vhost_dir"] {
+        if mapping.contains_key(serde_yaml_ng::Value::String(key.to_owned())) {
+            return Err(vec![format!(
+                "{key} is not allowed in a generated vhost document"
+            )]);
+        }
+    }
+    let file =
+        parse_file_config(content).map_err(|error| vec![format!("invalid YAML: {error}")])?;
+    if file.vhost.len() != 1 {
+        return Err(vec![format!(
+            "generated document must contain exactly one vhost; found {}",
+            file.vhost.len()
+        )]);
+    }
+    let fallback = match Config::parse(std::iter::empty::<String>()).map_err(|error| {
+        vec![format!(
+            "could not construct default configuration: {error}"
+        )]
+    })? {
+        crate::config::ParseResult::Config(config) => config,
+        crate::config::ParseResult::Help => {
+            return Err(vec!["could not construct default configuration".to_owned()]);
+        }
+    };
+    validate_vhost_entry(&file.vhost[0], &fallback, config_dir, has_waf)
+        .map_err(|error| vec![error.to_string()])
+}
+
+#[cfg(test)]
+mod configure_validation_tests {
+    use super::validate_vhost_document;
+    use std::path::Path;
+
+    #[test]
+    fn generated_vhost_validation_rejects_global_options_and_multiple_entries() {
+        for yaml in [
+            "options: {debug: true}\nvhost: []\n",
+            "vhost_dir: /etc/charlotte/sites\nvhost: []\n",
+        ] {
+            let errors = validate_vhost_document(yaml, Path::new("."), false).unwrap_err();
+            assert!(errors[0].contains("not allowed"), "{errors:?}");
+        }
+
+        let errors = validate_vhost_document(
+            "vhost:\n  - server_names: [one.example]\n  - server_names: [two.example]\n",
+            Path::new("."),
+            false,
+        )
+        .unwrap_err();
+        assert!(errors[0].contains("exactly one vhost"), "{errors:?}");
+    }
+}
+
 fn valid_control_name(name: &str) -> bool {
     let mut bytes = name.bytes();
     bytes

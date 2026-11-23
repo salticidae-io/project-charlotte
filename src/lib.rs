@@ -39,6 +39,35 @@ mod waf;
 #[cfg(feature = "hosting")]
 mod worker;
 
+/// Internal entry points used by the interactive vhost configuration tool.
+#[doc(hidden)]
+pub mod configure_support {
+    /// Whether this build can host document-root virtual hosts.
+    pub const HOSTING_ENABLED: bool = cfg!(feature = "hosting");
+    /// Whether this build can proxy virtual hosts to HTTP upstreams.
+    pub const PROXY_ENABLED: bool = cfg!(feature = "proxy");
+    /// Whether this build supports ACME certificate provisioning.
+    pub const ACME_ENABLED: bool = cfg!(feature = "acme");
+
+    /// Validates a single-vhost YAML document using Charlotte's startup validator.
+    ///
+    /// `config_dir` is the directory against which relative paths in the vhost
+    /// are resolved. Set `has_waf` when the server will load ModSecurity rules
+    /// globally; vhost ModSecurity overrides require that global configuration.
+    ///
+    /// # Errors
+    /// Returns one or more diagnostics if the YAML is malformed, contains
+    /// forbidden global settings, declares anything other than one vhost, or
+    /// fails the same semantic checks used by server startup.
+    pub fn validate_vhost_yaml(
+        yaml: &str,
+        config_dir: &std::path::Path,
+        has_waf: bool,
+    ) -> Result<(), Vec<String>> {
+        crate::vhost::validate_vhost_document(yaml, config_dir, has_waf)
+    }
+}
+
 #[cfg(all(test, feature = "hosting"))]
 mod fuzz_support;
 
