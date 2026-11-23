@@ -26,13 +26,20 @@ headless validation mode.
 - Optional ModSecurity request and response inspection.
 - Optional TLS with SNI-based certificate selection, ACME HTTP-01 certificate
   provisioning and renewal, and HTTP/3 over QUIC.
-- Hot reload of virtual-host files from a configured directory.
+- Optional Redis-backed swarm access checks, plus per-client rate limiting and
+  bot detection with proof-of-work challenges.
+- A local Unix-socket control API (`charlotte-ctl`), worker cgroup v2 settings,
+  and tools to convert Apache/nginx configurations or interactively create a
+  vhost (`apache2charlotte`, `nginx2charlotte`, and `charlotte-configure`).
+- A configuration validator (`--check-config`) and watched virtual-host file
+  reloads.
 
 ## Requirements
 
 - Rust and Cargo with Rust 2024 edition support (Rust 1.85 or newer).
-- The `modsecurity-rs` dependency checked out as a sibling directory at
-  `../modsecurity-rs`, as specified by the path dependency in `Cargo.toml`.
+- The `libmodsecurity3-rs` crate and the system `libmodsecurity3` development
+  library (`libmodsecurity-dev` on Debian/Ubuntu), required for all builds;
+  ModSecurity support uses this library.
 
 Build and run the test suite from the project directory:
 
@@ -43,7 +50,7 @@ cargo test
 
 ## Build features
 
-The major parts of the server are Cargo features. All four are enabled by
+The major parts of the server are Cargo features. All five are enabled by
 default; leave some out to build a smaller server.
 
 | Feature | Provides | Without it |
@@ -52,6 +59,7 @@ default; leave some out to build a smaller server.
 | `proxy` | Virtual hosts with `proxy_pass`. | Virtual hosts with `proxy_pass` are refused. |
 | `acme` | ACME certificate provisioning (`--acme-*`). | The ACME options and `acme: true` are refused. |
 | `http3` | The HTTP/3 listener (`--http3-bind`). | TLS is served over TCP only. |
+| `swarm` | Redis-backed client access checks compatible with logchomper. | Swarm options and vhost `swarm` settings are refused. |
 
 TLS termination, SNI certificate selection, ModSecurity, `--user`/`--group`,
 and virtual-host reloading are part of every build. A build refuses the
@@ -66,8 +74,8 @@ certificates with ACME, and serves HTTP/3, but hosts nothing itself:
 cargo build --release --no-default-features --features proxy,acme,http3
 ```
 
-`scripts/check-features.sh` checks that every combination of features
-compiles without warnings.
+`scripts/check-features.sh` checks that every combination of the five features
+compiles without warnings, both for the server and all targets.
 
 ### Debian packages
 
@@ -78,11 +86,12 @@ other:
 | Package | Command | Features |
 | --- | --- | --- |
 | `project-charlotte` | `cargo deb` | all |
-| `project-charlotte-proxy` | `cargo deb --variant proxy` | `proxy`, `acme`, `http3` |
+| `project-charlotte-proxy` | `cargo deb --variant proxy` | `proxy`, `acme`, `http3` (no `hosting` or `swarm`) |
 
-To build for Ubuntu 22.04 (jammy) from a newer host, run
-`scripts/build-deb-jammy.sh` (add `--variant proxy` for the proxy package). It
-builds inside an `ubuntu:22.04` container with Docker (set
+The Debian packages workflow currently builds for Ubuntu 24.04 (noble) and
+Ubuntu 26.04 (resolute). To build for Ubuntu 22.04 (jammy) from a newer host,
+run `scripts/build-deb-jammy.sh` (add `--variant proxy` for the proxy package).
+It builds inside an `ubuntu:22.04` container with Docker (set
 `CONTAINER_ENGINE=podman` to use Podman), so the binaries link against jammy's
 glibc and `libmodsecurity3`. Packages are written to `target/jammy/debian/`.
 
@@ -423,11 +432,13 @@ storage `503`.
 ### Bot detection
 
 Bot detection is disabled unless `--bot-detection` (the built-in policy in
-enforcing mode) or `--bot-config FILE` (a YAML policy) is used. The master
-evaluates every request after the ACME challenge check and the rate limit, and
-before ModSecurity and routing, so blocked and challenged requests never reach
-the WAF, a worker, a script, or a proxied upstream. The client address is the
-same one used for rate limiting, so it honours `--trusted-proxy`.
+enforcing mode) or `--bot-config FILE` (a YAML policy) is used. Requests are
+counted for the busy-traffic gate first; ACME challenges are then served,
+followed by any configured HTTP-to-HTTPS redirect, rate limiting, optional
+swarm access checks, bot policy, and ModSecurity before routing. Thus requests
+blocked or challenged at those stages do not reach a worker, script, or
+proxied upstream. The client address is the same one used for rate limiting,
+so it honours `--trusted-proxy`.
 
 #### How a request is scored
 
@@ -906,8 +917,10 @@ general server configuration.
 Run tests with `cargo test`. Tests that need a feature are compiled only when
 it is enabled, so a reduced build is tested with the same feature flags it is
 built with, for example
-`cargo test --no-default-features --features proxy,acme,http3`. Fuzz target
-setup, seed tests, and target commands are documented in
+`cargo test --no-default-features --features proxy,acme,http3`. On Linux, the
+root-only tests are marked ignored in ordinary runs; after building as the
+normal user, run them with `sudo -E env PATH="$PATH" cargo test -- --ignored`.
+Fuzz target setup, seed tests, and target commands are documented in
 [FUZZING.md](FUZZING.md); the fuzz targets need the default features.
 
 Run coverage with `cargo tarpaulin` (install it with
