@@ -51,9 +51,18 @@ pub struct FastCgiApp {
     pub program: PathBuf,
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
+    pub mode: FastCgiAppMode,
+    pub php_defaults: bool,
     pub min_workers: usize,
     pub max_workers: usize,
     pub idle_timeout: Duration,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FastCgiAppMode {
+    #[default]
+    Cgi,
+    Fpm,
 }
 
 #[derive(Clone, Debug)]
@@ -214,6 +223,12 @@ struct Cli {
     /// Environment variable of a spawned FastCGI application
     #[arg(long, value_name = "EXT=KEY=VALUE", hide = !HOSTING, allow_hyphen_values = true)]
     fastcgi_app_env: Vec<String>,
+    /// Run a spawned PHP app as CGI or a single managed PHP-FPM process
+    #[arg(long, value_name = "EXT=cgi|fpm", hide = !HOSTING, allow_hyphen_values = true)]
+    fastcgi_app_mode: Vec<String>,
+    /// Enable default OPcache and realpath settings for a PHP app
+    #[arg(long, value_name = "EXT=on|off", hide = !HOSTING, allow_hyphen_values = true)]
+    fastcgi_app_php_defaults: Vec<String>,
     /// FastCGI/CGI timeout in seconds
     #[arg(long, value_name = "SECS", default_value = "60", value_parser = parse_cli_fastcgi_timeout, hide = !HOSTING, allow_hyphen_values = true)]
     fastcgi_timeout: Duration,
@@ -403,6 +418,8 @@ const FEATURE_OPTIONS: &[(&str, bool, &[&str])] = &[
             "fastcgi_app_min_workers",
             "fastcgi_app_idle_timeout",
             "fastcgi_app_env",
+            "fastcgi_app_mode",
+            "fastcgi_app_php_defaults",
             "fastcgi_timeout",
             "fastcgi_keepalive",
             "static_cache_ttl_ms",
@@ -657,6 +674,42 @@ impl Config {
             ));
         }
 
+        let mut fastcgi_app_modes = Vec::new();
+        for value in &cli.fastcgi_app_mode {
+            let (extension, mode) = value.split_once('=').ok_or_else(|| {
+                format!("invalid FastCGI app mode: {value}; expected EXT=cgi|fpm")
+            })?;
+            let extension = normalize_extension(extension)?;
+            let mode = parse_fastcgi_app_mode(mode)?;
+            if fastcgi_app_modes
+                .iter()
+                .any(|(existing, _): &(String, FastCgiAppMode)| existing == &extension)
+            {
+                return Err(format!(
+                    "duplicate FastCGI app mode for extension: {extension}"
+                ));
+            }
+            fastcgi_app_modes.push((extension, mode));
+        }
+
+        let mut fastcgi_app_php_defaults = Vec::new();
+        for value in &cli.fastcgi_app_php_defaults {
+            let (extension, enabled) = value.split_once('=').ok_or_else(|| {
+                format!("invalid FastCGI app PHP defaults setting: {value}; expected EXT=on|off")
+            })?;
+            let extension = normalize_extension(extension)?;
+            let enabled = parse_fastcgi_app_php_defaults(enabled)?;
+            if fastcgi_app_php_defaults
+                .iter()
+                .any(|(existing, _): &(String, bool)| existing == &extension)
+            {
+                return Err(format!(
+                    "duplicate FastCGI app PHP defaults setting for extension: {extension}"
+                ));
+            }
+            fastcgi_app_php_defaults.push((extension, enabled));
+        }
+
         let Cli {
             user: master_user,
             group: master_group,
@@ -678,6 +731,8 @@ impl Config {
             static_cache_ttl_ms,
             fastcgi_app_min_workers: _,
             fastcgi_app_max_workers: _,
+            fastcgi_app_mode: _,
+            fastcgi_app_php_defaults: _,
             threads,
             worker_threads,
             worker_idle_timeout,
@@ -826,6 +881,34 @@ impl Config {
         }
         for (extension, key, value) in fastcgi_app_env {
             add_fastcgi_app_env(&mut fastcgi, &extension, key, value)?;
+        }
+        for (extension, mode) in fastcgi_app_modes {
+            let Some(FastCgiBackend {
+                address: FastCgiAddress::Spawn(app),
+                ..
+            }) = fastcgi
+                .iter_mut()
+                .find(|backend| backend.extension == extension)
+            else {
+                return Err(format!(
+                    "FastCGI app mode references undeclared app extension: {extension}"
+                ));
+            };
+            app.mode = mode;
+        }
+        for (extension, enabled) in fastcgi_app_php_defaults {
+            let Some(FastCgiBackend {
+                address: FastCgiAddress::Spawn(app),
+                ..
+            }) = fastcgi
+                .iter_mut()
+                .find(|backend| backend.extension == extension)
+            else {
+                return Err(format!(
+                    "FastCGI app PHP defaults references undeclared app extension: {extension}"
+                ));
+            };
+            app.php_defaults = enabled;
         }
 
         let tls = match (tls_cert, tls_key) {
@@ -1459,11 +1542,33 @@ pub(crate) fn parse_fastcgi_app(value: &str) -> Result<FastCgiBackend, String> {
             program: PathBuf::from(program),
             args: Vec::new(),
             env: BTreeMap::new(),
+            mode: FastCgiAppMode::Cgi,
+            php_defaults: true,
             min_workers: 1,
             max_workers: default_fastcgi_app_max_workers(),
             idle_timeout: Duration::from_secs(DEFAULT_FASTCGI_APP_IDLE_TIMEOUT_SECS),
         }),
     })
+}
+
+pub(crate) fn parse_fastcgi_app_mode(value: &str) -> Result<FastCgiAppMode, String> {
+    match value {
+        "cgi" => Ok(FastCgiAppMode::Cgi),
+        "fpm" => Ok(FastCgiAppMode::Fpm),
+        _ => Err(format!(
+            "invalid FastCGI app mode: {value}; expected cgi or fpm"
+        )),
+    }
+}
+
+pub(crate) fn parse_fastcgi_app_php_defaults(value: &str) -> Result<bool, String> {
+    match value {
+        "on" => Ok(true),
+        "off" => Ok(false),
+        _ => Err(format!(
+            "invalid FastCGI app PHP defaults setting: {value}; expected on or off"
+        )),
+    }
 }
 
 pub(crate) fn normalize_extension(extension: &str) -> Result<String, String> {
@@ -1554,8 +1659,8 @@ mod tests {
     use super::{Config, ParseResult, parse_modsecurity_block_status};
     #[cfg(feature = "hosting")]
     use super::{
-        DEFAULT_FASTCGI_APP_IDLE_TIMEOUT_SECS, FastCgiAddress, default_fastcgi_app_max_workers,
-        validate_try_files,
+        DEFAULT_FASTCGI_APP_IDLE_TIMEOUT_SECS, FastCgiAddress, FastCgiAppMode,
+        default_fastcgi_app_max_workers, validate_try_files,
     };
     use crate::forwarded::TrustedProxy;
     use crate::ratelimit::RateLimit;
@@ -2019,6 +2124,10 @@ mod tests {
             "php=APP_MODE=production".to_owned(),
             "--fastcgi-app-max-workers".to_owned(),
             "php=4".to_owned(),
+            "--fastcgi-app-mode".to_owned(),
+            "php=fpm".to_owned(),
+            "--fastcgi-app-php-defaults".to_owned(),
+            "php=off".to_owned(),
             "--fastcgi-app-idle-timeout".to_owned(),
             "php=12".to_owned(),
             "--fastcgi-app".to_owned(),
@@ -2039,6 +2148,8 @@ mod tests {
         assert_eq!(app.args, ["--foreground", "--bind"]);
         assert_eq!(app.max_workers, 4);
         assert_eq!(app.idle_timeout, Duration::from_secs(12));
+        assert_eq!(app.mode, FastCgiAppMode::Fpm);
+        assert!(!app.php_defaults);
         assert_eq!(
             app.env.get("APP_MODE").map(String::as_str),
             Some("production")
@@ -2056,12 +2167,45 @@ mod tests {
             panic!("expected spawned FastCGI app")
         };
         assert_eq!(app.min_workers, 1);
+        assert_eq!(app.mode, FastCgiAppMode::Cgi);
+        assert!(app.php_defaults);
         assert_eq!(app.max_workers, default_fastcgi_app_max_workers());
         assert!((1..=8).contains(&app.max_workers));
         assert_eq!(config.modsecurity_response_body_limit, 64 * 1024);
         assert_eq!(
             app.idle_timeout,
             Duration::from_secs(DEFAULT_FASTCGI_APP_IDLE_TIMEOUT_SECS)
+        );
+    }
+
+    #[cfg(feature = "hosting")]
+    #[test]
+    fn validates_fastcgi_app_mode_and_php_default_options() {
+        for (option, value) in [
+            ("--fastcgi-app-mode", "php=bad"),
+            ("--fastcgi-app-php-defaults", "php=yes"),
+        ] {
+            assert!(
+                Config::parse([
+                    "--fastcgi-app".to_owned(),
+                    "php=php-cgi".to_owned(),
+                    option.to_owned(),
+                    value.to_owned(),
+                ])
+                .is_err()
+            );
+        }
+        assert!(Config::parse(["--fastcgi-app-mode".to_owned(), "php=fpm".to_owned(),]).is_err());
+        assert!(
+            Config::parse([
+                "--fastcgi-app".to_owned(),
+                "php=php-cgi".to_owned(),
+                "--fastcgi-app-mode".to_owned(),
+                "php=cgi".to_owned(),
+                "--fastcgi-app-mode".to_owned(),
+                "php=fpm".to_owned(),
+            ])
+            .is_err()
         );
     }
 

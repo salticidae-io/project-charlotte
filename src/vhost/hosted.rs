@@ -31,7 +31,7 @@ use tokio::{io::AsyncReadExt, net::UnixStream, sync::Mutex, time::timeout};
 use super::{Rejection, TlsSni, request_authority};
 use crate::{
     cgroup::CgroupSpec,
-    config::{FastCgiAddress, FastCgiApp, FastCgiBackend},
+    config::{FastCgiAddress, FastCgiApp, FastCgiAppMode, FastCgiBackend},
     response::{self, ResponseBody},
 };
 
@@ -560,6 +560,14 @@ pub(super) fn build_worker_args(worker: WorkerArgs<'_>) -> Vec<OsString> {
             for arg in &app.args {
                 args.push("--fastcgi-app-arg".into());
                 args.push(format!("{}={arg}", backend.extension).into());
+            }
+            if app.mode != FastCgiAppMode::Cgi {
+                args.push("--fastcgi-app-mode".into());
+                args.push(format!("{}=fpm", backend.extension).into());
+            }
+            if !app.php_defaults {
+                args.push("--fastcgi-app-php-defaults".into());
+                args.push(format!("{}=off", backend.extension).into());
             }
             args.push("--fastcgi-app-max-workers".into());
             args.push(format!("{}={}", backend.extension, app.max_workers).into());

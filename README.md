@@ -80,6 +80,12 @@ other:
 | `project-charlotte` | `cargo deb` | all |
 | `project-charlotte-proxy` | `cargo deb --variant proxy` | `proxy`, `acme`, `http3` |
 
+To build for Ubuntu 22.04 (jammy) from a newer host, run
+`scripts/build-deb-jammy.sh` (add `--variant proxy` for the proxy package). It
+builds inside an `ubuntu:22.04` container with Docker (set
+`CONTAINER_ENGINE=podman` to use Podman), so the binaries link against jammy's
+glibc and `libmodsecurity3`. Packages are written to `target/jammy/debian/`.
+
 The `Debian packages` GitHub workflow builds both for each supported Ubuntu
 release. Both packages install and enable the `project-charlotte.service`
 systemd unit. Before starting it, create `/etc/charlotte/charlotte.yaml` from
@@ -211,6 +217,8 @@ see all command-line options. Common options include:
 | `--fastcgi-app-max-workers EXT=N` | Set the FastCGI app pool limit (1–256); defaults to the CPU count, capped at 8. |
 | `--fastcgi-app-min-workers EXT=N` | Keep N app workers warm (0–256, capped at the maximum); defaults to one. |
 | `--fastcgi-app-idle-timeout EXT=SECS` | Reap surplus idle app workers after 1–86,400 seconds; defaults to 60 seconds. |
+| `--fastcgi-app-mode EXT=cgi|fpm` | Run an app as individual CGI workers (default) or one supervised PHP-FPM process. |
+| `--fastcgi-app-php-defaults EXT=on|off` | Enable or disable PHP OPcache/realpath defaults; enabled by default for programs whose name contains `php`. |
 | `--modsecurity-rules FILE` | Load ModSecurity rules; can be repeated to load multiple files. |
 | `--modsecurity-response-body-limit BYTES` | Buffer at most this much of an inspected response body; defaults to `--modsecurity-body-limit` if set, otherwise 64 KiB. |
 | `--modsecurity-block-status CODE` | Override the status for ModSecurity blocking interventions (400–599; defaults to the rule status or 403). |
@@ -620,6 +628,34 @@ idle timeout defaults to 60 seconds. The old
 `--fastcgi-app-max-workers`. Workers restart immediately after a clean exit if
 they ran for at least 50 ms; failed or very short-lived processes are delayed
 to avoid a rapid restart loop.
+
+For managed PHP commands, Charlotte supplies OPcache and realpath-cache
+defaults, sets `PHP_FCGI_MAX_REQUESTS=10000`, and configures a private
+`opcache.file_cache` directory under the system temporary directory. The cache
+directory is owned by the server or vhost-worker account and has mode `0700`;
+it is kept across app restarts, subject to the temporary directory's own
+lifetime. A command-line `-d key=value` setting overrides the matching default,
+and an explicit `PHP_FCGI_MAX_REQUESTS` environment value is preserved. Turn
+these defaults off per app with `--fastcgi-app-php-defaults EXT=off` or
+`php_defaults: false` in vhost YAML.
+
+Set `--fastcgi-app-mode EXT=fpm` or `mode: fpm` on a `fastcgi_app` YAML entry
+to run a PHP-FPM binary as one supervised process instead of separate
+`php-cgi` workers. Charlotte writes a private pool configuration and Unix
+socket, limits concurrent FastCGI requests to `max_workers`, and maps
+`min_workers` / `idle_timeout` to PHP-FPM's static, dynamic, or ondemand process
+manager. PHP-FPM workers share the OPcache managed by that FPM process. The
+process runs as the server or hosted-vhost worker account; PHP-FPM must be
+installed and available to that account.
+
+```yaml
+fastcgi_app:
+  - extension: php
+    command: [/usr/sbin/php-fpm8.3]
+    mode: fpm
+    min_workers: 2
+    max_workers: 8
+```
 
 Classic CGI entries can be configured from the command line or in each virtual
 host's YAML `cgi` list. Without an interpreter, the script must be executable;

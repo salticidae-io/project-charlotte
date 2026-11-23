@@ -148,6 +148,8 @@ struct FastCgiAppFile {
     command: Vec<String>,
     #[serde(default)]
     env: BTreeMap<String, String>,
+    mode: Option<String>,
+    php_defaults: Option<bool>,
     #[serde(default, alias = "workers")]
     max_workers: Option<usize>,
     min_workers: Option<usize>,
@@ -1007,6 +1009,13 @@ impl Router {
                             },
                         )
                         .map_err(|error| format!("vhost FastCGI app .{extension}: {error}"))?;
+                    let mode = app_file
+                        .mode
+                        .as_deref()
+                        .map(crate::config::parse_fastcgi_app_mode)
+                        .transpose()
+                        .map_err(|error| format!("vhost FastCGI app .{extension}: {error}"))?
+                        .unwrap_or_default();
                     for (key, value) in &app_file.env {
                         crate::config::validate_env_key(key)?;
                         if value.contains('\0') {
@@ -1020,6 +1029,8 @@ impl Router {
                     if let FastCgiAddress::Spawn(app) = &mut backend.address {
                         app.args = app_file.command.into_iter().skip(1).collect();
                         app.env = app_file.env;
+                        app.mode = mode;
+                        app.php_defaults = app_file.php_defaults.unwrap_or(true);
                         app.max_workers = max_workers;
                         app.min_workers = min_workers.min(max_workers);
                         app.idle_timeout = idle_timeout;
@@ -1862,6 +1873,15 @@ fn validate_vhost_declarations<'a>(
             )?;
         }
         for app in &entry.fastcgi_app {
+            if let Some(mode) = &app.mode {
+                crate::config::parse_fastcgi_app_mode(mode).map_err(|error| {
+                    format!(
+                        "vhost {} FastCGI app .{}: {error}",
+                        index + 1,
+                        app.extension
+                    )
+                })?;
+            }
             if let Some(max_workers) = app.max_workers {
                 crate::config::parse_fastcgi_app_max_workers(&max_workers.to_string()).map_err(
                     |error| {
@@ -3154,6 +3174,8 @@ mod tests {
                       - extension: php
                         command: [php8.4-cgi, --foreground]
                         env: { APP_MODE: test }
+                        mode: fpm
+                        php_defaults: false
                         max_workers: 4
                         idle_timeout: 12
             "#,
@@ -3162,6 +3184,8 @@ mod tests {
         assert_eq!(parsed.vhost[0].fastcgi_app[0].extension, "php");
         assert_eq!(parsed.vhost[0].fastcgi_app[0].max_workers, Some(4));
         assert_eq!(parsed.vhost[0].fastcgi_app[0].idle_timeout, Some(12));
+        assert_eq!(parsed.vhost[0].fastcgi_app[0].mode.as_deref(), Some("fpm"));
+        assert_eq!(parsed.vhost[0].fastcgi_app[0].php_defaults, Some(false));
         assert!(validate_vhost_declarations(&parsed.vhost).is_ok());
         assert_eq!(
             parsed.vhost[0].fastcgi_app[0].command,
@@ -3178,6 +3202,11 @@ mod tests {
         let mut invalid = parsed.vhost[0].clone();
         invalid.fastcgi_app[0].max_workers = Some(0);
         assert!(validate_vhost_declarations(&[invalid]).is_err());
+        let invalid_mode: FileConfig = serde_yaml_ng::from_str(
+            "vhost:\n  - server_names: [bad-mode.example]\n    root: /srv/bad-mode\n    user: site\n    fastcgi_app:\n      - extension: php\n        command: [php-cgi]\n        mode: invalid\n",
+        )
+        .unwrap();
+        assert!(validate_vhost_declarations(&invalid_mode.vhost).is_err());
         let mut invalid = parsed.vhost[0].clone();
         invalid.fastcgi_app[0].idle_timeout = Some(0);
         assert!(validate_vhost_declarations(&[invalid]).is_err());
@@ -3335,6 +3364,8 @@ mod tests {
                     program: "/usr/bin/php8.4-cgi".into(),
                     args: vec!["--foreground".to_owned()],
                     env: BTreeMap::from([("APP_MODE".to_owned(), "worker".to_owned())]),
+                    mode: crate::config::FastCgiAppMode::Fpm,
+                    php_defaults: false,
                     min_workers: 1,
                     max_workers: 4,
                     idle_timeout: Duration::from_secs(12),
@@ -3371,6 +3402,14 @@ mod tests {
         assert!(
             args.windows(2)
                 .any(|pair| { pair == ["--fastcgi-app-arg", "cgi=--foreground"] })
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| { pair == ["--fastcgi-app-mode", "cgi=fpm"] })
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| { pair == ["--fastcgi-app-php-defaults", "cgi=off"] })
         );
         assert!(
             args.windows(2)

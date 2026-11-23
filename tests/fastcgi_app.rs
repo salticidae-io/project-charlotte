@@ -259,6 +259,99 @@ fn new_root() -> PathBuf {
     ))
 }
 
+fn find_program(names: &[&str]) -> Option<PathBuf> {
+    let search_paths = std::env::split_paths(&std::env::var_os("PATH")?).collect::<Vec<_>>();
+    names.iter().find_map(|name| {
+        search_paths
+            .iter()
+            .map(|directory| directory.join(name))
+            .find(|path| path.is_file())
+    })
+}
+
+fn write_php_settings_script(root: &std::path::Path) {
+    std::fs::write(
+        root.join("echo.php"),
+        "<?php echo ini_get('opcache.file_cache'), \"\\n\", ini_get('realpath_cache_size'), \"\\n\", getenv('PHP_FCGI_MAX_REQUESTS'), \"\\n\", ini_get('opcache.enable'), \"\\n\", getenv('APP_VALUE'); ?>",
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn php_cgi_app_receives_opcache_and_realpath_defaults() {
+    let Some(program) = find_program(&["php-cgi"]) else {
+        eprintln!("skipping PHP defaults test: php-cgi is not installed");
+        return;
+    };
+    let fixture = Fixture::start_with_program(new_root(), program, Vec::new(), &[], &[]).await;
+    write_php_settings_script(&fixture.root);
+
+    let response = request(fixture.address, "localhost", "GET", "/echo.php", &[], b"").await;
+    assert_eq!(response.status, 200);
+    let body = String::from_utf8(response.body).unwrap();
+    let mut lines = body.lines();
+    let cache_dir = lines.next().unwrap();
+    assert!(
+        cache_dir.starts_with("/tmp/project-charlotte-opcache-"),
+        "{body}"
+    );
+    assert_eq!(lines.next(), Some("4096K"), "{body}");
+    assert_eq!(lines.next(), Some("10000"), "{body}");
+    assert_eq!(lines.next(), Some("1"), "{body}");
+
+    drop(fixture);
+    std::fs::remove_dir_all(cache_dir).unwrap();
+}
+
+#[tokio::test]
+async fn php_fpm_mode_serves_requests_with_generated_pool_settings() {
+    let Some(program) = find_program(&["php-fpm8.4", "php-fpm8.3", "php-fpm8.2", "php-fpm"]) else {
+        eprintln!("skipping PHP-FPM test: php-fpm is not installed");
+        return;
+    };
+    let fixture = Fixture::start_with_program(
+        new_root(),
+        program,
+        Vec::new(),
+        &["APP_VALUE=say\"hello"],
+        &[
+            "--fastcgi-app-mode",
+            "php=fpm",
+            "--fastcgi-app-max-workers",
+            "php=3",
+        ],
+    )
+    .await;
+    write_php_settings_script(&fixture.root);
+
+    let (first, second) = tokio::join!(
+        request(fixture.address, "localhost", "GET", "/echo.php", &[], b""),
+        request(fixture.address, "localhost", "GET", "/echo.php", &[], b"")
+    );
+    let mut cache_dir = None;
+    for response in [first, second] {
+        assert_eq!(response.status, 200);
+        let body = String::from_utf8(response.body).unwrap();
+        let mut lines = body.lines();
+        let reported_cache_dir = lines.next().unwrap();
+        assert!(
+            reported_cache_dir.starts_with("/tmp/project-charlotte-opcache-"),
+            "{body}"
+        );
+        cache_dir.get_or_insert_with(|| PathBuf::from(reported_cache_dir));
+        assert_eq!(lines.next(), Some("4096K"), "{body}");
+        assert_eq!(
+            lines.next(),
+            Some(""),
+            "PHP-FPM does not set PHP_FCGI_MAX_REQUESTS"
+        );
+        assert_eq!(lines.next(), Some("1"), "{body}");
+        assert_eq!(lines.next(), Some("say\"hello"), "{body}");
+    }
+    drop(fixture);
+    std::fs::remove_dir_all(cache_dir.unwrap()).unwrap();
+}
+
 #[tokio::test]
 async fn launches_application_and_forwards_get_parameters_with_clean_environment() {
     let fixture = Fixture::start(new_root(), None, None).await;
