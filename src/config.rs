@@ -65,6 +65,32 @@ pub enum FastCgiAppMode {
     Fpm,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Input shape of a command-line option exposed to the configure wizard.
+pub enum OptionKind {
+    /// Boolean switch.
+    Flag,
+    /// One scalar value.
+    Value,
+    /// A repeatable scalar value.
+    List,
+}
+
+#[derive(Clone, Debug)]
+/// Metadata for a visible global command-line option.
+pub struct OptionInfo {
+    /// YAML/CLI option name, normalized to underscores.
+    pub name: String,
+    /// Help text shown in the generic wizard menu.
+    pub help: String,
+    /// Whether the option is a switch, scalar, or repeatable list.
+    pub kind: OptionKind,
+    /// The CLI value placeholder, when one is defined.
+    pub value_name: Option<String>,
+    /// The first CLI default value, when one is defined.
+    pub default: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub debug: bool,
@@ -466,6 +492,58 @@ const FEATURE_OPTIONS: &[(&str, bool, &[&str])] = &[
 ];
 
 impl Config {
+    pub(crate) fn from_options(
+        options: &serde_yaml_ng::Value,
+        config_path: &Path,
+    ) -> Result<Self, String> {
+        let matches = Cli::command()
+            .try_get_matches_from(["project-charlotte"])
+            .map_err(|error| error.to_string())?;
+        let args = options_to_args(options, &matches, config_path)?;
+        match Self::parse(args)? {
+            ParseResult::Config(config) => Ok(*config),
+            ParseResult::Help => Err("could not construct configuration from options".to_owned()),
+        }
+    }
+
+    pub(crate) fn configurable_options() -> Vec<OptionInfo> {
+        Cli::command()
+            .get_arguments()
+            .filter_map(|arg| {
+                let long = arg.get_long()?;
+                let name = long.replace('-', "_");
+                if arg.is_hide_set()
+                    || matches!(
+                        name.as_str(),
+                        "config" | "check_config" | "help" | "worker" | "worker_uid" | "worker_gid"
+                    )
+                {
+                    return None;
+                }
+                let kind = if matches!(arg.get_action(), ArgAction::SetTrue) {
+                    OptionKind::Flag
+                } else if matches!(arg.get_action(), ArgAction::Append) {
+                    OptionKind::List
+                } else {
+                    OptionKind::Value
+                };
+                Some(OptionInfo {
+                    name,
+                    help: arg.get_help().map_or_else(String::new, ToString::to_string),
+                    kind,
+                    value_name: arg
+                        .get_value_names()
+                        .and_then(|names| names.first())
+                        .map(ToString::to_string),
+                    default: arg
+                        .get_default_values()
+                        .first()
+                        .map(|value| value.to_string_lossy().into_owned()),
+                })
+            })
+            .collect()
+    }
+
     pub fn parse(args: impl IntoIterator<Item = String>) -> Result<ParseResult, String> {
         let args = args.into_iter().collect::<Vec<_>>();
         let matches = match Cli::command().try_get_matches_from(
@@ -1681,6 +1759,41 @@ mod tests {
         ));
         fs::write(&path, content).unwrap();
         path
+    }
+
+    #[test]
+    fn from_options_uses_server_parser_and_config_relative_paths() {
+        let options_yaml = if cfg!(feature = "hosting") {
+            "bind: 0.0.0.0:9000\ndebug: true\nindex: [home.htm, index.html]\naccess_log_file: logs/access.log\n"
+        } else {
+            "bind: 0.0.0.0:9000\ndebug: true\naccess_log_file: logs/access.log\n"
+        };
+        let options: serde_yaml_ng::Value = serde_yaml_ng::from_str(options_yaml).unwrap();
+        let config = Config::from_options(
+            &options,
+            std::path::Path::new("/tmp/charlotte/options.yaml"),
+        )
+        .unwrap();
+
+        assert_eq!(config.bind.to_string(), "0.0.0.0:9000");
+        assert!(config.debug);
+        #[cfg(feature = "hosting")]
+        assert_eq!(config.index, ["home.htm", "index.html"]);
+        assert_eq!(
+            config.access_log_file.as_deref(),
+            Some(std::path::Path::new("/tmp/charlotte/logs/access.log"))
+        );
+    }
+
+    #[test]
+    fn from_options_rejects_unknown_reserved_and_invalid_options() {
+        for yaml in ["unknown_option: true", "worker: true", "group: www-data"] {
+            let options: serde_yaml_ng::Value = serde_yaml_ng::from_str(yaml).unwrap();
+            assert!(
+                Config::from_options(&options, std::path::Path::new("charlotte.yaml")).is_err(),
+                "accepted {yaml}"
+            );
+        }
     }
 
     #[cfg(feature = "hosting")]

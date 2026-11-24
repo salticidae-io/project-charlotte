@@ -20,7 +20,7 @@ use bytes::Bytes;
 use http::{HeaderValue, Request, Response, StatusCode, header::HOST};
 use http_body::Body;
 use http_body_util::BodyExt;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::Visitor};
 use tokio::sync::Mutex;
 
 #[cfg(feature = "acme")]
@@ -154,6 +154,60 @@ struct FastCgiAppFile {
     max_workers: Option<usize>,
     min_workers: Option<usize>,
     idle_timeout: Option<u64>,
+}
+
+struct FieldNamesDeserializer<'a> {
+    fields: &'a mut Option<&'static [&'static str]>,
+}
+
+impl<'de> serde::Deserializer<'de> for FieldNamesDeserializer<'_> {
+    type Error = serde::de::value::Error;
+
+    fn deserialize_any<V>(self, _visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        Err(serde::de::Error::custom("field names requested"))
+    }
+
+    fn deserialize_struct<V>(
+        self,
+        _name: &'static str,
+        fields: &'static [&'static str],
+        _visitor: V,
+    ) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        *self.fields = Some(fields);
+        Err(serde::de::Error::custom("field names captured"))
+    }
+
+    serde::forward_to_deserialize_any! {
+        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+        bytes byte_buf option unit unit_struct newtype_struct seq tuple tuple_struct
+        map enum identifier ignored_any
+    }
+}
+
+fn serde_struct_field_names<T: for<'de> Deserialize<'de>>() -> &'static [&'static str] {
+    let mut fields = None;
+    let _ = T::deserialize(FieldNamesDeserializer {
+        fields: &mut fields,
+    });
+    fields.unwrap_or(&[])
+}
+
+pub(crate) fn configure_vhost_keys() -> &'static [&'static str] {
+    serde_struct_field_names::<VhostFile>()
+}
+
+pub(crate) fn configure_fastcgi_app_keys() -> &'static [&'static str] {
+    serde_struct_field_names::<FastCgiAppFile>()
+}
+
+pub(crate) fn configure_bot_policy_keys() -> &'static [&'static str] {
+    serde_struct_field_names::<BotPolicyFile>()
 }
 
 #[derive(Deserialize)]
@@ -2725,23 +2779,57 @@ pub(crate) fn validate_vhost_document(
             file.vhost.len()
         )]);
     }
-    let fallback = match Config::parse(std::iter::empty::<String>()).map_err(|error| {
-        vec![format!(
-            "could not construct default configuration: {error}"
-        )]
-    })? {
-        crate::config::ParseResult::Config(config) => config,
-        crate::config::ParseResult::Help => {
-            return Err(vec!["could not construct default configuration".to_owned()]);
-        }
-    };
+    let fallback = configure_fallback(None, config_dir)?;
     validate_vhost_entry(&file.vhost[0], &fallback, config_dir, has_waf)
         .map_err(|error| vec![error.to_string()])
 }
 
+pub(crate) fn validate_main_document(content: &str, config_dir: &Path) -> Result<(), Vec<String>> {
+    let value: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(content).map_err(|error| vec![format!("invalid YAML: {error}")])?;
+    let Some(mapping) = value.as_mapping() else {
+        return Err(vec!["configuration must be a YAML mapping".to_owned()]);
+    };
+    for key in mapping.keys() {
+        let Some(key) = key.as_str() else {
+            return Err(vec![
+                "top-level configuration keys must be strings".to_owned(),
+            ]);
+        };
+        if !matches!(key, "options" | "vhost") {
+            return Err(vec![format!("unknown top-level configuration key: {key}")]);
+        }
+    }
+    let file =
+        parse_file_config(content).map_err(|error| vec![format!("invalid YAML: {error}")])?;
+    if file.vhost.len() > 1 {
+        return Err(vec![format!(
+            "generated document may contain at most one vhost; found {}",
+            file.vhost.len()
+        )]);
+    }
+    let fallback = configure_fallback(file.options.as_ref(), config_dir)?;
+    if let Some(entry) = file.vhost.first() {
+        let has_waf = !fallback.modsecurity_rules.is_empty();
+        validate_vhost_entry(entry, &fallback, config_dir, has_waf)
+            .map_err(|error| vec![error.to_string()])?;
+    }
+    Ok(())
+}
+
+fn configure_fallback(
+    options: Option<&serde_yaml_ng::Value>,
+    config_dir: &Path,
+) -> Result<Config, Vec<String>> {
+    let empty_options = serde_yaml_ng::Value::Mapping(serde_yaml_ng::Mapping::new());
+    let options = options.unwrap_or(&empty_options);
+    Config::from_options(options, &config_dir.join("charlotte.yaml"))
+        .map_err(|error| vec![format!("could not construct server configuration: {error}")])
+}
+
 #[cfg(test)]
 mod configure_validation_tests {
-    use super::validate_vhost_document;
+    use super::{validate_main_document, validate_vhost_document};
     use std::path::Path;
 
     #[test]
@@ -2761,6 +2849,37 @@ mod configure_validation_tests {
         )
         .unwrap_err();
         assert!(errors[0].contains("exactly one vhost"), "{errors:?}");
+    }
+
+    #[test]
+    fn generated_main_validation_rejects_unexpected_top_level_keys_and_multiple_vhosts() {
+        let errors = validate_main_document("other: true\n", Path::new(".")).unwrap_err();
+        assert!(errors[0].contains("unknown top-level"), "{errors:?}");
+
+        let errors = validate_main_document(
+            "options: {debug: true}\nvhost:\n  - server_names: [one.example]\n  - server_names: [two.example]\n",
+            Path::new("."),
+        )
+        .unwrap_err();
+        assert!(errors[0].contains("at most one vhost"), "{errors:?}");
+
+        assert!(validate_main_document("options: {debug: true}\n", Path::new(".")).is_ok());
+    }
+
+    #[cfg(feature = "proxy")]
+    #[test]
+    fn generated_main_validation_uses_global_options_for_vhost_waf_checks() {
+        let content = "options:\n  modsecurity-rules: [rules.conf]\nvhost:\n  - server_names: [proxy.example]\n    proxy_pass: http://127.0.0.1:3000\n    modsecurity_disable_rules: [123]\n";
+        assert!(validate_main_document(content, Path::new(".")).is_ok());
+        let without_waf = content.replace(
+            "options:\n  modsecurity-rules: [rules.conf]\n",
+            "options: {}\n",
+        );
+        let errors = validate_main_document(&without_waf, Path::new(".")).unwrap_err();
+        assert!(
+            errors[0].contains("modsecurity_disable_rules"),
+            "{errors:?}"
+        );
     }
 }
 

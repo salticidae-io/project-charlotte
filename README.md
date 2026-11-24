@@ -233,17 +233,39 @@ see all command-line options. Common options include:
 | `--modsecurity-block-status CODE` | Override the status for ModSecurity blocking interventions (400–599; defaults to the rule status or 403). |
 | `--acme-directory URL --acme-cache DIR` | Configure ACME certificate provisioning and its cache. |
 
-Use `charlotte-configure` to create a single virtual-host YAML entry through an
+Use `charlotte-configure` to create a virtual-host YAML entry through an
 interactive question-and-answer flow. Fixed-choice settings are presented as
-numbered choices, and Charlotte validates the completed entry with its normal
-configuration validator before writing it. By default YAML is printed to
-stdout, while prompts go to stderr so the output can be redirected safely;
-`--output FILE` writes a new file with mode `0644`, and `--force` permits
-replacing an existing file. The tool only offers hosting, proxy, and ACME
-choices supported by the build you are using. For example:
+numbered choices, and Charlotte validates each proposed setting and the
+completed document with its normal configuration checks before writing it. By
+default YAML is printed to stdout, while prompts go to stderr so the output can
+be redirected safely; `--output FILE` writes a new file with mode `0644`, and
+`--force` permits replacing an existing file. The tool only offers hosting,
+proxy, and ACME choices supported by the build you are using. For example:
 
 ```sh
 charlotte-configure --output /etc/charlotte/vhosts.d/example.yaml
+```
+
+After the standard setup questions, choose **Configure advanced settings?** to
+set worker thread counts, CGI and additional FastCGI backends, extra managed
+applications and their arguments/environment/pool settings, cgroup limits,
+proxy CA roots, swarm opt-out, log formats, ModSecurity rule exclusions, and
+the detailed fields of a bot policy. Lists are entered one value per line and
+end with a blank line. The wizard validates each proposed change with the same
+configuration checks used at startup and re-asks when it is invalid. The
+directory-index answer replaces the global list rather than appending to it.
+The wizard writes one vhost entry by default. Pass `--server-options` to also
+configure the server-wide `options:` mapping; after those questions, you can
+choose whether to add one vhost to the same file. Common listener, TLS/ACME,
+logging, bot, ModSecurity, rate-limit, trusted-proxy, and swarm settings have
+guided questions. A numbered menu exposes every other visible server CLI
+option; flags offer Yes/No/Unset, repeatable options accept one value per line,
+and scalar options are validated before they are applied. Builds without site
+hosting or proxy support can still use `--server-options` to create an
+options-only file. For example:
+
+```sh
+charlotte-configure --server-options --output /etc/charlotte/charlotte.yaml
 ```
 
 Any command-line option can also be set as a global default in the main

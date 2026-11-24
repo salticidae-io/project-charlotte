@@ -42,12 +42,35 @@ mod worker;
 /// Internal entry points used by the interactive vhost configuration tool.
 #[doc(hidden)]
 pub mod configure_support {
+    pub use crate::config::{OptionInfo, OptionKind};
     /// Whether this build can host document-root virtual hosts.
     pub const HOSTING_ENABLED: bool = cfg!(feature = "hosting");
     /// Whether this build can proxy virtual hosts to HTTP upstreams.
     pub const PROXY_ENABLED: bool = cfg!(feature = "proxy");
     /// Whether this build supports ACME certificate provisioning.
     pub const ACME_ENABLED: bool = cfg!(feature = "acme");
+    /// Whether this build supports Redis-backed swarm access checks.
+    pub const SWARM_ENABLED: bool = cfg!(feature = "swarm");
+
+    /// Returns visible global options that can be configured by the wizard.
+    pub fn server_options() -> Vec<OptionInfo> {
+        crate::config::Config::configurable_options()
+    }
+
+    /// Returns the YAML keys accepted by a virtual-host declaration.
+    pub fn vhost_keys() -> &'static [&'static str] {
+        crate::vhost::configure_vhost_keys()
+    }
+
+    /// Returns the YAML keys accepted by a managed FastCGI application.
+    pub fn fastcgi_app_keys() -> &'static [&'static str] {
+        crate::vhost::configure_fastcgi_app_keys()
+    }
+
+    /// Returns the YAML keys accepted by a bot policy.
+    pub fn bot_policy_keys() -> &'static [&'static str] {
+        crate::vhost::configure_bot_policy_keys()
+    }
 
     /// Validates a single-vhost YAML document using Charlotte's startup validator.
     ///
@@ -65,6 +88,15 @@ pub mod configure_support {
         has_waf: bool,
     ) -> Result<(), Vec<String>> {
         crate::vhost::validate_vhost_document(yaml, config_dir, has_waf)
+    }
+
+    /// Validates a generated main config containing global `options` and an
+    /// optional single `vhost` entry.
+    pub fn validate_main_config_yaml(
+        yaml: &str,
+        config_dir: &std::path::Path,
+    ) -> Result<(), Vec<String>> {
+        crate::vhost::validate_main_document(yaml, config_dir)
     }
 }
 
