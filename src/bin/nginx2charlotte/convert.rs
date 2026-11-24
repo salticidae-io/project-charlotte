@@ -363,6 +363,11 @@ fn convert_server_directive(
         },
         "ssl_certificate" => set_string(host, "tls_cert", value),
         "ssl_certificate_key" => set_string(host, "tls_key", value),
+        "ssl_trusted_certificate" => comment_directive_with_reason(
+            directive,
+            "used for OCSP stapling or client-certificate verification; it is not served as part of the certificate chain",
+            &mut host.comments,
+        ),
         "access_log" => convert_access_log(directive, host, &settings.log_formats),
         "error_log" => convert_error_log(directive, host),
         "proxy_set_header" => set_proxy_preserve_host(directive, host),

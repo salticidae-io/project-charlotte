@@ -51,6 +51,7 @@ http {
     index index.php index.html /index.php;
     ssl_certificate /etc/ssl/example.pem;
     ssl_certificate_key /etc/ssl/example.key;
+    ssl_trusted_certificate /etc/ssl/ca-bundle.pem;
     access_log /var/log/nginx/access.log charlotte;
     error_log /var/log/nginx/error.log warn;
     add_header X-Test "kept # as text";
@@ -135,6 +136,7 @@ http {
     assert_eq!(static_host["listing"], true);
     assert_eq!(static_host["tls_cert"], "/etc/ssl/example.pem");
     assert_eq!(static_host["tls_key"], "/etc/ssl/example.key");
+    assert!(yaml.contains("used for OCSP stapling or client-certificate verification"));
     assert_eq!(static_host["access_log"], "/var/log/nginx/access.log");
     assert_eq!(static_host["access_log_format"], "%a - \"%r\" %s %O %I");
     assert_eq!(static_host["error_log"], "/var/log/nginx/error.log");

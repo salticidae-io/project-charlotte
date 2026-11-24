@@ -52,6 +52,7 @@ struct FixtureOptions {
     global_certificate: bool,
     default_vhost_certificate: bool,
     https_redirect: bool,
+    alpha_chain: bool,
 }
 
 impl Fixture {
@@ -60,6 +61,7 @@ impl Fixture {
             global_certificate: true,
             default_vhost_certificate: true,
             https_redirect: false,
+            alpha_chain: false,
         })
         .await
     }
@@ -69,6 +71,7 @@ impl Fixture {
             global_certificate: false,
             default_vhost_certificate: true,
             https_redirect: false,
+            alpha_chain: false,
         })
         .await
     }
@@ -78,6 +81,7 @@ impl Fixture {
             global_certificate: false,
             default_vhost_certificate: false,
             https_redirect: false,
+            alpha_chain: false,
         })
         .await
     }
@@ -87,6 +91,17 @@ impl Fixture {
             global_certificate: true,
             default_vhost_certificate: true,
             https_redirect: true,
+            alpha_chain: false,
+        })
+        .await
+    }
+
+    async fn with_vhost_chain() -> Self {
+        Self::start(FixtureOptions {
+            global_certificate: true,
+            default_vhost_certificate: true,
+            https_redirect: false,
+            alpha_chain: true,
         })
         .await
     }
@@ -107,7 +122,8 @@ impl Fixture {
 
         let (alpha_cert, alpha_cert_path, alpha_key_path) =
             write_certificate(&root, "alpha", &["alpha.test"]);
-        let (beta_cert, _, _) = write_certificate(&root, "beta", &["*.beta.test", "unknown.test"]);
+        let (beta_cert, beta_cert_path, _) =
+            write_certificate(&root, "beta", &["*.beta.test", "unknown.test"]);
         let (fallback_cert, fallback_cert_path, fallback_key_path) = write_certificate(
             &root,
             "fallback",
@@ -121,12 +137,17 @@ impl Fixture {
         } else {
             ""
         };
+        let alpha_chain = if options.alpha_chain {
+            format!("    tls_chain: {:?}\n", beta_cert_path.to_string_lossy())
+        } else {
+            String::new()
+        };
         std::fs::write(
             &config_path,
             format!(
                 concat!(
                     "vhost:\n  - server_names: [alpha.test]\n    root: {:?}\n    user: {:?}\n",
-                    "    tls_cert: {:?}\n    tls_key: {:?}\n",
+                    "    tls_cert: {:?}\n    tls_key: {:?}\n{}",
                     "  - server_names: [\"*.beta.test\"]\n    root: {:?}\n    user: {:?}\n",
                     "    https_redirect: false\n{}    default: true\n",
                     "  - server_names: [gamma.test]\n    root: {:?}\n    user: {:?}\n"
@@ -135,6 +156,7 @@ impl Fixture {
                 username,
                 alpha_cert_path.to_string_lossy(),
                 alpha_key_path.to_string_lossy(),
+                alpha_chain,
                 beta_root.to_string_lossy(),
                 username,
                 default_certificate,
@@ -624,6 +646,24 @@ async fn https_normalizes_case_and_port_in_host_authority() {
     .await;
     assert_eq!(response.status, 200);
     assert_eq!(response.body, b"alpha vhost");
+}
+
+#[tokio::test]
+async fn vhost_tls_chain_is_sent_after_the_leaf_certificate() {
+    let fixture = Fixture::with_vhost_chain().await;
+    let connector = TlsConnector::from(Arc::new(client_config(
+        fixture.roots(),
+        vec![b"http/1.1".to_vec()],
+    )));
+    let stream = TcpStream::connect(fixture.tls_address).await.unwrap();
+    let tls = connector
+        .connect(current_name("alpha.test"), stream)
+        .await
+        .unwrap();
+
+    let certificates = tls.get_ref().1.peer_certificates().unwrap();
+    assert_eq!(certificates.len(), 2);
+    assert_eq!(certificates[0].as_ref(), fixture.alpha_cert.as_ref());
 }
 
 #[tokio::test]

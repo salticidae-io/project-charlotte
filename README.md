@@ -133,7 +133,7 @@ FastCGI apps are emitted only when their executable is an absolute path;
 commands such as `php-cgi` or relative paths are skipped with a review comment.
 Apache `DirectoryIndex` and nginx `index` entries are converted to an ordered
 `index` list; entries that are not bare file names are skipped with a review
-comment.
+comment. Apache `SSLCertificateChainFile` maps to the vhost `tls_chain` key.
 
 ### nginx configuration conversion
 
@@ -157,6 +157,10 @@ Add `--user-from-root` to set each vhost's `user` and `group` to the owner of
 its root, overriding configured values. Relative roots are resolved from the
 converter's current working directory; if ownership cannot be determined,
 configured values are kept and a review comment is emitted.
+Nginx `ssl_certificate` is mapped to `tls_cert` as-is; configure it with the
+full chain when it contains intermediates. `ssl_trusted_certificate` is not
+served to clients and remains a review comment, since nginx uses it for OCSP
+stapling or client-certificate verification.
 
 ## Quick start
 
@@ -786,6 +790,14 @@ vhost:
 Each vhost `index` may be a single filename or an ordered list. Charlotte serves
 the first matching file found in the requested directory, then falls back to a
 directory listing (if enabled).
+
+For a static certificate, `tls_cert` may contain the leaf and its certificate
+chain. Alternatively, set `tls_chain` to a PEM file containing intermediate
+certificates; Charlotte appends certificates not already present in `tls_cert`
+when building the chain sent to clients. `tls_chain` requires both `tls_cert`
+and `tls_key`, and its path is resolved relative to the vhost YAML file. When
+the server runs as root with `--user`, the root TLS helper reads this file just
+like the certificate and key.
 
 Set `--https-redirect` to redirect plain HTTP requests to HTTPS when the
 selected vhost has its own TLS certificate or an ACME certificate has been

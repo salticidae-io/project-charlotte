@@ -157,6 +157,7 @@ pub struct AcmeSettings {
 pub struct TlsFiles {
     pub cert: PathBuf,
     pub key: PathBuf,
+    pub chain: Option<PathBuf>,
 }
 
 pub enum ParseResult {
@@ -990,7 +991,11 @@ impl Config {
         }
 
         let tls = match (tls_cert, tls_key) {
-            (Some(cert), Some(key)) => Some(TlsFiles { cert, key }),
+            (Some(cert), Some(key)) => Some(TlsFiles {
+                cert,
+                key,
+                chain: None,
+            }),
             (None, None) => None,
             _ => return Err("--tls-cert and --tls-key must be supplied together".to_owned()),
         };

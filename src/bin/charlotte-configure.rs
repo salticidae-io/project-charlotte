@@ -125,6 +125,7 @@ const ASKED_VHOST_KEYS: &[&str] = &[
     "bot",
     "tls_cert",
     "tls_key",
+    "tls_chain",
     "https_redirect",
     "default",
     "modsecurity_disable_rules",
@@ -1569,6 +1570,10 @@ impl<R: BufRead, W: Write> Wizard<R, W> {
             let mut candidate = host.clone();
             insert_string(&mut candidate, "tls_cert", &cert);
             insert_string(&mut candidate, "tls_key", &key);
+            let chain = self.ask("Intermediate chain PEM path (optional)", Some(""))?;
+            if !chain.trim().is_empty() {
+                insert_string(&mut candidate, "tls_chain", chain.trim());
+            }
             self.accept_candidate(host, candidate, has_waf)?;
         }
 

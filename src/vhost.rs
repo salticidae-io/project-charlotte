@@ -97,6 +97,7 @@ struct VhostFile {
     bot: Option<BotPolicyDeclarationFile>,
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
+    tls_chain: Option<PathBuf>,
     https_redirect: Option<bool>,
     #[serde(default)]
     default: bool,
@@ -927,12 +928,17 @@ impl Router {
                 normalized_names.push(normalized);
             }
 
-            let tls = match (entry.tls_cert.take(), entry.tls_key.take()) {
-                (Some(cert), Some(key)) => Some(TlsFiles {
+            let tls_chain = entry.tls_chain.take();
+            let tls = match (entry.tls_cert.take(), entry.tls_key.take(), tls_chain) {
+                (Some(cert), Some(key), chain) => Some(TlsFiles {
                     cert: resolve_config_path(cert, config_dir),
                     key: resolve_config_path(key, config_dir),
+                    chain: chain.map(|path| resolve_config_path(path, config_dir)),
                 }),
-                (None, None) => None,
+                (None, None, None) => None,
+                (None, None, Some(_)) => {
+                    return Err("vhost tls_chain requires tls_cert and tls_key".into());
+                }
                 _ => return Err("vhost tls_cert and tls_key must be supplied together".into()),
             };
 
@@ -1855,6 +1861,13 @@ fn validate_vhost_declarations<'a>(
                 format!("vhost {} must provide both tls_cert and tls_key", index + 1).into(),
             );
         }
+        if entry.tls_chain.is_some() && entry.tls_cert.is_none() {
+            return Err(format!(
+                "vhost {} tls_chain requires tls_cert and tls_key",
+                index + 1
+            )
+            .into());
+        }
         #[cfg(feature = "hosting")]
         {
             if let Some(path) = entry.cgroup.as_deref() {
@@ -2229,6 +2242,9 @@ pub(crate) fn helper_directories(config: &Config) -> io::Result<(Vec<PathBuf>, V
     if let Some(tls) = &config.tls {
         add_parent_directory(&mut tls_dirs, &tls.cert, &current_dir);
         add_parent_directory(&mut tls_dirs, &tls.key, &current_dir);
+        if let Some(chain) = &tls.chain {
+            add_parent_directory(&mut tls_dirs, chain, &current_dir);
+        }
     }
     #[cfg(feature = "acme")]
     if let Some(acme) = &config.acme {
@@ -2287,9 +2303,13 @@ fn append_vhost_helper_directories(
     {
         add_parent_directory(log_dirs, path, config_dir);
     }
-    for path in [entry.tls_cert.as_ref(), entry.tls_key.as_ref()]
-        .into_iter()
-        .flatten()
+    for path in [
+        entry.tls_cert.as_ref(),
+        entry.tls_key.as_ref(),
+        entry.tls_chain.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
     {
         add_parent_directory(tls_dirs, path, config_dir);
     }
@@ -3090,6 +3110,7 @@ mod tests {
             bot: None,
             tls_cert: None,
             tls_key: None,
+            tls_chain: None,
             https_redirect: None,
             default: is_default,
             modsecurity_disable_rules: Vec::new(),
@@ -3531,6 +3552,21 @@ mod tests {
         entry.tls_cert = Some("cert.pem".into());
         entry.tls_key = Some("key.pem".into());
         assert!(validate_vhost_declarations(&[entry]).is_ok());
+
+        let mut entry = declaration(&["example.test"], false);
+        entry.tls_chain = Some("chain.pem".into());
+        let error = validate_vhost_declarations(&[entry]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("tls_chain requires tls_cert and tls_key")
+        );
+
+        let mut entry = declaration(&["example.test"], false);
+        entry.tls_cert = Some("cert.pem".into());
+        entry.tls_key = Some("key.pem".into());
+        entry.tls_chain = Some("chain.pem".into());
+        assert!(validate_vhost_declarations(&[entry]).is_ok());
     }
 
     #[test]
@@ -3966,7 +4002,7 @@ mod tests {
         let config_path = directory.join("charlotte.yaml");
         std::fs::write(
             &config_path,
-            "vhost_dir: vhosts.d\nvhost:\n  - server_names: [main.example.test]\n    proxy_pass: http://127.0.0.1:9\n    access_log: logs/main.log\n    tls_cert: /etc/ssl/main/cert.pem\n    tls_key: /etc/ssl/private/main.key\n",
+            "vhost_dir: vhosts.d\nvhost:\n  - server_names: [main.example.test]\n    proxy_pass: http://127.0.0.1:9\n    access_log: logs/main.log\n    tls_cert: /etc/ssl/main/cert.pem\n    tls_key: /etc/ssl/private/main.key\n    tls_chain: /etc/ssl/chain/intermediate.pem\n",
         )
         .unwrap();
         std::fs::write(
@@ -4005,6 +4041,7 @@ mod tests {
                 PathBuf::from("/srv/tls"),
                 PathBuf::from("/etc/ssl/main"),
                 PathBuf::from("/etc/ssl/private"),
+                PathBuf::from("/etc/ssl/chain"),
             ]
         );
         std::fs::remove_dir_all(directory).unwrap();

@@ -679,6 +679,43 @@ fn takes_user_and_group_from_document_root_when_requested() {
 }
 
 #[test]
+fn converts_ssl_certificate_chain_file_to_vhost_tls_chain() {
+    let root = temp_dir();
+    let config = root.join("httpd.conf");
+    fs::write(
+        &config,
+        concat!(
+            "<VirtualHost *:443>\n",
+            "  ServerName chain.example.test\n",
+            "  DocumentRoot /srv/www/chain\n",
+            "  SSLCertificateFile /etc/ssl/chain/fullchain.pem\n",
+            "  SSLCertificateKeyFile /etc/ssl/chain/key.pem\n",
+            "  SSLCertificateChainFile /etc/ssl/chain/intermediate.pem\n",
+            "</VirtualHost>\n",
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_apache2charlotte"))
+        .arg(&config)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "converter failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let yaml = String::from_utf8(output.stdout).unwrap();
+    let document: serde_yaml_ng::Value = serde_yaml_ng::from_str(&yaml).unwrap();
+    assert_eq!(
+        document["vhost"][0]["tls_chain"],
+        "/etc/ssl/chain/intermediate.pem"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 #[cfg(feature = "hosting")]
 fn converted_yaml_passes_charlotte_config_validation() {
     let root = temp_dir();
