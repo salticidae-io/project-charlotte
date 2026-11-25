@@ -990,8 +990,6 @@ async fn acme_startup_failure_is_logged_and_exits_promptly() {
     let error_log = root.join("errors.log");
     let mut command = Command::new(env!("CARGO_BIN_EXE_project-charlotte"));
     command
-        .arg("--root")
-        .arg(&root)
         .arg("--bind")
         .arg(common::reserve_tcp_address().to_string())
         .arg("--acme-directory")
@@ -1002,6 +1000,8 @@ async fn acme_startup_failure_is_logged_and_exits_promptly() {
         .arg(&error_log)
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    #[cfg(feature = "hosting")]
+    command.arg("--root").arg(&root);
     let started = tokio::time::Instant::now();
     let mut server = common::spawn(&mut command).unwrap();
     let deadline = started + Duration::from_secs(5);
@@ -1019,7 +1019,12 @@ async fn acme_startup_failure_is_logged_and_exits_promptly() {
 
     assert!(!status.success(), "invalid ACME cache unexpectedly started");
     assert!(started.elapsed() < Duration::from_secs(5));
-    let log = std::fs::read_to_string(&error_log).unwrap();
+    let log = std::fs::read_to_string(&error_log).unwrap_or_else(|error| {
+        panic!(
+            "could not read error log {} after server exited with {status}: {error}",
+            error_log.display()
+        )
+    });
     assert!(log.contains("Startup failed:"), "{log}");
     assert!(log.contains("ACME cache"), "{log}");
     std::fs::remove_dir_all(root).unwrap();
