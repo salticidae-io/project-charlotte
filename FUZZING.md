@@ -128,6 +128,16 @@ Request handling:
 
 Parsers and helpers:
 
+- `ja4::tests::ja4_client_hello` — hand-parses TLS ClientHello records. Any
+  parsed SNI fits within the input, JA4 output has a valid version/flag/count
+  prefix and two 12-hex-digit hashes, and a truncated input prefix does not
+  panic. Seeds include normal and GREASE ClientHellos, a handshake split across
+  TLS records, and malformed bytes.
+- `forwarded::tests::trusted_proxy_spec` — every accepted proxy CIDR contains
+  its input address and has a prefix within the address width.
+- `forwarded::tests::forwarded_resolve` — untrusted peers cannot override
+  themselves; trusted chains contain at most 64 parseable IPs, are sanitized to
+  one `X-Forwarded-For` value, and resolve the client to a chain member.
 - `handler::tests::request_path`, `byte_range`, `if_range`, `html_escape` —
   decoded paths contain only normal components, ranges are in bounds, a
   non-tag `If-Range` matches only as a date, and escaped text has no markup.

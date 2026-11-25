@@ -509,6 +509,7 @@ fn cache_files(cache: &Path, host: &str) -> crate::config::TlsFiles {
     crate::config::TlsFiles {
         cert: cache.join(format!("{host}.cert.pem")),
         key: cache.join(format!("{host}.key.pem")),
+        chain: None,
     }
 }
 

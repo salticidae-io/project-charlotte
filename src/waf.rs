@@ -1,14 +1,20 @@
 //! Loads ModSecurity rules and inspects HTTP requests and responses.
 
 use std::{
-    collections::VecDeque, error::Error, future::Future, io, net::SocketAddr, path::PathBuf,
-    str::FromStr, time::Duration,
+    collections::{HashSet, VecDeque},
+    error::Error,
+    future::Future,
+    io,
+    net::SocketAddr,
+    path::{Component, Path, PathBuf},
+    str::FromStr,
+    time::Duration,
 };
 
 use bytes::Bytes;
 use futures_util::stream;
 use http::{
-    HeaderValue, Request, Response, StatusCode, Version,
+    HeaderMap, HeaderValue, Request, Response, StatusCode, Version,
     header::{self, HOST},
 };
 use http_body::{Body, Frame};
@@ -28,7 +34,15 @@ pub(crate) struct Waf {
     rule_files: &'static [PathBuf],
     request_body_limit: usize,
     response_body_limit: usize,
+    response_body_policy: &'static ResponseBodyPolicy,
+    response_body_override: Option<bool>,
     block_status: Option<StatusCode>,
+}
+
+#[derive(Clone, Debug)]
+struct ResponseBodyPolicy {
+    access: bool,
+    mime_types: HashSet<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -86,6 +100,221 @@ impl std::fmt::Display for RuleIdSpec {
     }
 }
 
+impl ResponseBodyPolicy {
+    fn conservative() -> Self {
+        Self {
+            access: true,
+            mime_types: HashSet::new(),
+        }
+    }
+
+    fn default() -> Self {
+        Self {
+            access: false,
+            mime_types: HashSet::from(["text/plain".to_owned(), "text/html".to_owned()]),
+        }
+    }
+}
+
+fn scan_response_body_policy(rule_files: &[PathBuf]) -> io::Result<ResponseBodyPolicy> {
+    let mut policy = ResponseBodyPolicy::default();
+    let mut visited = HashSet::new();
+    let mut dynamic_policy = false;
+    for path in rule_files {
+        scan_response_rule_file(path, &mut policy, &mut visited, &mut dynamic_policy)?;
+    }
+    if dynamic_policy {
+        return Ok(ResponseBodyPolicy::conservative());
+    }
+    Ok(policy)
+}
+
+fn scan_response_rule_file(
+    path: &Path,
+    policy: &mut ResponseBodyPolicy,
+    visited: &mut HashSet<PathBuf>,
+    dynamic_policy: &mut bool,
+) -> io::Result<()> {
+    let path = path.canonicalize()?;
+    if !visited.insert(path.clone()) {
+        return Ok(());
+    }
+    let contents = std::fs::read_to_string(&path)?;
+    let lines = continued_rule_lines(&contents);
+    for line in lines {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("ctl:responsebodyaccess")
+            || lower.contains("ctl:responsebodymimetype")
+            || lower.starts_with("secremoterules ")
+        {
+            *dynamic_policy = true;
+            continue;
+        }
+        let (directive, value) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+        let value = value.trim();
+        match directive.to_ascii_lowercase().as_str() {
+            "secresponsebodyaccess" => {
+                let value = value
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                match value.as_str() {
+                    "on" => policy.access = true,
+                    "off" => policy.access = false,
+                    _ => return Err(io::Error::other("invalid SecResponseBodyAccess value")),
+                }
+            }
+            "secresponsebodymimetype" => {
+                for mime_type in value.split_whitespace() {
+                    let mime_type = mime_type.trim_matches(['"', '\'']).to_ascii_lowercase();
+                    if !mime_type.is_empty() {
+                        policy.mime_types.insert(mime_type);
+                    }
+                }
+            }
+            "secresponsebodymimetypesclear" => policy.mime_types.clear(),
+            "include" | "includeoptional" => {
+                let optional = directive.eq_ignore_ascii_case("includeoptional");
+                let include = value.trim_matches(['"', '\'']);
+                let include_path = PathBuf::from(include);
+                let mut matches = if include_path.is_absolute() {
+                    expand_include_pattern(&include_path)?
+                } else {
+                    let relative = path
+                        .parent()
+                        .unwrap_or_else(|| Path::new("."))
+                        .join(&include_path);
+                    let relative_matches = expand_include_pattern(&relative)?;
+                    if relative_matches.is_empty() {
+                        expand_include_pattern(&include_path)?
+                    } else {
+                        relative_matches
+                    }
+                };
+                if matches.is_empty() && !optional {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("included rule file was not found: {include}"),
+                    ));
+                }
+                matches.sort();
+                for included in matches {
+                    scan_response_rule_file(&included, policy, visited, dynamic_policy)?;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn continued_rule_lines(contents: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut continued = String::new();
+    for line in contents.lines() {
+        let line = line.trim_end();
+        let continues = line.ends_with('\\');
+        continued.push_str(line.trim_end_matches('\\'));
+        if continues {
+            continued.push(' ');
+        } else {
+            lines.push(std::mem::take(&mut continued));
+        }
+    }
+    if !continued.is_empty() {
+        lines.push(continued);
+    }
+    lines
+}
+
+fn expand_include_pattern(pattern: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut base = PathBuf::new();
+    let mut components = Vec::new();
+    for component in pattern.components() {
+        match component {
+            Component::RootDir => base.push("/"),
+            Component::CurDir => {}
+            Component::ParentDir => components.push("..".to_owned()),
+            Component::Normal(value) => components.push(value.to_string_lossy().into_owned()),
+            Component::Prefix(prefix) => {
+                components.push(prefix.as_os_str().to_string_lossy().into_owned())
+            }
+        }
+    }
+    expand_include_components(&base, &components, 0)
+}
+
+fn expand_include_components(
+    base: &Path,
+    components: &[String],
+    index: usize,
+) -> io::Result<Vec<PathBuf>> {
+    if index == components.len() {
+        return Ok(if base.exists() {
+            vec![base.to_path_buf()]
+        } else {
+            Vec::new()
+        });
+    }
+    let component = &components[index];
+    if !component.contains(['*', '?']) {
+        return expand_include_components(&base.join(component), components, index + 1);
+    }
+    let directory = if base.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        base
+    };
+    let mut matches = Vec::new();
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name
+            .to_str()
+            .is_some_and(|name| glob_component_matches(component, name))
+        {
+            matches.extend(expand_include_components(
+                &base.join(name),
+                components,
+                index + 1,
+            )?);
+        }
+    }
+    Ok(matches)
+}
+
+fn glob_component_matches(pattern: &str, value: &str) -> bool {
+    let pattern = pattern.as_bytes();
+    let value = value.as_bytes();
+    let (mut pattern_index, mut value_index) = (0, 0);
+    let mut star = None;
+    let mut star_value_index = 0;
+    while value_index < value.len() {
+        if pattern.get(pattern_index) == Some(&b'?')
+            || pattern.get(pattern_index) == value.get(value_index)
+        {
+            pattern_index += 1;
+            value_index += 1;
+        } else if pattern.get(pattern_index) == Some(&b'*') {
+            star = Some(pattern_index);
+            pattern_index += 1;
+            star_value_index = value_index;
+        } else if let Some(star_index) = star {
+            pattern_index = star_index + 1;
+            star_value_index += 1;
+            value_index = star_value_index;
+        } else {
+            return false;
+        }
+    }
+    pattern[pattern_index..].iter().all(|byte| *byte == b'*')
+}
+
 impl Waf {
     pub(crate) fn load(
         rule_files: &[PathBuf],
@@ -101,6 +330,14 @@ impl Waf {
 
         let rule_files = Box::leak(rule_files.to_vec().into_boxed_slice());
         let rules = build_rules(rule_files, &[])?;
+        let response_body_policy = Box::leak(Box::new(
+            scan_response_body_policy(rule_files).unwrap_or_else(|error| {
+                crate::log_error!(
+                    "could not determine ModSecurity response-body policy; inspecting all response bodies: {error}"
+                );
+                ResponseBodyPolicy::conservative()
+            }),
+        ));
 
         Ok(Self {
             modsecurity: Box::leak(Box::new(modsecurity)),
@@ -108,12 +345,19 @@ impl Waf {
             rule_files,
             request_body_limit,
             response_body_limit,
+            response_body_policy,
+            response_body_override: None,
             block_status,
         })
     }
 
     pub(crate) fn with_block_status(mut self, block_status: Option<StatusCode>) -> Self {
         self.block_status = block_status;
+        self
+    }
+
+    pub(crate) fn with_response_body(mut self, inspect: bool) -> Self {
+        self.response_body_override = Some(inspect);
         self
     }
 
@@ -128,6 +372,8 @@ impl Waf {
             rule_files: self.rule_files,
             request_body_limit: self.request_body_limit,
             response_body_limit: self.response_body_limit,
+            response_body_policy: self.response_body_policy,
+            response_body_override: self.response_body_override,
             block_status: self.block_status,
         })
     }
@@ -145,6 +391,7 @@ impl Waf {
         F: FnOnce(Request<Full<Bytes>>) -> Fut,
         Fut: Future<Output = Response<ResponseBody>>,
     {
+        let waf_timing = crate::logging::StageTimer::new(crate::logging::Stage::Waf);
         let (parts, body) = request.into_parts();
         let request_version = parts.version;
         let mut transaction = match Transaction::new(self.modsecurity, self.rules) {
@@ -237,6 +484,7 @@ impl Waf {
         parts.headers.remove(header::RANGE);
         parts.headers.remove(header::IF_RANGE);
         let request = Request::from_parts(parts, Full::new(request_body));
+        waf_timing.finish();
         let response = next(request).await;
         self.inspect_response(response, transaction, request_version)
             .await
@@ -248,6 +496,7 @@ impl Waf {
         mut transaction: Transaction<'static>,
         request_version: Version,
     ) -> Response<ResponseBody> {
+        let _response_timing = crate::logging::StageTimer::new(crate::logging::Stage::WafResponse);
         let response_headers = response.headers().iter().try_for_each(|(name, value)| {
             transaction.add_response_header(name.as_str().as_bytes(), value.as_bytes())
         });
@@ -270,6 +519,13 @@ impl Waf {
         }
 
         let (parts, mut body) = response.into_parts();
+        let inspect_body = self.inspect_response_body(&parts.headers);
+        if !inspect_body {
+            return Response::from_parts(
+                parts,
+                streaming_response_body(transaction, VecDeque::new(), None, body, false),
+            );
+        }
         let mut buffered = VecDeque::new();
         let mut buffered_bytes = 0usize;
         loop {
@@ -307,6 +563,7 @@ impl Waf {
                                     buffered,
                                     Some(Frame::data(remainder)),
                                     body,
+                                    true,
                                 ),
                             );
                         }
@@ -367,6 +624,32 @@ impl Waf {
                 }
             }
         }
+    }
+
+    fn inspect_response_body(&self, headers: &HeaderMap) -> bool {
+        if let Some(inspect) = self.response_body_override {
+            return inspect;
+        }
+        if !self.response_body_policy.access {
+            return false;
+        }
+        let mime_types = &self.response_body_policy.mime_types;
+        if mime_types.is_empty() {
+            return true;
+        }
+        let Some(content_type) = headers.get(header::CONTENT_TYPE) else {
+            return true;
+        };
+        let Ok(content_type) = content_type.to_str() else {
+            return true;
+        };
+        let mime_type = content_type
+            .split(';')
+            .next()
+            .unwrap_or(content_type)
+            .trim()
+            .to_ascii_lowercase();
+        mime_types.contains(&mime_type)
     }
 }
 
@@ -528,13 +811,14 @@ fn streaming_response_body(
     buffered: VecDeque<Frame<Bytes>>,
     first_tail: Option<Frame<Bytes>>,
     body: ResponseBody,
+    process_response_body: bool,
 ) -> ResponseBody {
     let state = StreamingBody {
         transaction: Some(transaction),
         buffered,
         first_tail,
         body,
-        process_response_body: true,
+        process_response_body,
     };
     let chunks = stream::unfold(state, |mut state| async move {
         if let Some(frame) = state.buffered.pop_front() {
@@ -547,7 +831,8 @@ fn streaming_response_body(
         };
         match frame {
             Some(Ok(frame)) => {
-                if let Some(data) = frame.data_ref()
+                if state.process_response_body
+                    && let Some(data) = frame.data_ref()
                     && let Some(transaction) = state.transaction.as_mut()
                 {
                     match transaction.append_response_body(data) {
@@ -646,6 +931,89 @@ impl Drop for StreamingBody {
     }
 }
 
+#[cfg(test)]
+mod response_policy_tests {
+    use std::path::PathBuf;
+
+    use super::{glob_component_matches, scan_response_body_policy};
+
+    fn rules_dir(name: &str) -> PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "charlotte-waf-policy-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        directory
+    }
+
+    #[test]
+    fn response_body_access_defaults_off() {
+        let directory = rules_dir("default");
+        let main = directory.join("main.conf");
+        std::fs::write(&main, "SecRuleEngine On\n").unwrap();
+        let policy = scan_response_body_policy(&[main]).unwrap();
+        assert!(!policy.access);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn follows_glob_includes_and_mime_lists() {
+        let directory = rules_dir("include");
+        std::fs::create_dir(directory.join("rules")).unwrap();
+        std::fs::write(
+            directory.join("rules/a.conf"),
+            "SecResponseBodyAccess On\nSecResponseBodyMimeTypesClear\n",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.join("rules/b.conf"),
+            "SecResponseBodyMimeType text/html \\\n    application/json\n",
+        )
+        .unwrap();
+        let main = directory.join("main.conf");
+        std::fs::write(&main, "Include \"rules/*.conf\"\n").unwrap();
+        let policy = scan_response_body_policy(&[main]).unwrap();
+        assert!(policy.access);
+        assert!(policy.mime_types.contains("text/html"));
+        assert!(policy.mime_types.contains("application/json"));
+        assert!(!policy.mime_types.contains("text/plain"));
+        assert!(!policy.mime_types.contains("application/octet-stream"));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn runtime_response_body_controls_inspect_everything() {
+        let directory = rules_dir("ctl");
+        let main = directory.join("main.conf");
+        std::fs::write(
+            &main,
+            "SecResponseBodyAccess Off\nSecRule REQUEST_URI \"@beginsWith /x\" \"id:1,phase:1,pass,ctl:responseBodyAccess=On\"\n",
+        )
+        .unwrap();
+        let policy = scan_response_body_policy(&[main]).unwrap();
+        assert!(policy.access);
+        assert!(policy.mime_types.is_empty());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn missing_include_is_an_error() {
+        let directory = rules_dir("missing");
+        let main = directory.join("main.conf");
+        std::fs::write(&main, "Include missing.conf\nIncludeOptional none/*.conf\n").unwrap();
+        assert!(scan_response_body_policy(&[main]).is_err());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn matches_include_globs() {
+        assert!(glob_component_matches("*.conf", "REQUEST-901.conf"));
+        assert!(glob_component_matches("a?c", "abc"));
+        assert!(!glob_component_matches("*.conf", "rules.conf.bak"));
+    }
+}
+
 // The tests drive the WAF through the static file handler.
 #[cfg(all(test, feature = "hosting"))]
 mod tests {
@@ -727,7 +1095,7 @@ mod tests {
             .query()
             .is_some_and(|query| query.split('&').any(|pair| pair == "block=yes"));
         let collected = fuzz_support::collect(async {
-            let router = Router::load(Arc::new(config), None, None, Some(fuzz_waf()))
+            let router = Router::load(Arc::new(config), None, None, None, Some(fuzz_waf()))
                 .await
                 .expect("WAF router loads");
             router.dispatch(request, peer, local).await
@@ -803,7 +1171,7 @@ mod tests {
             .unwrap();
             let config = Arc::clone(&config);
             let collected = fuzz_support::collect(async {
-                let router = Router::load(config, None, None, Some(fuzz_waf()))
+                let router = Router::load(config, None, None, None, Some(fuzz_waf()))
                     .await
                     .unwrap();
                 router.dispatch(request, peer, local).await

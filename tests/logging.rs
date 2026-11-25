@@ -7,6 +7,8 @@
 mod common;
 
 use std::{
+    io::Read,
+    net::TcpListener,
     os::unix::fs::PermissionsExt,
     path::Path,
     process::{Command, Stdio},
@@ -143,20 +145,152 @@ async fn writes_global_and_vhost_access_and_error_logs() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+#[tokio::test]
+async fn logs_request_timing_in_access_log_header_and_debug_output() {
+    let root = std::env::temp_dir().join(format!("project-charlotte-ttfb-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("index.html"), "timed response").unwrap();
+    let access_log = root.join("access.log");
+    let address = common::reserve_tcp_address();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_project-charlotte"));
+    command
+        .arg("--debug")
+        .arg("--server-timing")
+        .arg("--bind")
+        .arg(address.to_string())
+        .arg("--root")
+        .arg(&root)
+        .arg("--access-log-file")
+        .arg(&access_log)
+        .arg("--access-log-format")
+        .arg("%{ttfb}T %{headers}T %{total}T %{backend}T")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut server = common::spawn(&mut command).unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while TcpStream::connect(address).await.is_err() {
+        if let Some(status) = server.try_wait().unwrap() {
+            panic!("server exited before becoming ready: {status}");
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "server did not start"
+        );
+        sleep(Duration::from_millis(20)).await;
+    }
+
+    let response = get(address, "/", "localhost").await;
+    let response = String::from_utf8_lossy(&response);
+    let server_timing = response
+        .lines()
+        .find(|line| line.to_ascii_lowercase().starts_with("server-timing:"))
+        .unwrap_or_else(|| panic!("missing Server-Timing header: {response}"));
+    assert!(server_timing.contains("backend;dur="), "{server_timing}");
+    assert!(server_timing.contains("ttfb;"), "{server_timing}");
+    assert!(server_timing.contains(";dur="), "{server_timing}");
+
+    let access = wait_for_line(&access_log, " ").await;
+    let fields = access.split_whitespace().collect::<Vec<_>>();
+    assert_eq!(fields.len(), 4, "{access}");
+    let ttfb = fields[0].parse::<u64>().unwrap();
+    let headers = fields[1].parse::<u64>().unwrap();
+    let total = fields[2].parse::<u64>().unwrap();
+    assert!(ttfb <= total, "ttfb={ttfb}, total={total}, {access}");
+    assert!(
+        headers <= total,
+        "headers={headers}, total={total}, {access}"
+    );
+    assert!(fields[3].parse::<u64>().is_ok(), "{access}");
+
+    common::shutdown(&mut server);
+    let mut debug_log = String::new();
+    server
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut debug_log)
+        .unwrap();
+    assert!(
+        debug_log.contains("request timing: GET / status=200"),
+        "{debug_log}"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn debug_startup_logs_listener_binding_to_stderr() {
+    let root = std::env::temp_dir().join(format!(
+        "project-charlotte-debug-logging-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let address = common::reserve_tcp_address();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_project-charlotte"));
+    command
+        .arg("--debug")
+        .arg("--bind")
+        .arg(address.to_string())
+        .arg("--root")
+        .arg(&root)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut server = common::spawn(&mut command).unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    while TcpStream::connect(address).await.is_err() {
+        if let Some(status) = server.try_wait().unwrap() {
+            panic!("server exited before becoming ready: {status}");
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "server did not start"
+        );
+        sleep(Duration::from_millis(20)).await;
+    }
+    common::shutdown(&mut server);
+    let mut log = String::new();
+    server
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut log)
+        .unwrap();
+
+    assert!(log.contains("Binding plain HTTP listener"), "{log}");
+    assert!(log.contains("Bound plain HTTP listener"), "{log}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn startup_errors_default_to_stderr_without_an_error_log() {
+    let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = occupied.local_addr().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_project-charlotte"))
+        .arg("--bind")
+        .arg(address.to_string())
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("could not bind TCP listener"), "{stderr}");
+    assert!(stderr.contains(&address.to_string()), "{stderr}");
+}
+
 #[cfg(target_os = "linux")]
 #[tokio::test]
+#[ignore = "requires root; run in the privileged CI job with cargo test -- --ignored"]
 async fn root_helper_opens_vhost_logs_after_master_drops_privileges() {
     use std::os::unix::fs::MetadataExt;
 
-    if !nix::unistd::geteuid().is_root() {
-        return;
-    }
-    let Some(user) = nix::unistd::User::from_name("nobody").unwrap() else {
-        return;
-    };
-    let Some(group) = nix::unistd::Group::from_gid(user.gid).unwrap() else {
-        return;
-    };
+    assert!(nix::unistd::geteuid().is_root(), "this test requires root");
+    let user = nix::unistd::User::from_name("nobody")
+        .unwrap()
+        .expect("root test environment must provide the nobody account");
+    let group = nix::unistd::Group::from_gid(user.gid)
+        .unwrap()
+        .expect("nobody's primary group must exist");
 
     let base = std::env::temp_dir().join(format!(
         "project-charlotte-root-logopener-{}",
@@ -183,7 +317,8 @@ async fn root_helper_opens_vhost_logs_after_master_drops_privileges() {
     )
     .unwrap();
     let address = common::reserve_tcp_address();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_project-charlotte"));
+    let binary = common::worker_accessible_server_binary(&base);
+    let mut command = Command::new(binary);
     command
         .arg("--user")
         .arg(&user.name)
@@ -246,7 +381,7 @@ async fn root_helper_opens_vhost_logs_after_master_drops_privileges() {
     }
 
     let response = get(address, "/noisy.cgi", "logs.example.test").await;
-    assert!(response.starts_with(b"HTTP/1.1 200"));
+    assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
     let access = wait_for_line(&vhost_log, "noisy.cgi").await;
     assert!(
         access.contains("logs.example.test 200 /noisy.cgi"),

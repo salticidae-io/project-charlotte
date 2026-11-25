@@ -231,19 +231,18 @@ fn packaged_defaults_run_unprivileged_with_systemd_sandboxing() {
 
 #[cfg(all(target_os = "linux", feature = "hosting"))]
 #[tokio::test]
+#[ignore = "requires root; run in the privileged CI job with cargo test -- --ignored"]
 async fn root_helper_restricts_new_log_paths_after_master_drops_privileges() {
     use std::os::unix::fs::MetadataExt;
     use tokio::time::sleep;
 
-    if !geteuid().is_root() {
-        return;
-    }
-    let Some(user) = User::from_name("nobody").unwrap() else {
-        return;
-    };
-    let Some(group) = Group::from_gid(user.gid).unwrap() else {
-        return;
-    };
+    assert!(geteuid().is_root(), "this test requires root");
+    let user = User::from_name("nobody")
+        .unwrap()
+        .expect("root test environment must provide the nobody account");
+    let group = Group::from_gid(user.gid)
+        .unwrap()
+        .expect("nobody's primary group must exist");
 
     let directory = TestDirectory::new("security-root-helper");
     let base = directory.path();
@@ -282,7 +281,8 @@ async fn root_helper_restricts_new_log_paths_after_master_drops_privileges() {
     let stderr_path = base.join("server.stderr");
     let stderr_file = fs::File::create(&stderr_path).unwrap();
     let address = common::reserve_tcp_address();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_project-charlotte"));
+    let binary = common::worker_accessible_server_binary(base);
+    let mut command = Command::new(binary);
     command
         .arg("--user")
         .arg(&user.name)

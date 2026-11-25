@@ -625,3 +625,130 @@ async fn hosted_worker_starts_on_demand_and_stops_after_idle_timeout() {
     assert_eq!(response.body, b"lazy worker response");
     assert!(!worker_process_ids(server_pid).is_empty());
 }
+
+#[tokio::test]
+async fn vhost_idle_timeout_zero_overrides_global_reaper_timeout() {
+    let _guard = TEST_LOCK.lock().await;
+    let root = new_root();
+    let site_root = root.join("site");
+    std::fs::create_dir(&site_root).unwrap();
+    std::fs::write(site_root.join("index.html"), "worker stays alive").unwrap();
+    let user = if geteuid().is_root() {
+        if User::from_name("nobody").unwrap().is_none() {
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
+        "nobody".to_owned()
+    } else {
+        current_user_name()
+    };
+    let config_path = root.join("vhosts.yaml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "vhost:\n{}",
+            vhost(
+                "[\"never-reap.test\"]",
+                &site_root,
+                &user,
+                "    worker_idle_timeout: 0\n"
+            )
+        ),
+    )
+    .unwrap();
+
+    let address = common::reserve_tcp_address();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_project-charlotte"));
+    command
+        .arg("--bind")
+        .arg(address.to_string())
+        .arg("--root")
+        .arg(&root)
+        .arg("--config")
+        .arg(&config_path)
+        .arg("--worker-idle-timeout")
+        .arg("1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit());
+    let mut server = common::spawn(&mut command).unwrap();
+    let server_pid = server.id();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    loop {
+        if TcpStream::connect(address).await.is_ok() {
+            break;
+        }
+        if let Some(status) = server.try_wait().unwrap() {
+            panic!("webserver exited before becoming ready: {status}");
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "webserver did not start"
+        );
+        sleep(Duration::from_millis(20)).await;
+    }
+
+    let response = request(address, "never-reap.test", "GET", "/", &[], b"").await;
+    assert_eq!(response.status, 200);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while worker_process_ids(server_pid).is_empty() {
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("worker should be spawned for the request");
+    sleep(Duration::from_millis(2200)).await;
+    assert!(
+        !worker_process_ids(server_pid).is_empty(),
+        "per-vhost zero timeout should disable idle reaping"
+    );
+
+    common::shutdown(&mut server);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn server_starts_with_only_config_file_options() {
+    let _guard = TEST_LOCK.lock().await;
+    let root = new_root();
+    std::fs::write(root.join("index.html"), "from config options").unwrap();
+    let address = common::reserve_tcp_address();
+    let config_path = root.join("charlotte.yaml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "options:\n  bind: {:?}\n  root: {:?}\nvhost: []\n",
+            address.to_string(),
+            root.to_string_lossy()
+        ),
+    )
+    .unwrap();
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_project-charlotte"));
+    command
+        .arg("--config")
+        .arg(&config_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit());
+    let mut server = common::spawn(&mut command).unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    loop {
+        if TcpStream::connect(address).await.is_ok() {
+            break;
+        }
+        if let Some(status) = server.try_wait().unwrap() {
+            panic!("webserver exited before becoming ready: {status}");
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "webserver did not start"
+        );
+        sleep(Duration::from_millis(20)).await;
+    }
+
+    let response = request(address, "localhost", "GET", "/index.html", &[], b"").await;
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, b"from config options");
+
+    common::shutdown(&mut server);
+    let _ = std::fs::remove_dir_all(root);
+}

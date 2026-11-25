@@ -12,7 +12,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, RwLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU16, AtomicU64, Ordering},
     },
 };
 
@@ -20,11 +20,13 @@ use bytes::Bytes;
 use http::{HeaderValue, Request, Response, StatusCode, header::HOST};
 use http_body::Body;
 use http_body_util::BodyExt;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::Visitor};
 use tokio::sync::Mutex;
 
 #[cfg(feature = "acme")]
 use crate::acme::AcmeManager;
+#[cfg(feature = "hosting")]
+use crate::cgroup::CgroupSpec;
 #[cfg(feature = "hosting")]
 use crate::config::FastCgiAddress;
 #[cfg(feature = "proxy")]
@@ -33,6 +35,8 @@ use crate::forwarded::DirectPeer;
 use crate::handler;
 #[cfg(feature = "proxy")]
 use crate::proxy::ReverseProxy;
+#[cfg(feature = "swarm")]
+use crate::swarm::Swarm;
 use crate::{
     bot::{self, BotAction, BotPolicy, BotPolicyFile, BotState},
     config::{Config, TlsFiles},
@@ -84,19 +88,28 @@ struct VhostFile {
     fastcgi_timeout: Option<u64>,
     worker_threads: Option<usize>,
     worker_idle_timeout: Option<u64>,
+    cgroup: Option<String>,
+    cgroup_memory_max: Option<String>,
+    cgroup_cpu_max: Option<String>,
+    cgroup_pids_max: Option<String>,
     rate_limit: Option<String>,
     rate_limit_burst: Option<u32>,
     bot: Option<BotPolicyDeclarationFile>,
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
+    tls_chain: Option<PathBuf>,
+    https_redirect: Option<bool>,
     #[serde(default)]
     default: bool,
     #[serde(default)]
     modsecurity_disable_rules: Vec<RuleIdFile>,
     modsecurity_block_status: Option<u16>,
+    modsecurity_response_body: Option<bool>,
     acme: Option<bool>,
     proxy_pass: Option<String>,
     proxy_preserve_host: Option<bool>,
+    proxy_http2: Option<bool>,
+    swarm: Option<bool>,
     proxy_timeout: Option<u64>,
     proxy_ca_root: Option<PathBuf>,
     access_log: Option<PathBuf>,
@@ -136,9 +149,66 @@ struct FastCgiAppFile {
     command: Vec<String>,
     #[serde(default)]
     env: BTreeMap<String, String>,
+    mode: Option<String>,
+    php_defaults: Option<bool>,
     #[serde(default, alias = "workers")]
     max_workers: Option<usize>,
+    min_workers: Option<usize>,
     idle_timeout: Option<u64>,
+}
+
+struct FieldNamesDeserializer<'a> {
+    fields: &'a mut Option<&'static [&'static str]>,
+}
+
+impl<'de> serde::Deserializer<'de> for FieldNamesDeserializer<'_> {
+    type Error = serde::de::value::Error;
+
+    fn deserialize_any<V>(self, _visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        Err(serde::de::Error::custom("field names requested"))
+    }
+
+    fn deserialize_struct<V>(
+        self,
+        _name: &'static str,
+        fields: &'static [&'static str],
+        _visitor: V,
+    ) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        *self.fields = Some(fields);
+        Err(serde::de::Error::custom("field names captured"))
+    }
+
+    serde::forward_to_deserialize_any! {
+        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+        bytes byte_buf option unit unit_struct newtype_struct seq tuple tuple_struct
+        map enum identifier ignored_any
+    }
+}
+
+fn serde_struct_field_names<T: for<'de> Deserialize<'de>>() -> &'static [&'static str] {
+    let mut fields = None;
+    let _ = T::deserialize(FieldNamesDeserializer {
+        fields: &mut fields,
+    });
+    fields.unwrap_or(&[])
+}
+
+pub(crate) fn configure_vhost_keys() -> &'static [&'static str] {
+    serde_struct_field_names::<VhostFile>()
+}
+
+pub(crate) fn configure_fastcgi_app_keys() -> &'static [&'static str] {
+    serde_struct_field_names::<FastCgiAppFile>()
+}
+
+pub(crate) fn configure_bot_policy_keys() -> &'static [&'static str] {
+    serde_struct_field_names::<BotPolicyFile>()
 }
 
 #[derive(Deserialize)]
@@ -163,6 +233,7 @@ where
 struct Vhost {
     names: Vec<String>,
     tls: Option<TlsFiles>,
+    https_redirect: Option<bool>,
     #[cfg(feature = "acme")]
     acme: bool,
     default: bool,
@@ -171,6 +242,8 @@ struct Vhost {
     bot: VhostBot,
     access_log: Option<Arc<crate::logging::AccessLog>>,
     error_log: Arc<crate::logging::ErrorLog>,
+    #[cfg(feature = "swarm")]
+    swarm_enabled: bool,
     #[cfg(feature = "hosting")]
     worker: Option<Arc<Worker>>,
     #[cfg(feature = "proxy")]
@@ -198,8 +271,11 @@ pub(crate) struct Router {
     rate_limit: Option<Arc<RateLimiter>>,
     bot: Option<Arc<BotPolicy>>,
     bot_state: Arc<BotState>,
+    #[cfg(feature = "swarm")]
+    swarm: Option<Arc<Swarm>>,
     access_log: Option<Arc<crate::logging::AccessLog>>,
     error_log: Arc<crate::logging::ErrorLog>,
+    https_port: AtomicU16,
     #[cfg(feature = "acme")]
     acme: Option<AcmeManager>,
 }
@@ -237,6 +313,7 @@ impl Router {
     pub(crate) async fn load(
         fallback: Arc<Config>,
         path: Option<&PathBuf>,
+        content: Option<String>,
         rate_limit: Option<Arc<RateLimiter>>,
         waf: Option<Waf>,
     ) -> Result<Self, Box<dyn Error + Send + Sync>> {
@@ -275,6 +352,13 @@ impl Router {
             .transpose()?
             .map(Arc::new);
         let bot_state = BotState::new().map_err(io::Error::other)?;
+        #[cfg(feature = "swarm")]
+        let swarm = fallback
+            .swarm
+            .clone()
+            .map(Swarm::new)
+            .transpose()?
+            .map(Arc::new);
         let current_dir = std::env::current_dir()?;
         let config_dir = if let Some(path) = path {
             let config_dir = path
@@ -290,7 +374,12 @@ impl Router {
             current_dir.clone()
         };
         let file = if let Some(path) = path {
-            let content = read_trusted_config(path)?;
+            // The master normally reads the file before dropping privileges,
+            // because the unprivileged user may not be able to reach it.
+            let content = match content {
+                Some(content) => content,
+                None => read_trusted_config(path)?,
+            };
             parse_file_config(&content)?
         } else {
             FileConfig {
@@ -320,6 +409,10 @@ impl Router {
             Arc::clone(&error_log),
         )
         .await?;
+        #[cfg(feature = "swarm")]
+        {
+            router.swarm = swarm;
+        }
         router.dir = dir;
         if router.dir.is_some() {
             router.reload_dir().await?;
@@ -822,20 +915,30 @@ impl Router {
                         .without_rules(&disabled_rules)?,
                 )
             };
-            let vhost_waf = vhost_waf.map(|waf| waf.with_block_status(block_status));
+            let vhost_waf = vhost_waf.map(|waf| {
+                let waf = waf.with_block_status(block_status);
+                entry
+                    .modsecurity_response_body
+                    .map_or(waf, |inspect| waf.with_response_body(inspect))
+            });
             let mut normalized_names = Vec::with_capacity(entry.server_names.len());
-            for name in entry.server_names {
-                let normalized = normalize_server_name(&name)
+            for name in &entry.server_names {
+                let normalized = normalize_server_name(name)
                     .ok_or_else(|| format!("invalid virtual host name: {name}"))?;
                 normalized_names.push(normalized);
             }
 
-            let tls = match (entry.tls_cert.take(), entry.tls_key.take()) {
-                (Some(cert), Some(key)) => Some(TlsFiles {
+            let tls_chain = entry.tls_chain.take();
+            let tls = match (entry.tls_cert.take(), entry.tls_key.take(), tls_chain) {
+                (Some(cert), Some(key), chain) => Some(TlsFiles {
                     cert: resolve_config_path(cert, config_dir),
                     key: resolve_config_path(key, config_dir),
+                    chain: chain.map(|path| resolve_config_path(path, config_dir)),
                 }),
-                (None, None) => None,
+                (None, None, None) => None,
+                (None, None, Some(_)) => {
+                    return Err("vhost tls_chain requires tls_cert and tls_key".into());
+                }
                 _ => return Err("vhost tls_cert and tls_key must be supplied together".into()),
             };
 
@@ -848,18 +951,22 @@ impl Router {
                 let proxy = Arc::new(ReverseProxy::new(
                     &upstream,
                     entry.proxy_preserve_host.unwrap_or(true),
+                    entry.proxy_http2.unwrap_or(false),
                     Duration::from_secs(entry.proxy_timeout.unwrap_or(60)),
                     ca_root.as_deref(),
                 )?);
                 vhosts.push(Vhost {
                     names: normalized_names,
                     tls,
+                    https_redirect: entry.https_redirect,
                     #[cfg(feature = "acme")]
                     acme: entry.acme.unwrap_or(true),
                     default: entry.default,
                     waf: vhost_waf,
                     rate_limit: vhost_rate_limit,
                     bot: vhost_bot,
+                    #[cfg(feature = "swarm")]
+                    swarm_enabled: entry.swarm.unwrap_or(true),
                     access_log: access_log.clone(),
                     error_log: Arc::clone(&error_log),
                     #[cfg(feature = "hosting")]
@@ -883,6 +990,13 @@ impl Router {
                     return Err(format!("virtual host user must not be root: {user}").into());
                 }
                 validate_worker_identity(uid, gid)?;
+                let worker_cgroup = cgroup_for_vhost(
+                    &entry,
+                    &fallback,
+                    uid,
+                    gid,
+                    normalized_names.first().map_or("", String::as_str),
+                )?;
                 let index_names = entry.index.unwrap_or_else(|| fallback.index.clone());
                 validate_index(&index_names)?;
                 let listing = entry.listing.unwrap_or(fallback.listing);
@@ -934,8 +1048,15 @@ impl Router {
                     if app_file.command.iter().any(|part| part.contains('\0')) {
                         return Err("vhost FastCGI app command cannot contain NUL".into());
                     }
-                    let max_workers = app_file.max_workers.unwrap_or(1);
+                    let max_workers = app_file
+                        .max_workers
+                        .unwrap_or_else(crate::config::default_fastcgi_app_max_workers);
                     crate::config::parse_fastcgi_app_max_workers(&max_workers.to_string())
+                        .map_err(|error| format!("vhost FastCGI app .{extension}: {error}"))?;
+                    let min_workers = app_file
+                        .min_workers
+                        .unwrap_or(crate::config::DEFAULT_FASTCGI_APP_MIN_WORKERS);
+                    crate::config::parse_fastcgi_app_min_workers(&min_workers.to_string())
                         .map_err(|error| format!("vhost FastCGI app .{extension}: {error}"))?;
                     let idle_timeout = app_file
                         .idle_timeout
@@ -948,6 +1069,13 @@ impl Router {
                             },
                         )
                         .map_err(|error| format!("vhost FastCGI app .{extension}: {error}"))?;
+                    let mode = app_file
+                        .mode
+                        .as_deref()
+                        .map(crate::config::parse_fastcgi_app_mode)
+                        .transpose()
+                        .map_err(|error| format!("vhost FastCGI app .{extension}: {error}"))?
+                        .unwrap_or_default();
                     for (key, value) in &app_file.env {
                         crate::config::validate_env_key(key)?;
                         if value.contains('\0') {
@@ -961,7 +1089,10 @@ impl Router {
                     if let FastCgiAddress::Spawn(app) = &mut backend.address {
                         app.args = app_file.command.into_iter().skip(1).collect();
                         app.env = app_file.env;
+                        app.mode = mode;
+                        app.php_defaults = app_file.php_defaults.unwrap_or(true);
                         app.max_workers = max_workers;
+                        app.min_workers = min_workers.min(max_workers);
                         app.idle_timeout = idle_timeout;
                     }
                     fastcgi.push(backend);
@@ -1010,6 +1141,7 @@ impl Router {
                     uid,
                     gid,
                     root,
+                    cgroup: worker_cgroup,
                     idle_timeout: (idle_timeout != Duration::ZERO).then_some(idle_timeout),
                     active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                     last_used: Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
@@ -1029,12 +1161,15 @@ impl Router {
                 vhosts.push(Vhost {
                     names: normalized_names,
                     tls,
+                    https_redirect: entry.https_redirect,
                     #[cfg(feature = "acme")]
                     acme: entry.acme.unwrap_or(true),
                     default: entry.default,
                     waf: vhost_waf,
                     rate_limit: vhost_rate_limit,
                     bot: vhost_bot,
+                    #[cfg(feature = "swarm")]
+                    swarm_enabled: entry.swarm.unwrap_or(true),
                     access_log,
                     error_log,
                     #[cfg(feature = "hosting")]
@@ -1062,8 +1197,11 @@ impl Router {
             rate_limit,
             bot,
             bot_state,
+            #[cfg(feature = "swarm")]
+            swarm: None,
             access_log: global_access_log,
             error_log: global_error_log,
+            https_port: AtomicU16::new(0),
             #[cfg(feature = "acme")]
             acme: None,
         })
@@ -1115,6 +1253,10 @@ impl Router {
         self.dir.clone()
     }
 
+    pub(crate) fn set_https_port(&self, port: u16) {
+        self.https_port.store(port, Ordering::Relaxed);
+    }
+
     pub(crate) async fn dispatch<B>(
         &self,
         request: Request<B>,
@@ -1125,6 +1267,8 @@ impl Router {
         B: Body<Data = Bytes> + Send + 'static,
         B::Error: Into<Box<dyn Error + Send + Sync>>,
     {
+        let timing = Arc::new(crate::logging::RequestTiming::new());
+        let request_started = std::time::SystemTime::now();
         let mut request = request;
         let (client, trusted_chain) =
             forwarded::resolve(peer, request.headers(), &self.fallback.trusted_proxies);
@@ -1158,52 +1302,74 @@ impl Router {
         );
         let access_log =
             vhost.map_or_else(|| self.access_log.clone(), |vhost| vhost.access_log.clone());
+        let debug = crate::logging::debug_enabled();
+        let capture_request = access_log.is_some() || debug;
         let received = access_log
             .as_ref()
             .map(|_| Arc::new(std::sync::atomic::AtomicU64::new(0)));
-        let access_request = received
-            .as_ref()
-            .map(|received| crate::logging::AccessRequest {
-                method: request.method().clone(),
-                path: request
-                    .uri()
-                    .path_and_query()
-                    .map_or("/", |value| value.as_str())
-                    .to_owned(),
-                version: request.version(),
-                client,
-                peer,
-                local,
-                server_name: server_name.clone(),
-                ja4: request
-                    .extensions()
-                    .get::<TlsFingerprint>()
-                    .map_or_else(|| "-".to_owned(), |fingerprint| fingerprint.0.ja4.clone()),
-                headers: request.headers().clone(),
-                received: Arc::clone(received),
-                started: std::time::SystemTime::now(),
-            });
-        let request = request.map(|body| crate::logging::CountedBody::new(body, received));
+        let access_request = capture_request.then(|| crate::logging::AccessRequest {
+            method: request.method().clone(),
+            path: request
+                .uri()
+                .path_and_query()
+                .map_or("/", |value| value.as_str())
+                .to_owned(),
+            version: request.version(),
+            client,
+            peer,
+            local,
+            server_name: server_name.clone(),
+            ja4: request
+                .extensions()
+                .get::<TlsFingerprint>()
+                .map_or_else(|| "-".to_owned(), |fingerprint| fingerprint.0.ja4.clone()),
+            headers: request.headers().clone(),
+            received: received
+                .clone()
+                .unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicU64::new(0))),
+            started: request_started,
+        });
+        let request = request.map(|body| crate::logging::CountedBody::new(body, received.clone()));
         let context = crate::logging::RequestContext {
             client: Some(client),
             local: Some(local),
             server_name,
             error_log: Some(error_log),
+            timing: Some(Arc::clone(&timing)),
         };
         let response = crate::logging::with_request_context(
-            context,
+            context.clone(),
             self.dispatch_inner(request, client, local, table, host, selected),
         )
         .await;
-        if let (Some(log), Some(access_request)) = (access_log, access_request) {
+        timing.mark_headers();
+        let mut response = response;
+        if self.fallback.server_timing
+            && let Ok(value) = HeaderValue::from_str(&crate::logging::server_timing_value(&timing))
+        {
+            response.headers_mut().append(
+                http::header::HeaderName::from_static("server-timing"),
+                value,
+            );
+        }
+        if access_log.is_some() || debug || self.fallback.server_timing {
             let (parts, body) = response.into_parts();
-            let access_response = crate::logging::AccessResponse {
-                status: parts.status.as_u16(),
-                version: parts.version,
-                headers: parts.headers.clone(),
-            };
-            let body = crate::logging::LoggedBody::new(body, log, access_request, access_response)
-                .boxed_unsync();
+            let access_response =
+                (access_log.is_some() || debug).then(|| crate::logging::AccessResponse {
+                    status: parts.status.as_u16(),
+                    version: parts.version,
+                    headers: parts.headers.clone(),
+                });
+            let body = crate::logging::LoggedBody::new(
+                body,
+                access_log,
+                access_request,
+                access_response,
+                timing,
+                debug,
+                context,
+            )
+            .boxed_unsync();
             Response::from_parts(parts, body)
         } else {
             response
@@ -1223,7 +1389,9 @@ impl Router {
         B: Body<Data = Bytes> + Send + 'static,
         B::Error: Into<Box<dyn Error + Send + Sync>>,
     {
+        self.bot_state.record_request();
         let host = host.as_deref();
+        let https_port = self.https_port.load(Ordering::Relaxed);
         #[cfg(feature = "acme")]
         if let Some(acme) = &self.acme {
             if request.method() == http::Method::GET
@@ -1236,6 +1404,40 @@ impl Router {
                 && let Some(host) = host
             {
                 acme.maybe_provision(host);
+            }
+        }
+        if request.extensions().get::<TlsSni>().is_none()
+            && https_port != 0
+            && let Some(index) = selected
+            && let Some(vhost) = table.vhosts.get(index)
+            && vhost.https_redirect.unwrap_or(self.fallback.https_redirect)
+            && let Some(host) = host
+            && (vhost.tls.is_some() || {
+                #[cfg(feature = "acme")]
+                {
+                    self.acme
+                        .as_ref()
+                        .is_some_and(|acme| acme.certificate_store().get(host).is_some())
+                }
+                #[cfg(not(feature = "acme"))]
+                {
+                    false
+                }
+            })
+        {
+            let path_and_query = request
+                .uri()
+                .path_and_query()
+                .map_or("/", |value| value.as_str());
+            let location = https_redirect_location(host, https_port, path_and_query);
+            if http::HeaderValue::from_str(&location).is_ok() {
+                let status = if matches!(request.method(), &http::Method::GET | &http::Method::HEAD)
+                {
+                    StatusCode::MOVED_PERMANENTLY
+                } else {
+                    StatusCode::PERMANENT_REDIRECT
+                };
+                return response::redirect_response(status, location);
             }
         }
         let rate_limit = match selected {
@@ -1251,6 +1453,17 @@ impl Router {
         {
             return crate::ratelimit::too_many_requests(retry_after);
         }
+        #[cfg(feature = "swarm")]
+        if let Some(swarm) = &self.swarm
+            && selected.is_none_or(|index| table.vhosts[index].swarm_enabled)
+            && let Some(blocked) = swarm.check(peer.ip()).await
+        {
+            let mut response = response::error_response(blocked.status, "Blocked\n");
+            if let Ok(reason) = HeaderValue::from_str(&blocked.reason) {
+                response.headers_mut().insert("block-reason", reason);
+            }
+            return response;
+        }
         let bot_policy = match selected {
             Some(index) => match &table.vhosts[index].bot {
                 VhostBot::Inherit => self.bot.as_ref(),
@@ -1260,6 +1473,7 @@ impl Router {
             None => self.bot.as_ref(),
         };
         if let Some(policy) = bot_policy {
+            let _bot_timing = crate::logging::StageTimer::new(crate::logging::Stage::Bot);
             let tls = request.extensions().get::<TlsSni>().is_some();
             if request.uri().path() == bot::CHALLENGE_PATH {
                 if request.method() != http::Method::GET {
@@ -1357,8 +1571,17 @@ impl Router {
             Ok(Some(index)) => index,
             Ok(None) => {
                 #[cfg(feature = "hosting")]
-                return handler::handle_request(request, Arc::clone(&self.fallback), peer, local)
+                {
+                    let _backend_timing =
+                        crate::logging::StageTimer::new(crate::logging::Stage::Backend);
+                    return handler::handle_request(
+                        request,
+                        Arc::clone(&self.fallback),
+                        peer,
+                        local,
+                    )
                     .await;
+                }
                 // Without hosting there is no fallback site to serve.
                 #[cfg(not(feature = "hosting"))]
                 return response::error_response(StatusCode::NOT_FOUND, "Not found\n");
@@ -1373,6 +1596,7 @@ impl Router {
                 .extensions()
                 .get::<DirectPeer>()
                 .map_or(peer, |direct_peer| direct_peer.0);
+            let _backend_timing = crate::logging::StageTimer::new(crate::logging::Stage::Backend);
             let response = proxy.forward(request, direct_peer, tls).await;
             let (parts, body) = response.into_parts();
             return Response::from_parts(parts, response::coalesce_ready_body(body));
@@ -1459,6 +1683,20 @@ fn request_host<B>(request: &Request<B>) -> Option<String> {
     normalize_host(authority.host())
 }
 
+fn https_redirect_location(host: &str, port: u16, path_and_query: &str) -> String {
+    let host = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_owned()
+    };
+    let authority = if port == 443 {
+        host
+    } else {
+        format!("{host}:{port}")
+    };
+    format!("https://{authority}{path_and_query}")
+}
+
 pub(crate) fn normalize_host(value: &str) -> Option<String> {
     let host = value.trim().trim_end_matches('.');
     if host.is_empty()
@@ -1513,6 +1751,42 @@ fn validate_index(index: &[String]) -> Result<(), Box<dyn Error + Send + Sync>> 
         .map_err(|_| "vhost index must be a non-empty list of file names".into())
 }
 
+#[cfg(feature = "hosting")]
+fn cgroup_for_vhost(
+    entry: &VhostFile,
+    fallback: &Config,
+    uid: u32,
+    gid: u32,
+    name: &str,
+) -> Result<Option<CgroupSpec>, Box<dyn Error + Send + Sync>> {
+    let global = fallback.worker_cgroup.as_ref();
+    let path = entry
+        .cgroup
+        .as_deref()
+        .or_else(|| global.and_then(|spec| spec.path.to_str()));
+    let memory_max = entry
+        .cgroup_memory_max
+        .as_deref()
+        .or_else(|| global.and_then(|spec| spec.memory_max.as_deref()));
+    let cpu_max = entry
+        .cgroup_cpu_max
+        .as_deref()
+        .or_else(|| global.and_then(|spec| spec.cpu_max.as_deref()));
+    let pids_max = entry
+        .cgroup_pids_max
+        .as_deref()
+        .or_else(|| global.and_then(|spec| spec.pids_max.as_deref()));
+    let Some(path) = path else {
+        if memory_max.is_some() || cpu_max.is_some() || pids_max.is_some() {
+            return Err("worker cgroup limits require a cgroup path".into());
+        }
+        return Ok(None);
+    };
+    Ok(Some(
+        CgroupSpec::new(path, memory_max, cpu_max, pids_max)?.expand(uid, gid, name)?,
+    ))
+}
+
 fn validate_vhost_declarations<'a>(
     entries: impl IntoIterator<Item = &'a VhostFile>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -1527,6 +1801,17 @@ fn validate_vhost_declarations<'a>(
             .into());
         }
         if entry.proxy_pass.is_some() {
+            if entry.cgroup.is_some()
+                || entry.cgroup_memory_max.is_some()
+                || entry.cgroup_cpu_max.is_some()
+                || entry.cgroup_pids_max.is_some()
+            {
+                return Err(format!(
+                    "vhost {} worker cgroup options require a hosted vhost",
+                    index + 1
+                )
+                .into());
+            }
             #[cfg(feature = "proxy")]
             ReverseProxy::validate_upstream_url(entry.proxy_pass.as_deref().unwrap())
                 .map_err(|error| format!("vhost {} proxy_pass: {error}", index + 1))?;
@@ -1557,6 +1842,7 @@ fn validate_vhost_declarations<'a>(
                 .into());
             }
             if entry.proxy_preserve_host.is_some()
+                || entry.proxy_http2.is_some()
                 || entry.proxy_timeout.is_some()
                 || entry.proxy_ca_root.is_some()
             {
@@ -1574,6 +1860,39 @@ fn validate_vhost_declarations<'a>(
             return Err(
                 format!("vhost {} must provide both tls_cert and tls_key", index + 1).into(),
             );
+        }
+        if entry.tls_chain.is_some() && entry.tls_cert.is_none() {
+            return Err(format!(
+                "vhost {} tls_chain requires tls_cert and tls_key",
+                index + 1
+            )
+            .into());
+        }
+        #[cfg(feature = "hosting")]
+        {
+            if let Some(path) = entry.cgroup.as_deref() {
+                CgroupSpec::new(
+                    path,
+                    entry.cgroup_memory_max.as_deref(),
+                    entry.cgroup_cpu_max.as_deref(),
+                    entry.cgroup_pids_max.as_deref(),
+                )
+                .map_err(|error| format!("vhost {} cgroup: {error}", index + 1))?;
+            } else {
+                if let Some(limit) = entry.cgroup_memory_max.as_deref() {
+                    crate::cgroup::normalize_memory_max(limit).map_err(|error| {
+                        format!("vhost {} cgroup_memory_max: {error}", index + 1)
+                    })?;
+                }
+                if let Some(limit) = entry.cgroup_cpu_max.as_deref() {
+                    crate::cgroup::normalize_cpu_max(limit)
+                        .map_err(|error| format!("vhost {} cgroup_cpu_max: {error}", index + 1))?;
+                }
+                if let Some(limit) = entry.cgroup_pids_max.as_deref() {
+                    crate::cgroup::normalize_pids_max(limit)
+                        .map_err(|error| format!("vhost {} cgroup_pids_max: {error}", index + 1))?;
+                }
+            }
         }
         if let Some(threads) = entry.worker_threads {
             crate::config::parse_thread_count(&threads.to_string())
@@ -1621,8 +1940,28 @@ fn validate_vhost_declarations<'a>(
             )?;
         }
         for app in &entry.fastcgi_app {
+            if let Some(mode) = &app.mode {
+                crate::config::parse_fastcgi_app_mode(mode).map_err(|error| {
+                    format!(
+                        "vhost {} FastCGI app .{}: {error}",
+                        index + 1,
+                        app.extension
+                    )
+                })?;
+            }
             if let Some(max_workers) = app.max_workers {
                 crate::config::parse_fastcgi_app_max_workers(&max_workers.to_string()).map_err(
+                    |error| {
+                        format!(
+                            "vhost {} FastCGI app .{}: {error}",
+                            index + 1,
+                            app.extension
+                        )
+                    },
+                )?;
+            }
+            if let Some(min_workers) = app.min_workers {
+                crate::config::parse_fastcgi_app_min_workers(&min_workers.to_string()).map_err(
                     |error| {
                         format!(
                             "vhost {} FastCGI app .{}: {error}",
@@ -1675,6 +2014,14 @@ fn validate_vhost_declarations<'a>(
 /// built without it: proxying for `proxy_pass`, hosting for a document root,
 /// and ACME for an explicit `acme: true`.
 fn missing_feature(entry: &VhostFile) -> Option<&'static str> {
+    if (entry.cgroup.is_some()
+        || entry.cgroup_memory_max.is_some()
+        || entry.cgroup_cpu_max.is_some()
+        || entry.cgroup_pids_max.is_some())
+        && !cfg!(feature = "hosting")
+    {
+        return Some("hosting");
+    }
     if entry.proxy_pass.is_some() {
         if !cfg!(feature = "proxy") {
             return Some("proxy");
@@ -1684,6 +2031,9 @@ fn missing_feature(entry: &VhostFile) -> Option<&'static str> {
     }
     if entry.acme == Some(true) && !cfg!(feature = "acme") {
         return Some("acme");
+    }
+    if entry.swarm.is_some() && !cfg!(feature = "swarm") {
+        return Some("swarm");
     }
     None
 }
@@ -1700,8 +2050,15 @@ fn validate_vhost_waf_declarations<'a>(
     {
         return Err("modsecurity_disable_rules requires --modsecurity-rules".into());
     }
-    if !has_global_waf && entries.any(|entry| entry.modsecurity_block_status.is_some()) {
+    if !has_global_waf
+        && entries
+            .clone()
+            .any(|entry| entry.modsecurity_block_status.is_some())
+    {
         return Err("modsecurity_block_status requires --modsecurity-rules".into());
+    }
+    if !has_global_waf && entries.any(|entry| entry.modsecurity_response_body.is_some()) {
+        return Err("modsecurity_response_body requires --modsecurity-rules".into());
     }
     Ok(())
 }
@@ -1885,6 +2242,9 @@ pub(crate) fn helper_directories(config: &Config) -> io::Result<(Vec<PathBuf>, V
     if let Some(tls) = &config.tls {
         add_parent_directory(&mut tls_dirs, &tls.cert, &current_dir);
         add_parent_directory(&mut tls_dirs, &tls.key, &current_dir);
+        if let Some(chain) = &tls.chain {
+            add_parent_directory(&mut tls_dirs, chain, &current_dir);
+        }
     }
     #[cfg(feature = "acme")]
     if let Some(acme) = &config.acme {
@@ -1943,9 +2303,13 @@ fn append_vhost_helper_directories(
     {
         add_parent_directory(log_dirs, path, config_dir);
     }
-    for path in [entry.tls_cert.as_ref(), entry.tls_key.as_ref()]
-        .into_iter()
-        .flatten()
+    for path in [
+        entry.tls_cert.as_ref(),
+        entry.tls_key.as_ref(),
+        entry.tls_chain.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
     {
         add_parent_directory(tls_dirs, path, config_dir);
     }
@@ -2253,6 +2617,7 @@ fn validate_vhost_entry(
         ReverseProxy::new(
             upstream,
             entry.proxy_preserve_host.unwrap_or(true),
+            entry.proxy_http2.unwrap_or(false),
             Duration::from_secs(entry.proxy_timeout.unwrap_or(60)),
             ca_root.as_deref(),
         )?;
@@ -2269,6 +2634,8 @@ fn validate_vhost_entry(
             return Err(format!("virtual host user must not be root: {user}").into());
         }
         validate_worker_identity(uid, gid)?;
+        let name = entry.server_names.first().map_or("", String::as_str);
+        cgroup_for_vhost(entry, fallback, uid, gid, name)?;
         validate_index(entry.index.as_deref().unwrap_or(&fallback.index))?;
         let root = entry
             .root
@@ -2316,8 +2683,14 @@ fn validate_vhost_entry(
                 return Err("vhost FastCGI app command cannot contain NUL".into());
             }
             crate::config::parse_fastcgi_app(&format!("{extension}={program}"))?;
-            crate::config::parse_fastcgi_app_max_workers(
-                &app.max_workers.unwrap_or(1).to_string(),
+            let max_workers = app
+                .max_workers
+                .unwrap_or_else(crate::config::default_fastcgi_app_max_workers);
+            crate::config::parse_fastcgi_app_max_workers(&max_workers.to_string())?;
+            crate::config::parse_fastcgi_app_min_workers(
+                &app.min_workers
+                    .unwrap_or(crate::config::DEFAULT_FASTCGI_APP_MIN_WORKERS)
+                    .to_string(),
             )?;
             crate::config::parse_fastcgi_app_idle_timeout(
                 &app.idle_timeout
@@ -2398,6 +2771,135 @@ fn parse_file_config(content: &str) -> Result<FileConfig, serde_yaml_ng::Error> 
         Ok(FileConfig::default())
     } else {
         serde_yaml_ng::from_str(content)
+    }
+}
+
+pub(crate) fn validate_vhost_document(
+    content: &str,
+    config_dir: &Path,
+    has_waf: bool,
+) -> Result<(), Vec<String>> {
+    let value: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(content).map_err(|error| vec![format!("invalid YAML: {error}")])?;
+    let Some(mapping) = value.as_mapping() else {
+        return Err(vec!["configuration must be a YAML mapping".to_owned()]);
+    };
+    for key in ["options", "vhost_dir"] {
+        if mapping.contains_key(serde_yaml_ng::Value::String(key.to_owned())) {
+            return Err(vec![format!(
+                "{key} is not allowed in a generated vhost document"
+            )]);
+        }
+    }
+    let file =
+        parse_file_config(content).map_err(|error| vec![format!("invalid YAML: {error}")])?;
+    if file.vhost.len() != 1 {
+        return Err(vec![format!(
+            "generated document must contain exactly one vhost; found {}",
+            file.vhost.len()
+        )]);
+    }
+    let fallback = configure_fallback(None, config_dir)?;
+    validate_vhost_entry(&file.vhost[0], &fallback, config_dir, has_waf)
+        .map_err(|error| vec![error.to_string()])
+}
+
+pub(crate) fn validate_main_document(content: &str, config_dir: &Path) -> Result<(), Vec<String>> {
+    let value: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(content).map_err(|error| vec![format!("invalid YAML: {error}")])?;
+    let Some(mapping) = value.as_mapping() else {
+        return Err(vec!["configuration must be a YAML mapping".to_owned()]);
+    };
+    for key in mapping.keys() {
+        let Some(key) = key.as_str() else {
+            return Err(vec![
+                "top-level configuration keys must be strings".to_owned(),
+            ]);
+        };
+        if !matches!(key, "options" | "vhost") {
+            return Err(vec![format!("unknown top-level configuration key: {key}")]);
+        }
+    }
+    let file =
+        parse_file_config(content).map_err(|error| vec![format!("invalid YAML: {error}")])?;
+    if file.vhost.len() > 1 {
+        return Err(vec![format!(
+            "generated document may contain at most one vhost; found {}",
+            file.vhost.len()
+        )]);
+    }
+    let fallback = configure_fallback(file.options.as_ref(), config_dir)?;
+    if let Some(entry) = file.vhost.first() {
+        let has_waf = !fallback.modsecurity_rules.is_empty();
+        validate_vhost_entry(entry, &fallback, config_dir, has_waf)
+            .map_err(|error| vec![error.to_string()])?;
+    }
+    Ok(())
+}
+
+fn configure_fallback(
+    options: Option<&serde_yaml_ng::Value>,
+    config_dir: &Path,
+) -> Result<Config, Vec<String>> {
+    let empty_options = serde_yaml_ng::Value::Mapping(serde_yaml_ng::Mapping::new());
+    let options = options.unwrap_or(&empty_options);
+    Config::from_options(options, &config_dir.join("charlotte.yaml"))
+        .map_err(|error| vec![format!("could not construct server configuration: {error}")])
+}
+
+#[cfg(test)]
+mod configure_validation_tests {
+    use super::{validate_main_document, validate_vhost_document};
+    use std::path::Path;
+
+    #[test]
+    fn generated_vhost_validation_rejects_global_options_and_multiple_entries() {
+        for yaml in [
+            "options: {debug: true}\nvhost: []\n",
+            "vhost_dir: /etc/charlotte/sites\nvhost: []\n",
+        ] {
+            let errors = validate_vhost_document(yaml, Path::new("."), false).unwrap_err();
+            assert!(errors[0].contains("not allowed"), "{errors:?}");
+        }
+
+        let errors = validate_vhost_document(
+            "vhost:\n  - server_names: [one.example]\n  - server_names: [two.example]\n",
+            Path::new("."),
+            false,
+        )
+        .unwrap_err();
+        assert!(errors[0].contains("exactly one vhost"), "{errors:?}");
+    }
+
+    #[test]
+    fn generated_main_validation_rejects_unexpected_top_level_keys_and_multiple_vhosts() {
+        let errors = validate_main_document("other: true\n", Path::new(".")).unwrap_err();
+        assert!(errors[0].contains("unknown top-level"), "{errors:?}");
+
+        let errors = validate_main_document(
+            "options: {debug: true}\nvhost:\n  - server_names: [one.example]\n  - server_names: [two.example]\n",
+            Path::new("."),
+        )
+        .unwrap_err();
+        assert!(errors[0].contains("at most one vhost"), "{errors:?}");
+
+        assert!(validate_main_document("options: {debug: true}\n", Path::new(".")).is_ok());
+    }
+
+    #[cfg(feature = "proxy")]
+    #[test]
+    fn generated_main_validation_uses_global_options_for_vhost_waf_checks() {
+        let content = "options:\n  modsecurity-rules: [rules.conf]\nvhost:\n  - server_names: [proxy.example]\n    proxy_pass: http://127.0.0.1:3000\n    modsecurity_disable_rules: [123]\n";
+        assert!(validate_main_document(content, Path::new(".")).is_ok());
+        let without_waf = content.replace(
+            "options:\n  modsecurity-rules: [rules.conf]\n",
+            "options: {}\n",
+        );
+        let errors = validate_main_document(&without_waf, Path::new(".")).unwrap_err();
+        assert!(
+            errors[0].contains("modsecurity_disable_rules"),
+            "{errors:?}"
+        );
     }
 }
 
@@ -2499,11 +3001,11 @@ fn persist_vhost_file(dir: &Path, path: &Path, content: &str) -> io::Result<()> 
 mod tests {
     use super::{
         FileConfig, Router, TlsSni, Vhost, VhostFile, VhostTable, Worker, WorkerArgs,
-        build_worker_args, ensure_trusted_config, match_score, normalize_host,
-        normalize_server_name, parse_file_config, render_control_vhost, request_host,
-        resolve_identity, scan_vhost_files, select_route, trusted_write_mode, valid_control_name,
-        validate_index, validate_vhost_declarations, validate_vhost_waf_declarations,
-        worker_app_env, worker_request,
+        build_worker_args, cgroup_for_vhost, ensure_trusted_config, https_redirect_location,
+        match_score, normalize_host, normalize_server_name, parse_file_config,
+        render_control_vhost, request_host, resolve_identity, scan_vhost_files, select_route,
+        trusted_write_mode, valid_control_name, validate_index, validate_vhost_declarations,
+        validate_vhost_waf_declarations, worker_app_env, worker_request,
     };
     use crate::{
         config::{
@@ -2572,6 +3074,18 @@ mod tests {
         assert!(normalize_server_name("api.*.example.com").is_none());
     }
 
+    #[test]
+    fn https_redirect_location_formats_default_port_and_ipv6() {
+        assert_eq!(
+            https_redirect_location("example.test", 443, "/path?q=1"),
+            "https://example.test/path?q=1"
+        );
+        assert_eq!(
+            https_redirect_location("2001:db8::1", 8443, "/"),
+            "https://[2001:db8::1]:8443/"
+        );
+    }
+
     fn declaration(names: &[&str], is_default: bool) -> VhostFile {
         VhostFile {
             server_names: names.iter().map(|name| (*name).to_owned()).collect(),
@@ -2587,17 +3101,26 @@ mod tests {
             fastcgi_timeout: None,
             worker_threads: None,
             worker_idle_timeout: None,
+            cgroup: None,
+            cgroup_memory_max: None,
+            cgroup_cpu_max: None,
+            cgroup_pids_max: None,
             rate_limit: None,
             rate_limit_burst: None,
             bot: None,
             tls_cert: None,
             tls_key: None,
+            tls_chain: None,
+            https_redirect: None,
             default: is_default,
             modsecurity_disable_rules: Vec::new(),
             modsecurity_block_status: None,
+            modsecurity_response_body: None,
             acme: None,
             proxy_pass: None,
             proxy_preserve_host: None,
+            proxy_http2: None,
+            swarm: None,
             proxy_timeout: None,
             proxy_ca_root: None,
             access_log: None,
@@ -2634,6 +3157,54 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[cfg(feature = "hosting")]
+    #[test]
+    fn validates_and_merges_vhost_cgroup_settings() {
+        let mut valid = declaration(&["*.example.test"], false);
+        valid.cgroup = Some("/charlotte/{uid}/{name}".to_owned());
+        valid.cgroup_memory_max = Some("128M".to_owned());
+        valid.cgroup_cpu_max = Some("50%".to_owned());
+        valid.cgroup_pids_max = Some("24".to_owned());
+        assert!(validate_vhost_declarations([&valid]).is_ok());
+
+        let mut invalid_path = valid.clone();
+        invalid_path.cgroup = Some("../outside".to_owned());
+        assert!(validate_vhost_declarations([&invalid_path]).is_err());
+        let mut invalid_limit = valid.clone();
+        invalid_limit.cgroup_cpu_max = Some("0%".to_owned());
+        assert!(validate_vhost_declarations([&invalid_limit]).is_err());
+
+        let fallback = match Config::parse([
+            "--worker-cgroup".to_owned(),
+            "charlotte/global/{uid}".to_owned(),
+            "--worker-cgroup-pids-max".to_owned(),
+            "48".to_owned(),
+        ])
+        .unwrap()
+        {
+            crate::config::ParseResult::Config(config) => config,
+            crate::config::ParseResult::Help => panic!("expected config"),
+        };
+        let mut inherited = declaration(&["*.example.test"], false);
+        inherited.cgroup_memory_max = Some("1G".to_owned());
+        let inherited = cgroup_for_vhost(&inherited, &fallback, 1001, 1002, "*.example.test")
+            .unwrap()
+            .unwrap();
+        assert_eq!(inherited.path, PathBuf::from("charlotte/global/1001"));
+        assert_eq!(inherited.memory_max.as_deref(), Some("1073741824"));
+        assert_eq!(inherited.pids_max.as_deref(), Some("48"));
+
+        let mut missing_path = declaration(&["example.test"], false);
+        missing_path.cgroup_pids_max = Some("10".to_owned());
+        let no_global_cgroup = match Config::parse(Vec::<String>::new()).unwrap() {
+            crate::config::ParseResult::Config(config) => config,
+            crate::config::ParseResult::Help => panic!("expected config"),
+        };
+        let error =
+            cgroup_for_vhost(&missing_path, &no_global_cgroup, 1, 1, "example.test").unwrap_err();
+        assert!(error.to_string().contains("limits require a cgroup path"));
     }
 
     #[cfg(feature = "proxy")]
@@ -2807,6 +3378,8 @@ mod tests {
                       - extension: php
                         command: [php8.4-cgi, --foreground]
                         env: { APP_MODE: test }
+                        mode: fpm
+                        php_defaults: false
                         max_workers: 4
                         idle_timeout: 12
             "#,
@@ -2815,6 +3388,8 @@ mod tests {
         assert_eq!(parsed.vhost[0].fastcgi_app[0].extension, "php");
         assert_eq!(parsed.vhost[0].fastcgi_app[0].max_workers, Some(4));
         assert_eq!(parsed.vhost[0].fastcgi_app[0].idle_timeout, Some(12));
+        assert_eq!(parsed.vhost[0].fastcgi_app[0].mode.as_deref(), Some("fpm"));
+        assert_eq!(parsed.vhost[0].fastcgi_app[0].php_defaults, Some(false));
         assert!(validate_vhost_declarations(&parsed.vhost).is_ok());
         assert_eq!(
             parsed.vhost[0].fastcgi_app[0].command,
@@ -2831,6 +3406,11 @@ mod tests {
         let mut invalid = parsed.vhost[0].clone();
         invalid.fastcgi_app[0].max_workers = Some(0);
         assert!(validate_vhost_declarations(&[invalid]).is_err());
+        let invalid_mode: FileConfig = serde_yaml_ng::from_str(
+            "vhost:\n  - server_names: [bad-mode.example]\n    root: /srv/bad-mode\n    user: site\n    fastcgi_app:\n      - extension: php\n        command: [php-cgi]\n        mode: invalid\n",
+        )
+        .unwrap();
+        assert!(validate_vhost_declarations(&invalid_mode.vhost).is_err());
         let mut invalid = parsed.vhost[0].clone();
         invalid.fastcgi_app[0].idle_timeout = Some(0);
         assert!(validate_vhost_declarations(&[invalid]).is_err());
@@ -2972,6 +3552,21 @@ mod tests {
         entry.tls_cert = Some("cert.pem".into());
         entry.tls_key = Some("key.pem".into());
         assert!(validate_vhost_declarations(&[entry]).is_ok());
+
+        let mut entry = declaration(&["example.test"], false);
+        entry.tls_chain = Some("chain.pem".into());
+        let error = validate_vhost_declarations(&[entry]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("tls_chain requires tls_cert and tls_key")
+        );
+
+        let mut entry = declaration(&["example.test"], false);
+        entry.tls_cert = Some("cert.pem".into());
+        entry.tls_key = Some("key.pem".into());
+        entry.tls_chain = Some("chain.pem".into());
+        assert!(validate_vhost_declarations(&[entry]).is_ok());
     }
 
     #[test]
@@ -2988,6 +3583,9 @@ mod tests {
                     program: "/usr/bin/php8.4-cgi".into(),
                     args: vec!["--foreground".to_owned()],
                     env: BTreeMap::from([("APP_MODE".to_owned(), "worker".to_owned())]),
+                    mode: crate::config::FastCgiAppMode::Fpm,
+                    php_defaults: false,
+                    min_workers: 1,
                     max_workers: 4,
                     idle_timeout: Duration::from_secs(12),
                 }),
@@ -3023,6 +3621,14 @@ mod tests {
         assert!(
             args.windows(2)
                 .any(|pair| { pair == ["--fastcgi-app-arg", "cgi=--foreground"] })
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| { pair == ["--fastcgi-app-mode", "cgi=fpm"] })
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| { pair == ["--fastcgi-app-php-defaults", "cgi=off"] })
         );
         assert!(
             args.windows(2)
@@ -3156,7 +3762,7 @@ mod tests {
         let (peer, local) = fuzz_support::addresses();
         let method = request.method().clone();
         let collected = fuzz_support::collect(async {
-            let router = Router::load(Arc::new(config), None, None, None)
+            let router = Router::load(Arc::new(config), None, None, None, None)
                 .await
                 .expect("fallback router loads");
             router.dispatch(request, peer, local).await
@@ -3184,12 +3790,15 @@ mod tests {
             Arc::new(Vhost {
                 names: names.iter().map(|name| (*name).to_owned()).collect(),
                 tls: None,
+                https_redirect: None,
                 #[cfg(feature = "acme")]
                 acme: false,
                 default,
                 waf: None,
                 rate_limit: super::VhostRateLimit::Inherit,
                 bot: super::VhostBot::Inherit,
+                #[cfg(feature = "swarm")]
+                swarm_enabled: true,
                 access_log: None,
                 error_log: Arc::new(crate::logging::ErrorLog::new(
                     crate::logging::LogTarget::stderr(),
@@ -3199,6 +3808,7 @@ mod tests {
                     uid: 0,
                     gid: 0,
                     root: PathBuf::from("/"),
+                    cgroup: None,
                     idle_timeout: None,
                     active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                     last_used: Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
@@ -3392,7 +4002,7 @@ mod tests {
         let config_path = directory.join("charlotte.yaml");
         std::fs::write(
             &config_path,
-            "vhost_dir: vhosts.d\nvhost:\n  - server_names: [main.example.test]\n    proxy_pass: http://127.0.0.1:9\n    access_log: logs/main.log\n    tls_cert: /etc/ssl/main/cert.pem\n    tls_key: /etc/ssl/private/main.key\n",
+            "vhost_dir: vhosts.d\nvhost:\n  - server_names: [main.example.test]\n    proxy_pass: http://127.0.0.1:9\n    access_log: logs/main.log\n    tls_cert: /etc/ssl/main/cert.pem\n    tls_key: /etc/ssl/private/main.key\n    tls_chain: /etc/ssl/chain/intermediate.pem\n",
         )
         .unwrap();
         std::fs::write(
@@ -3431,6 +4041,7 @@ mod tests {
                 PathBuf::from("/srv/tls"),
                 PathBuf::from("/etc/ssl/main"),
                 PathBuf::from("/etc/ssl/private"),
+                PathBuf::from("/etc/ssl/chain"),
             ]
         );
         std::fs::remove_dir_all(directory).unwrap();
@@ -3753,29 +4364,32 @@ mod feature_tests {
             "{syntax_errors:?}"
         );
 
-        let semantic_path = directory.join("semantic.yaml");
-        fs::write(
-            &semantic_path,
-            concat!(
-                "vhost:\n",
-                "  - server_names: [rate.test]\n",
-                "    proxy_pass: http://127.0.0.1:8080\n",
-                "    rate_limit: invalid\n",
-                "  - server_names: [second-rate.test]\n",
-                "    proxy_pass: http://127.0.0.1:8080\n",
-                "    rate_limit: invalid\n",
-            ),
-        )
-        .unwrap();
-        let semantic_errors = check_file(&semantic_path);
-        for line in [2, 5] {
-            assert!(
-                semantic_errors.iter().any(|error| {
-                    error.starts_with(&format!("{}:{line}:", semantic_path.display()))
-                        && error.contains("rate_limit")
-                }),
-                "{semantic_errors:?}"
-            );
+        #[cfg(feature = "proxy")]
+        {
+            let semantic_path = directory.join("semantic.yaml");
+            fs::write(
+                &semantic_path,
+                concat!(
+                    "vhost:\n",
+                    "  - server_names: [rate.test]\n",
+                    "    proxy_pass: http://127.0.0.1:8080\n",
+                    "    rate_limit: invalid\n",
+                    "  - server_names: [second-rate.test]\n",
+                    "    proxy_pass: http://127.0.0.1:8080\n",
+                    "    rate_limit: invalid\n",
+                ),
+            )
+            .unwrap();
+            let semantic_errors = check_file(&semantic_path);
+            for line in [2, 5] {
+                assert!(
+                    semantic_errors.iter().any(|error| {
+                        error.starts_with(&format!("{}:{line}:", semantic_path.display()))
+                            && error.contains("rate_limit")
+                    }),
+                    "{semantic_errors:?}"
+                );
+            }
         }
         let _ = fs::remove_dir_all(directory);
     }

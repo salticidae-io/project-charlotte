@@ -976,3 +976,56 @@ fn rejects_acme_cache_inside_a_served_document_root() {
     );
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[tokio::test]
+async fn acme_startup_failure_is_logged_and_exits_promptly() {
+    let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!(
+        "project-charlotte-acme-startup-failure-{}-{sequence}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let cache_file = root.join("cache-is-a-file");
+    std::fs::write(&cache_file, "not a directory").unwrap();
+    let error_log = root.join("errors.log");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_project-charlotte"));
+    command
+        .arg("--bind")
+        .arg(common::reserve_tcp_address().to_string())
+        .arg("--acme-directory")
+        .arg("https://ca.example.test/directory")
+        .arg("--acme-cache")
+        .arg(&cache_file)
+        .arg("--error-log-file")
+        .arg(&error_log)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(feature = "hosting")]
+    command.arg("--root").arg(&root);
+    let started = tokio::time::Instant::now();
+    let mut server = common::spawn(&mut command).unwrap();
+    let deadline = started + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = server.try_wait().unwrap() {
+            break status;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let _ = server.kill();
+            let _ = server.wait();
+            panic!("server hung during failing ACME initialization");
+        }
+        sleep(Duration::from_millis(20)).await;
+    };
+
+    assert!(!status.success(), "invalid ACME cache unexpectedly started");
+    assert!(started.elapsed() < Duration::from_secs(5));
+    let log = std::fs::read_to_string(&error_log).unwrap_or_else(|error| {
+        panic!(
+            "could not read error log {} after server exited with {status}: {error}",
+            error_log.display()
+        )
+    });
+    assert!(log.contains("Startup failed:"), "{log}");
+    assert!(log.contains("ACME cache"), "{log}");
+    std::fs::remove_dir_all(root).unwrap();
+}

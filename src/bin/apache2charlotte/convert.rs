@@ -562,6 +562,10 @@ fn convert_directive(
             set_string(host, "tls_key", value);
             true
         }
+        "sslcertificatechainfile" => {
+            set_string(host, "tls_chain", value);
+            true
+        }
         "proxypass" if args.len() >= 2 && value == "/" => {
             set_string(host, "proxy_pass", &args[1]);
             true

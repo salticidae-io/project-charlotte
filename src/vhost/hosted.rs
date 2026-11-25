@@ -30,7 +30,8 @@ use tokio::{io::AsyncReadExt, net::UnixStream, sync::Mutex, time::timeout};
 
 use super::{Rejection, TlsSni, request_authority};
 use crate::{
-    config::{FastCgiAddress, FastCgiApp, FastCgiBackend},
+    cgroup::CgroupSpec,
+    config::{FastCgiAddress, FastCgiApp, FastCgiAppMode, FastCgiBackend},
     response::{self, ResponseBody},
 };
 
@@ -50,6 +51,7 @@ pub(super) struct Worker {
     pub(super) uid: u32,
     pub(super) gid: u32,
     pub(super) root: PathBuf,
+    pub(super) cgroup: Option<CgroupSpec>,
     pub(super) idle_timeout: Option<Duration>,
     pub(super) active: Arc<AtomicUsize>,
     pub(super) last_used: Arc<StdMutex<Instant>>,
@@ -159,14 +161,25 @@ impl Worker {
         }
     }
 
+    #[cfg(test)]
+    async fn process_is_running(&self) -> bool {
+        self.process.lock().await.is_some()
+    }
+
     pub(super) async fn spawn_process(
         &self,
     ) -> Result<WorkerProcess, Box<dyn Error + Send + Sync>> {
         crate::log_debug!(
-            "Spawning virtual-host worker for root {} as uid {} gid {}",
+            "Spawning virtual-host worker for root {} as uid {} gid {}{}",
             self.root.display(),
             self.uid,
-            self.gid
+            self.gid,
+            self.cgroup
+                .as_ref()
+                .map_or_else(String::new, |spec| format!(
+                    " in cgroup {}",
+                    spec.path.display()
+                ))
         );
         let (parent, child_socket) = StdUnixStream::pair()?;
         parent.set_nonblocking(true)?;
@@ -204,6 +217,7 @@ impl Worker {
                 &args,
                 &environment,
                 self.error_log_file.as_deref(),
+                self.cgroup.as_ref(),
                 OwnedFd::from(child_socket),
             )?)
         } else {
@@ -218,6 +232,18 @@ impl Worker {
                 let stderr = crate::logging::open_log_file(path)?;
                 command.stderr(Stdio::from(stderr));
             }
+            if let Some(spec) = &self.cgroup {
+                let cgroup_procs = crate::cgroup::prepare(spec).map_err(|error| {
+                    io::Error::new(
+                        error.kind(),
+                        format!(
+                            "could not prepare worker cgroup {}: {error}",
+                            spec.path.display()
+                        ),
+                    )
+                })?;
+                crate::cgroup::apply_to_command(&mut command, cgroup_procs);
+            }
             if crate::privileges::can_set_ids()? {
                 crate::privileges::apply_identity(&mut command, self.uid, self.gid)?;
             }
@@ -226,37 +252,14 @@ impl Worker {
             WorkerChild::Direct(child)
         };
         let mut stream = UnixStream::from_std(parent)?;
-        let ready_result = timeout(WORKER_READY_TIMEOUT, async {
-            let mut byte = [0; 1];
-            stream.read_exact(&mut byte).await?;
-            Ok::<_, io::Error>(byte[0])
-        })
-        .await;
-        match ready_result {
-            Ok(Ok(1)) => {
-                crate::log_debug!("Virtual-host worker {} is ready", child.id());
-            }
-            Ok(Ok(_)) => {
-                return Err(self
-                    .startup_failure(&mut child, "sent an invalid ready signal")
-                    .into());
-            }
-            Ok(Err(error)) => {
-                let reason = if error.kind() == io::ErrorKind::UnexpectedEof {
-                    "exited before becoming ready".to_owned()
-                } else {
-                    format!("failed while waiting for the ready signal: {error}")
-                };
-                return Err(self.startup_failure(&mut child, &reason).into());
-            }
-            Err(_) => {
-                return Err(self
-                    .startup_failure(&mut child, "did not become ready before the timeout")
-                    .into());
-            }
+        if let Err(reason) = wait_for_ready(&mut stream, WORKER_READY_TIMEOUT).await {
+            return Err(self.startup_failure(&mut child, &reason).into());
         }
-        let handshake =
-            hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(stream)).await;
+        crate::log_debug!("Virtual-host worker {} is ready", child.id());
+        let handshake = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+            .adaptive_window(true)
+            .handshake(TokioIo::new(stream))
+            .await;
         let (sender, connection) = match handshake {
             Ok(handshake) => handshake,
             Err(error) => {
@@ -345,6 +348,7 @@ impl Worker {
                 .is_none_or(|process| process.sender.is_closed())
             {
                 *process_guard = None;
+                let _spawn_timing = crate::logging::StageTimer::new(crate::logging::Stage::Spawn);
                 *process_guard = Some(self.spawn_process().await?);
             }
             process_guard
@@ -353,6 +357,7 @@ impl Worker {
                 .sender
                 .clone()
         };
+        let _backend_timing = crate::logging::StageTimer::new(crate::logging::Stage::Backend);
         match sender.send_request(request).await {
             Ok(response) => Ok(response),
             Err(error) => {
@@ -368,6 +373,26 @@ impl Worker {
                 Err(error.into())
             }
         }
+    }
+}
+
+async fn wait_for_ready(stream: &mut UnixStream, ready_timeout: Duration) -> Result<(), String> {
+    let result = timeout(ready_timeout, async {
+        let mut byte = [0; 1];
+        stream.read_exact(&mut byte).await?;
+        Ok::<_, io::Error>(byte[0])
+    })
+    .await;
+    match result {
+        Ok(Ok(1)) => Ok(()),
+        Ok(Ok(_)) => Err("sent an invalid ready signal".to_owned()),
+        Ok(Err(error)) if error.kind() == io::ErrorKind::UnexpectedEof => {
+            Err("exited before becoming ready".to_owned())
+        }
+        Ok(Err(error)) => Err(format!(
+            "failed while waiting for the ready signal: {error}"
+        )),
+        Err(_) => Err("did not become ready before the timeout".to_owned()),
     }
 }
 
@@ -507,6 +532,16 @@ pub(super) fn build_worker_args(worker: WorkerArgs<'_>) -> Vec<OsString> {
         "--error-log-format".into(),
         error_log_format.into(),
     ];
+    let keepalive = crate::fastcgi::keepalive_limit();
+    if keepalive != crate::config::DEFAULT_FASTCGI_KEEPALIVE {
+        args.push("--fastcgi-keepalive".into());
+        args.push(keepalive.to_string().into());
+    }
+    let cache_ttl = crate::handler::static_cache_ttl().as_millis();
+    if cache_ttl != u128::from(crate::config::DEFAULT_STATIC_CACHE_TTL_MS) {
+        args.push("--static-cache-ttl-ms".into());
+        args.push(cache_ttl.to_string().into());
+    }
     for name in index {
         args.push("--index".into());
         args.push(name.into());
@@ -526,9 +561,19 @@ pub(super) fn build_worker_args(worker: WorkerArgs<'_>) -> Vec<OsString> {
                 args.push("--fastcgi-app-arg".into());
                 args.push(format!("{}={arg}", backend.extension).into());
             }
-            if app.max_workers != 1 {
-                args.push("--fastcgi-app-max-workers".into());
-                args.push(format!("{}={}", backend.extension, app.max_workers).into());
+            if app.mode != FastCgiAppMode::Cgi {
+                args.push("--fastcgi-app-mode".into());
+                args.push(format!("{}=fpm", backend.extension).into());
+            }
+            if !app.php_defaults {
+                args.push("--fastcgi-app-php-defaults".into());
+                args.push(format!("{}=off", backend.extension).into());
+            }
+            args.push("--fastcgi-app-max-workers".into());
+            args.push(format!("{}={}", backend.extension, app.max_workers).into());
+            if app.min_workers != crate::config::DEFAULT_FASTCGI_APP_MIN_WORKERS {
+                args.push("--fastcgi-app-min-workers".into());
+                args.push(format!("{}={}", backend.extension, app.min_workers).into());
             }
             if app.idle_timeout.as_secs() != crate::config::DEFAULT_FASTCGI_APP_IDLE_TIMEOUT_SECS {
                 args.push("--fastcgi-app-idle-timeout".into());
@@ -607,5 +652,201 @@ fn version_name(version: Version) -> &'static str {
         Version::HTTP_2 => "HTTP/2.0",
         Version::HTTP_3 => "HTTP/3.0",
         _ => "HTTP/1.1",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ActivityGuard, WORKER_SHUTDOWN_GRACE, Worker, WorkerChild, WorkerProcess,
+        stop_direct_worker, wait_for_ready,
+    };
+    use bytes::Bytes;
+    use http::{Request, Response};
+    use http_body_util::{BodyExt, Full};
+    use hyper::service::service_fn;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use std::{
+        convert::Infallible,
+        path::PathBuf,
+        process::Command,
+        sync::{Arc, Mutex as StdMutex, atomic::AtomicUsize},
+        time::{Duration, Instant},
+    };
+    use tokio::{net::UnixStream, sync::Mutex};
+
+    #[tokio::test]
+    async fn wait_for_ready_accepts_ready_signal() {
+        let (mut reader, writer) = UnixStream::pair().unwrap();
+        writer.try_write(&[1]).unwrap();
+
+        assert_eq!(
+            wait_for_ready(&mut reader, Duration::from_secs(1)).await,
+            Ok(())
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_ready_rejects_invalid_ready_signal() {
+        let (mut reader, writer) = UnixStream::pair().unwrap();
+        writer.try_write(&[0]).unwrap();
+
+        assert_eq!(
+            wait_for_ready(&mut reader, Duration::from_secs(1)).await,
+            Err("sent an invalid ready signal".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_ready_reports_eof_before_ready() {
+        let (mut reader, writer) = UnixStream::pair().unwrap();
+        drop(writer);
+
+        assert_eq!(
+            wait_for_ready(&mut reader, Duration::from_secs(1)).await,
+            Err("exited before becoming ready".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_ready_reports_timeout() {
+        let (mut reader, _writer) = UnixStream::pair().unwrap();
+
+        assert_eq!(
+            wait_for_ready(&mut reader, Duration::from_millis(10)).await,
+            Err("did not become ready before the timeout".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn reap_idle_keeps_worker_with_active_request() {
+        let worker = test_worker(
+            Duration::from_millis(10),
+            Instant::now() - Duration::from_secs(1),
+        )
+        .await;
+        worker.active.store(1, std::sync::atomic::Ordering::Release);
+
+        worker.reap_idle(Duration::from_millis(10)).await;
+
+        assert!(worker.process_is_running().await);
+    }
+
+    #[tokio::test]
+    async fn reap_idle_keeps_recently_used_worker() {
+        let worker = test_worker(Duration::from_secs(10), Instant::now()).await;
+
+        worker.reap_idle(Duration::from_secs(10)).await;
+
+        assert!(worker.process_is_running().await);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn reap_idle_stops_expired_worker_and_reaps_its_child() {
+        let timeout = Duration::from_millis(10);
+        let worker = test_worker(timeout, Instant::now() - Duration::from_secs(1)).await;
+        let pid = {
+            let process = worker.process.lock().await;
+            let Some(WorkerProcess {
+                child: WorkerChild::Direct(child),
+                ..
+            }) = process.as_ref()
+            else {
+                panic!("expected direct worker process")
+            };
+            child.id()
+        };
+
+        worker.reap_idle(timeout).await;
+
+        assert!(!worker.process_is_running().await);
+        assert!(!PathBuf::from(format!("/proc/{pid}")).exists());
+    }
+
+    #[tokio::test]
+    async fn activity_guard_in_streaming_body_prevents_idle_reaping() {
+        let timeout = Duration::from_millis(10);
+        let worker = test_worker(timeout, Instant::now() - Duration::from_secs(1)).await;
+        let activity = ActivityGuard::new(&worker);
+        let mut body = Full::new(Bytes::from_static(b"streaming"))
+            .map_frame(move |frame| {
+                let _activity = &activity;
+                frame
+            })
+            .boxed_unsync();
+
+        worker.reap_idle(timeout).await;
+
+        assert!(worker.process_is_running().await);
+        assert_eq!(worker.active.load(std::sync::atomic::Ordering::Acquire), 1);
+        let _ = body.frame().await;
+        drop(body);
+        assert_eq!(worker.active.load(std::sync::atomic::Ordering::Acquire), 0);
+    }
+
+    async fn test_worker(timeout: Duration, last_used: Instant) -> Worker {
+        let (client, peer) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            let service = service_fn(|_request: Request<hyper::body::Incoming>| async {
+                Ok::<_, Infallible>(Response::new(Full::new(Bytes::new())))
+            });
+            let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                .adaptive_window(true)
+                .serve_connection(TokioIo::new(peer), service)
+                .await;
+        });
+        let (sender, connection) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+            .adaptive_window(true)
+            .handshake(TokioIo::new(client))
+            .await
+            .unwrap();
+        tokio::spawn(connection);
+        let child = Command::new("sleep").arg("60").spawn().unwrap();
+
+        Worker {
+            uid: 0,
+            gid: 0,
+            root: PathBuf::from("/tmp/test-worker"),
+            cgroup: None,
+            idle_timeout: Some(timeout),
+            active: Arc::new(AtomicUsize::new(0)),
+            last_used: Arc::new(StdMutex::new(last_used)),
+            index: vec!["index.html".to_owned()],
+            listing: true,
+            try_files: Vec::new(),
+            fastcgi: Vec::new(),
+            fastcgi_timeout: Duration::from_secs(60),
+            threads: 1,
+            error_log_file: None,
+            error_log_format: String::new(),
+            process: Mutex::new(Some(WorkerProcess {
+                sender,
+                child: WorkerChild::Direct(child),
+            })),
+        }
+    }
+
+    #[test]
+    fn stop_direct_worker_kills_and_reaps_a_child_that_ignores_sigterm() {
+        let mut child = Command::new("sh")
+            .args(["-c", "trap '' TERM; while :; do :; done"])
+            .spawn()
+            .unwrap();
+        let started = Instant::now();
+
+        stop_direct_worker(&mut child, false).unwrap();
+
+        assert!(started.elapsed() < WORKER_SHUTDOWN_GRACE * 4);
+        assert!(child.try_wait().unwrap().is_some());
+    }
+
+    #[test]
+    fn stop_direct_worker_accepts_an_already_exited_child() {
+        let mut child = Command::new("true").spawn().unwrap();
+        assert!(child.wait().unwrap().success());
+
+        stop_direct_worker(&mut child, false).unwrap();
+        assert!(child.try_wait().unwrap().is_some());
     }
 }

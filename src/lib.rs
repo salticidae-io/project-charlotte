@@ -5,6 +5,8 @@
 #[cfg(feature = "acme")]
 mod acme;
 mod bot;
+#[cfg_attr(not(feature = "hosting"), allow(dead_code))]
+mod cgroup;
 mod config;
 mod control;
 #[cfg(feature = "hosting")]
@@ -29,11 +31,74 @@ mod proxy;
 mod ratelimit;
 mod reload;
 mod response;
+#[cfg(feature = "swarm")]
+mod swarm;
 mod tls;
 mod vhost;
 mod waf;
 #[cfg(feature = "hosting")]
 mod worker;
+
+/// Internal entry points used by the interactive vhost configuration tool.
+#[doc(hidden)]
+pub mod configure_support {
+    pub use crate::config::{OptionInfo, OptionKind};
+    /// Whether this build can host document-root virtual hosts.
+    pub const HOSTING_ENABLED: bool = cfg!(feature = "hosting");
+    /// Whether this build can proxy virtual hosts to HTTP upstreams.
+    pub const PROXY_ENABLED: bool = cfg!(feature = "proxy");
+    /// Whether this build supports ACME certificate provisioning.
+    pub const ACME_ENABLED: bool = cfg!(feature = "acme");
+    /// Whether this build supports Redis-backed swarm access checks.
+    pub const SWARM_ENABLED: bool = cfg!(feature = "swarm");
+
+    /// Returns visible global options that can be configured by the wizard.
+    pub fn server_options() -> Vec<OptionInfo> {
+        crate::config::Config::configurable_options()
+    }
+
+    /// Returns the YAML keys accepted by a virtual-host declaration.
+    pub fn vhost_keys() -> &'static [&'static str] {
+        crate::vhost::configure_vhost_keys()
+    }
+
+    /// Returns the YAML keys accepted by a managed FastCGI application.
+    pub fn fastcgi_app_keys() -> &'static [&'static str] {
+        crate::vhost::configure_fastcgi_app_keys()
+    }
+
+    /// Returns the YAML keys accepted by a bot policy.
+    pub fn bot_policy_keys() -> &'static [&'static str] {
+        crate::vhost::configure_bot_policy_keys()
+    }
+
+    /// Validates a single-vhost YAML document using Charlotte's startup validator.
+    ///
+    /// `config_dir` is the directory against which relative paths in the vhost
+    /// are resolved. Set `has_waf` when the server will load ModSecurity rules
+    /// globally; vhost ModSecurity overrides require that global configuration.
+    ///
+    /// # Errors
+    /// Returns one or more diagnostics if the YAML is malformed, contains
+    /// forbidden global settings, declares anything other than one vhost, or
+    /// fails the same semantic checks used by server startup.
+    pub fn validate_vhost_yaml(
+        yaml: &str,
+        config_dir: &std::path::Path,
+        has_waf: bool,
+    ) -> Result<(), Vec<String>> {
+        crate::vhost::validate_vhost_document(yaml, config_dir, has_waf)
+    }
+
+    /// Validates a generated main config containing global `options` and an
+    /// optional single `vhost` entry.
+    pub fn validate_main_config_yaml(
+        yaml: &str,
+        config_dir: &std::path::Path,
+    ) -> Result<(), Vec<String>> {
+        crate::vhost::validate_main_document(yaml, config_dir)
+    }
+}
 
 #[cfg(all(test, feature = "hosting"))]
 mod fuzz_support;
@@ -122,11 +187,6 @@ pub mod bench {
     }
 }
 
-/// Connections served at once across the TCP listeners. Further connections
-/// wait in the listen backlog rather than consume descriptors and memory.
-const MAX_CONNECTIONS: usize = 4096;
-/// How long a client may take to send a complete request head.
-const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// How often an idle HTTP/2 connection is probed, and how long it has to
 /// answer before it is closed.
 const HTTP2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
@@ -199,6 +259,11 @@ pub fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     }
     #[cfg(feature = "hosting")]
     let mut config = config;
+    #[cfg(feature = "hosting")]
+    {
+        fastcgi::set_keepalive_limit(config.fastcgi_keepalive);
+        handler::set_static_cache_ttl(config.static_cache_ttl);
+    }
     #[cfg(not(feature = "hosting"))]
     let config = config;
 
@@ -276,6 +341,13 @@ pub fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         }
         crate::log_debug!("Starting master process");
         logopener::start(&config)?;
+        // Read the main configuration while still privileged; the --user
+        // account may not be able to traverse its directory.
+        let main_config = config
+            .config_file
+            .as_deref()
+            .map(vhost::read_trusted_config)
+            .transpose()?;
         privileges::drop_master(&config)?;
         let mut builder = tokio::runtime::Builder::new_multi_thread();
         if let Some(threads) = config.threads {
@@ -288,17 +360,21 @@ pub fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
                 .map_or_else(|| "Tokio default".to_owned(), |threads| threads.to_string())
         );
         let runtime = builder.enable_all().build()?;
-        runtime.block_on(run_master(config))
+        runtime.block_on(run_master(config, main_config))
     })();
     if report_startup_errors {
         if let Err(error) = &startup_result {
             crate::log_error!("Startup failed: {error}");
         }
     }
+    logging::flush_logs();
     startup_result
 }
 
-async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> {
+async fn run_master(
+    config: Config,
+    main_config: Option<String>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     #[cfg(feature = "hosting")]
     let root = tokio::fs::canonicalize(&config.root)
         .await
@@ -354,6 +430,7 @@ async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> 
     let router = Router::load(
         Arc::new(config.clone()),
         config.config_file.as_ref(),
+        main_config,
         rate_limit,
         waf,
     )
@@ -407,6 +484,9 @@ async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> 
         }
         _ => None,
     };
+    if let Some(listener) = &tls_listener {
+        router.set_https_port(listener.local_addr()?.port());
+    }
     #[cfg(feature = "http3")]
     let http3_endpoint = if let Some(tls) = &tls_setup {
         crate::log_debug!("Binding HTTP/3 endpoint to {}", config.http3_bind);
@@ -517,7 +597,7 @@ async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> 
         None
     };
     let mut connections = JoinSet::new();
-    let limiter = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    let limiter = Arc::new(Semaphore::new(config.max_connections));
     let signal_tx = shutdown_tx.clone();
     tokio::spawn(async move {
         tokio::select! {
@@ -557,6 +637,7 @@ async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> 
                         router,
                         connection_shutdown,
                         alt_svc_port,
+                        config.header_read_timeout,
                         None,
                         None,
                     ).await {
@@ -578,7 +659,7 @@ async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> 
                     let _permit = permit;
                     let recording = RecordingStream::new(stream);
                     let captured = recording.captured();
-                    match timeout(Duration::from_secs(10), acceptor.accept(recording)).await {
+                    match timeout(config.tls_handshake_timeout, acceptor.accept(recording)).await {
                         Ok(Ok(stream)) => {
                             let sni = stream.get_ref().1.server_name().map(Arc::<str>::from);
                             let fingerprint = parse_client_hello(
@@ -594,6 +675,7 @@ async fn run_master(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> 
                                 router,
                                 connection_shutdown,
                                 alt_svc_port,
+                                config.header_read_timeout,
                                 Some(sni),
                                 fingerprint,
                             )
@@ -646,6 +728,7 @@ async fn serve_connection<I>(
     router: Arc<Router>,
     mut shutdown: watch::Receiver<bool>,
     alt_svc_port: Option<u16>,
+    header_read_timeout: Duration,
     sni: Option<Option<Arc<str>>>,
     fingerprint: Option<Arc<ClientHelloInfo>>,
 ) -> Result<(), Box<dyn Error + Send + Sync>>
@@ -653,11 +736,13 @@ where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let io = TokioIo::new(stream);
+    let alt_svc = alt_svc_port.and_then(|port| format!("h3=\":{port}\"").parse().ok());
     let (request_seen, mut first_request) = watch::channel(false);
     let service = service_fn(move |mut request: Request<hyper::body::Incoming>| {
         let router = Arc::clone(&router);
         let sni = sni.clone();
         let fingerprint = fingerprint.clone();
+        let alt_svc = alt_svc.clone();
         request_seen.send_replace(true);
         async move {
             if let Some(sni) = sni {
@@ -667,9 +752,7 @@ where
                 request.extensions_mut().insert(TlsFingerprint(fingerprint));
             }
             let mut response = router.dispatch(request, peer, local).await;
-            if let Some(port) = alt_svc_port
-                && let Ok(value) = format!("h3=\":{port}\"").parse()
-            {
+            if let Some(value) = alt_svc {
                 response.headers_mut().insert(http::header::ALT_SVC, value);
             }
             Ok::<_, std::convert::Infallible>(response)
@@ -681,10 +764,12 @@ where
     builder
         .http1()
         .timer(TokioTimer::new())
-        .header_read_timeout(HEADER_READ_TIMEOUT);
+        .header_read_timeout(header_read_timeout);
     builder
         .http2()
         .timer(TokioTimer::new())
+        .adaptive_window(true)
+        .max_concurrent_streams(256)
         .keep_alive_interval(HTTP2_KEEP_ALIVE_INTERVAL)
         .keep_alive_timeout(HTTP2_KEEP_ALIVE_TIMEOUT);
     let mut connection = Box::pin(builder.serve_connection(io, service));
@@ -699,7 +784,7 @@ where
     // protocol detection before it has no timeout at all. This deadline covers
     // a client that connects and then sends nothing, or too little to tell.
     let no_request = async {
-        timeout(HEADER_READ_TIMEOUT, first_request.wait_for(|seen| *seen))
+        timeout(header_read_timeout, first_request.wait_for(|seen| *seen))
             .await
             .is_err()
     };

@@ -10,38 +10,310 @@ use std::{
     sync::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc::{self, Receiver, SyncSender, TryRecvError},
     },
-    time::{Instant, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use http::{HeaderMap, Method, Version};
 use http_body::{Body, Frame};
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Stage {
+    Bot,
+    Waf,
+    WafResponse,
+    Spawn,
+    Backend,
+}
+
+impl Stage {
+    const ALL: [Self; 5] = [
+        Self::Bot,
+        Self::Waf,
+        Self::WafResponse,
+        Self::Spawn,
+        Self::Backend,
+    ];
+
+    fn index(self) -> usize {
+        match self {
+            Self::Bot => 0,
+            Self::Waf => 1,
+            Self::WafResponse => 2,
+            Self::Spawn => 3,
+            Self::Backend => 4,
+        }
+    }
+
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Bot => "bot",
+            Self::Waf => "waf",
+            Self::WafResponse => "waf_response",
+            Self::Spawn => "spawn",
+            Self::Backend => "backend",
+        }
+    }
+}
+
+pub(crate) struct RequestTiming {
+    started: Instant,
+    stages: [AtomicU64; 5],
+    headers: AtomicU64,
+    first_byte: AtomicU64,
+}
+
+impl RequestTiming {
+    pub(crate) fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            stages: std::array::from_fn(|_| AtomicU64::new(0)),
+            headers: AtomicU64::new(0),
+            first_byte: AtomicU64::new(0),
+        }
+    }
+
+    fn elapsed_us(&self) -> u64 {
+        duration_us(self.started.elapsed())
+    }
+
+    pub(crate) fn mark_headers(&self) {
+        record_elapsed(&self.headers, self.elapsed_us());
+    }
+
+    fn mark_first_byte(&self) {
+        record_elapsed(&self.first_byte, self.elapsed_us());
+    }
+
+    fn stage_us(&self, stage: Stage) -> Option<u64> {
+        decode_duration(self.stages[stage.index()].load(Ordering::Relaxed))
+    }
+
+    fn metric_us(&self, name: &str) -> Option<u64> {
+        match name {
+            "total" => Some(self.elapsed_us()),
+            "headers" => decode_duration(self.headers.load(Ordering::Relaxed)),
+            "ttfb" => decode_duration(self.first_byte.load(Ordering::Relaxed)),
+            "bot" => self.stage_us(Stage::Bot),
+            "waf" => self.stage_us(Stage::Waf),
+            "waf_response" => self.stage_us(Stage::WafResponse),
+            "spawn" => self.stage_us(Stage::Spawn),
+            "backend" => self.stage_us(Stage::Backend),
+            _ => None,
+        }
+    }
+}
+
+fn duration_us(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX - 1)
+}
+
+fn record_elapsed(target: &AtomicU64, elapsed_us: u64) {
+    let encoded = elapsed_us.saturating_add(1);
+    let _ = target.compare_exchange(0, encoded, Ordering::Relaxed, Ordering::Relaxed);
+}
+
+fn decode_duration(value: u64) -> Option<u64> {
+    value.checked_sub(1)
+}
+
+fn format_timing_duration(micros: u64, unit: &str) -> String {
+    match unit {
+        "ms" => format!("{:.3}", micros as f64 / 1_000.0),
+        "s" => format!("{:.6}", micros as f64 / 1_000_000.0),
+        _ => micros.to_string(),
+    }
+}
+
+fn add_duration(target: &AtomicU64, duration: Duration) {
+    let duration_us = duration_us(duration);
+    let _ = target.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(if current == 0 {
+            duration_us.saturating_add(1)
+        } else {
+            current.saturating_add(duration_us)
+        })
+    });
+}
+
+pub(crate) fn record_stage(stage: Stage, duration: Duration) {
+    let _ = REQUEST_CONTEXT.try_with(|context| {
+        if let Some(timing) = &context.timing {
+            add_duration(&timing.stages[stage.index()], duration);
+        }
+    });
+}
+
+pub(crate) struct StageTimer {
+    stage: Stage,
+    started: Instant,
+    finished: bool,
+}
+
+impl StageTimer {
+    pub(crate) fn new(stage: Stage) -> Self {
+        Self {
+            stage,
+            started: Instant::now(),
+            finished: false,
+        }
+    }
+
+    pub(crate) fn finish(mut self) {
+        self.record();
+    }
+
+    fn record(&mut self) {
+        if !self.finished {
+            record_stage(self.stage, self.started.elapsed());
+            self.finished = true;
+        }
+    }
+}
+
+impl Drop for StageTimer {
+    fn drop(&mut self) {
+        self.record();
+    }
+}
+
+pub(crate) fn server_timing_value(timing: &RequestTiming) -> String {
+    let mut metrics = Vec::with_capacity(7);
+    for stage in Stage::ALL {
+        if let Some(micros) = timing.stage_us(stage) {
+            metrics.push(format!(
+                "{};dur={:.3}",
+                stage.name(),
+                micros as f64 / 1000.0
+            ));
+        }
+    }
+    if let Some(micros) = decode_duration(timing.headers.load(Ordering::Relaxed)) {
+        metrics.push(format!("headers;dur={:.3}", micros as f64 / 1000.0));
+    }
+    // The status line and headers are the first bytes written to the client, so
+    // the header is sent at the server-side time to first byte. A body byte that
+    // was already produced (it cannot be at this point today) is preferred.
+    let ttfb = decode_duration(timing.first_byte.load(Ordering::Relaxed))
+        .or_else(|| decode_duration(timing.headers.load(Ordering::Relaxed)))
+        .unwrap_or_else(|| timing.elapsed_us());
+    metrics.push(format!(
+        "ttfb;desc=\"Time to first byte\";dur={:.3}",
+        ttfb as f64 / 1000.0
+    ));
+    metrics.push(format!(
+        "total;dur={:.3}",
+        timing.elapsed_us() as f64 / 1000.0
+    ));
+    metrics.join(", ")
+}
+
+enum LogMessage {
+    Line(String),
+    Flush(mpsc::Sender<()>),
+}
+
 #[derive(Clone)]
-pub(crate) struct LogTarget(Arc<Mutex<Box<dyn Write + Send>>>);
+pub(crate) struct LogTarget(Arc<LogTargetKind>);
+
+enum LogTargetKind {
+    Synchronous(Mutex<Box<dyn Write + Send>>),
+    Asynchronous(SyncSender<LogMessage>),
+}
+
+static FILE_LOGS: OnceLock<Mutex<Vec<SyncSender<LogMessage>>>> = OnceLock::new();
+
+const LOG_QUEUE_CAPACITY: usize = 8192;
 
 impl LogTarget {
     pub(crate) fn file(path: &Path) -> io::Result<Self> {
         let file = open_log_file(path)?;
-        Ok(Self(Arc::new(Mutex::new(Box::new(file)))))
+        let (sender, receiver) = mpsc::sync_channel(LOG_QUEUE_CAPACITY);
+        std::thread::Builder::new()
+            .name("charlotte-log-writer".to_owned())
+            .spawn(move || file_log_writer(file, receiver))?;
+        FILE_LOGS
+            .get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(sender.clone());
+        Ok(Self(Arc::new(LogTargetKind::Asynchronous(sender))))
     }
 
     pub(crate) fn stdout() -> Self {
-        Self(Arc::new(Mutex::new(Box::new(io::stdout()))))
+        Self(Arc::new(LogTargetKind::Synchronous(Mutex::new(Box::new(
+            io::stdout(),
+        )))))
     }
 
     pub(crate) fn stderr() -> Self {
-        Self(Arc::new(Mutex::new(Box::new(io::stderr()))))
+        Self(Arc::new(LogTargetKind::Synchronous(Mutex::new(Box::new(
+            io::stderr(),
+        )))))
     }
 
     fn write_line(&self, line: &str) {
-        let mut writer = self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _ = writer.write_all(line.as_bytes());
-        let _ = writer.write_all(b"\n");
-        let _ = writer.flush();
+        match self.0.as_ref() {
+            LogTargetKind::Synchronous(writer) => {
+                let mut writer = writer
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let _ = writer.write_all(line.as_bytes());
+                let _ = writer.write_all(b"\n");
+                let _ = writer.flush();
+            }
+            LogTargetKind::Asynchronous(sender) => {
+                let _ = sender.send(LogMessage::Line(line.to_owned()));
+            }
+        }
+    }
+}
+
+fn file_log_writer(mut file: std::fs::File, receiver: Receiver<LogMessage>) {
+    while let Ok(message) = receiver.recv() {
+        match message {
+            LogMessage::Line(line) => {
+                let mut failed =
+                    file.write_all(line.as_bytes()).is_err() || file.write_all(b"\n").is_err();
+                while !failed {
+                    match receiver.try_recv() {
+                        Ok(LogMessage::Line(line)) => {
+                            failed = file.write_all(line.as_bytes()).is_err()
+                                || file.write_all(b"\n").is_err();
+                        }
+                        Ok(LogMessage::Flush(acknowledge)) => {
+                            let _ = file.flush();
+                            let _ = acknowledge.send(());
+                        }
+                        Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+                    }
+                }
+                let _ = file.flush();
+            }
+            LogMessage::Flush(acknowledge) => {
+                let _ = file.flush();
+                let _ = acknowledge.send(());
+            }
+        }
+    }
+    let _ = file.flush();
+}
+
+/// Flushes all file-backed log targets, waiting briefly for each writer thread.
+pub fn flush_logs() {
+    let Some(logs) = FILE_LOGS.get() else {
+        return;
+    };
+    let logs = logs
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    for sender in logs {
+        let (acknowledge, receiver) = mpsc::channel();
+        if sender.send(LogMessage::Flush(acknowledge)).is_ok() {
+            let _ = receiver.recv_timeout(Duration::from_secs(2));
+        }
     }
 }
 
@@ -122,6 +394,11 @@ impl AccessFormat {
                     argument.unwrap()
                 ));
             }
+            if code == 'T'
+                && let Some(argument) = argument.as_deref()
+            {
+                validate_timing_argument(argument)?;
+            }
             parts.push(AccessPart::Directive {
                 code,
                 argument,
@@ -139,7 +416,7 @@ impl AccessFormat {
         &self,
         request: &AccessRequest,
         response: &AccessResponse,
-        elapsed: Instant,
+        timing: &RequestTiming,
         bytes: u64,
         finished: SystemTime,
     ) -> String {
@@ -166,7 +443,7 @@ impl AccessFormat {
                         *modifier,
                         request,
                         response,
-                        elapsed,
+                        timing,
                         bytes,
                         finished,
                     );
@@ -176,6 +453,27 @@ impl AccessFormat {
         }
         output
     }
+}
+
+fn validate_timing_argument(argument: &str) -> Result<(), String> {
+    if matches!(argument, "us" | "ms" | "s") {
+        return Ok(());
+    }
+    let mut parts = argument.split(':');
+    let name = parts.next().unwrap_or_default();
+    let unit = parts.next().unwrap_or("us");
+    if parts.next().is_some()
+        || !matches!(
+            name,
+            "total" | "headers" | "ttfb" | "bot" | "waf" | "waf_response" | "spawn" | "backend"
+        )
+    {
+        return Err(format!("unknown access log timing metric: {argument}"));
+    }
+    if !matches!(unit, "us" | "ms" | "s") {
+        return Err(format!("unknown access log timing unit: {unit}"));
+    }
+    Ok(())
 }
 
 fn parse_status_condition(
@@ -244,13 +542,13 @@ impl AccessLog {
         &self,
         request: AccessRequest,
         response: AccessResponse,
-        started: Instant,
+        timing: &RequestTiming,
         bytes: u64,
     ) {
         self.target.write_line(&self.format.render(
             &request,
             &response,
-            started,
+            timing,
             bytes,
             SystemTime::now(),
         ));
@@ -289,7 +587,7 @@ fn access_value(
     modifier: Option<char>,
     request: &AccessRequest,
     response: &AccessResponse,
-    elapsed: Instant,
+    timing: &RequestTiming,
     bytes: u64,
     finished: SystemTime,
 ) -> String {
@@ -311,7 +609,7 @@ fn access_value(
             }
         }
         'B' => bytes.to_string(),
-        'D' => elapsed.elapsed().as_micros().to_string(),
+        'D' => timing.elapsed_us().to_string(),
         'h' => request.client.ip().to_string(),
         'H' => version_name(request.version).to_owned(),
         'I' => request_bytes(request).to_string(),
@@ -350,11 +648,20 @@ fn access_value(
             .saturating_add(response_bytes(response, bytes))
             .to_string(),
         't' => access_time(argument, request.started, finished),
-        'T' => match argument.unwrap_or("s") {
-            "ms" => elapsed.elapsed().as_millis().to_string(),
-            "us" => elapsed.elapsed().as_micros().to_string(),
-            _ => elapsed.elapsed().as_secs().to_string(),
-        },
+        'T' => {
+            let (metric, unit) = match argument {
+                Some("ms") => ("total", "ms"),
+                Some("us") => ("total", "us"),
+                Some("s") | None => ("total", "s"),
+                Some(argument) => argument
+                    .split_once(':')
+                    .map_or((argument, "us"), |(metric, unit)| (metric, unit)),
+            };
+            timing.metric_us(metric).map_or_else(
+                || "-".to_owned(),
+                |micros| format_timing_duration(micros, unit),
+            )
+        }
         'u' => "-".to_owned(),
         'U' => request
             .path
@@ -674,6 +981,7 @@ pub(crate) struct RequestContext {
     pub local: Option<SocketAddr>,
     pub server_name: String,
     pub error_log: Option<Arc<ErrorLog>>,
+    pub timing: Option<Arc<RequestTiming>>,
 }
 
 tokio::task_local! { static REQUEST_CONTEXT: RequestContext; }
@@ -740,10 +1048,12 @@ macro_rules! log_debug { ($($arg:tt)*) => { if $crate::logging::debug_enabled() 
 
 pub(crate) struct LoggedBody<B> {
     inner: std::pin::Pin<Box<B>>,
-    log: Arc<AccessLog>,
+    log: Option<Arc<AccessLog>>,
     request: Option<AccessRequest>,
-    response: AccessResponse,
-    started: Instant,
+    response: Option<AccessResponse>,
+    timing: Arc<RequestTiming>,
+    debug: bool,
+    context: RequestContext,
     bytes: u64,
 }
 
@@ -796,16 +1106,21 @@ where
 impl<B> LoggedBody<B> {
     pub(crate) fn new(
         inner: B,
-        log: Arc<AccessLog>,
-        request: AccessRequest,
-        response: AccessResponse,
+        log: Option<Arc<AccessLog>>,
+        request: Option<AccessRequest>,
+        response: Option<AccessResponse>,
+        timing: Arc<RequestTiming>,
+        debug: bool,
+        context: RequestContext,
     ) -> Self {
         Self {
             inner: Box::pin(inner),
             log,
-            request: Some(request),
+            request,
             response,
-            started: Instant::now(),
+            timing,
+            debug,
+            context,
             bytes: 0,
         }
     }
@@ -822,10 +1137,17 @@ where
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let result = self.inner.as_mut().poll_frame(cx);
-        if let std::task::Poll::Ready(Some(Ok(frame))) = &result {
-            if let Some(data) = frame.data_ref() {
-                self.bytes = self.bytes.saturating_add(data.len() as u64);
+        match &result {
+            std::task::Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    if !data.is_empty() {
+                        self.timing.mark_first_byte();
+                    }
+                    self.bytes = self.bytes.saturating_add(data.len() as u64);
+                }
             }
+            std::task::Poll::Ready(None) => self.timing.mark_first_byte(),
+            _ => {}
         }
         result
     }
@@ -839,10 +1161,50 @@ where
 
 impl<B> Drop for LoggedBody<B> {
     fn drop(&mut self) {
-        if let Some(request) = self.request.take() {
-            self.log
-                .write(request, self.response.clone(), self.started, self.bytes);
+        if let (Some(log), Some(request), Some(response)) =
+            (&self.log, self.request.as_ref(), self.response.as_ref())
+        {
+            log.write(request.clone(), response.clone(), &self.timing, self.bytes);
         }
+        if self.debug {
+            let request = self.request.as_ref();
+            let method = request.map_or("-", |request| request.method.as_str());
+            let path = request.map_or("-", |request| request.path.as_str());
+            let status = self
+                .response
+                .as_ref()
+                .map_or_else(|| "-".to_owned(), |response| response.status.to_string());
+            let line = format!(
+                "request timing: {method} {path} status={status} headers={} ttfb={} total={} bot={} waf={} waf_response={} spawn={} backend={}",
+                timing_field(self.timing.metric_us("headers")),
+                timing_field(self.timing.metric_us("ttfb")),
+                timing_field(self.timing.metric_us("total")),
+                stage_field(&self.timing, Stage::Bot),
+                stage_field(&self.timing, Stage::Waf),
+                stage_field(&self.timing, Stage::WafResponse),
+                stage_field(&self.timing, Stage::Spawn),
+                stage_field(&self.timing, Stage::Backend),
+            );
+            write_context_log("debug", module_path!(), &line, &self.context);
+        }
+    }
+}
+
+fn timing_field(micros: Option<u64>) -> String {
+    micros.map_or_else(|| "-".to_owned(), |micros| format!("{micros}us"))
+}
+
+fn stage_field(timing: &RequestTiming, stage: Stage) -> String {
+    timing_field(timing.stage_us(stage))
+}
+
+fn write_context_log(level: &str, module: &str, message: &str, context: &RequestContext) {
+    if let Some(log) = &context.error_log {
+        log.write(level, module, message, Some(context));
+    } else if let Some(log) = GLOBAL_ERROR_LOG.get() {
+        log.write(level, module, message, Some(context));
+    } else {
+        let _ = writeln!(io::stderr().lock(), "{message}");
     }
 }
 
@@ -869,6 +1231,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn file_log_target_flushes_queued_lines() {
+        let path = std::env::temp_dir().join(format!(
+            "charlotte-log-writer-{}-{}.log",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("system time is after the epoch")
+                .as_nanos()
+        ));
+        let target = LogTarget::file(&path).expect("create file log target");
+
+        target.write_line("queued log line");
+        flush_logs();
+
+        let contents = std::fs::read_to_string(&path).expect("read flushed log file");
+        assert_eq!(contents, "queued log line\n");
+        drop(target);
+        std::fs::remove_file(path).expect("remove test log file");
+    }
+
+    #[test]
     fn parses_common_and_combined_formats() {
         assert!(AccessFormat::parse("common").is_ok());
         assert!(AccessFormat::parse("combined").is_ok());
@@ -886,6 +1269,65 @@ mod tests {
     #[test]
     fn parses_mod_logio_directives() {
         assert!(AccessFormat::parse("%I %O %S").is_ok());
+    }
+
+    #[test]
+    fn parses_named_timing_directives_and_rejects_unknown_metrics() {
+        assert!(AccessFormat::parse("%{total}T %{backend:ms}T %{waf_response:s}T").is_ok());
+        assert!(AccessFormat::parse("%{backend:ns}T").is_err());
+        assert!(AccessFormat::parse("%{unknown}T").is_err());
+    }
+
+    #[test]
+    fn renders_timing_metrics_and_missing_stages() {
+        let response = AccessResponse {
+            status: 200,
+            version: Version::HTTP_11,
+            headers: HeaderMap::new(),
+        };
+        let timing = RequestTiming::new();
+        timing.stages[Stage::Backend.index()].store(123_457, Ordering::Relaxed);
+        timing.headers.store(8_001, Ordering::Relaxed);
+        timing.first_byte.store(234_568, Ordering::Relaxed);
+        let line =
+            AccessFormat::parse("%{backend}T %{waf}T %{backend:ms}T %{ttfb:s}T %{headers:us}T")
+                .unwrap()
+                .render(
+                    &sample_request(),
+                    &response,
+                    &timing,
+                    0,
+                    SystemTime::UNIX_EPOCH,
+                );
+
+        assert_eq!(line, "123456 - 123.456 0.234567 8000");
+    }
+
+    #[test]
+    fn server_timing_header_uses_millisecond_durations() {
+        let timing = RequestTiming::new();
+        timing.stages[Stage::Backend.index()].store(123_457, Ordering::Relaxed);
+        timing.headers.store(8_001, Ordering::Relaxed);
+
+        let value = server_timing_value(&timing);
+        assert!(
+            value.starts_with(
+                "backend;dur=123.456, headers;dur=8.000, ttfb;desc=\"Time to first byte\";dur=8.000, total;dur="
+            ),
+            "{value}"
+        );
+    }
+
+    #[test]
+    fn server_timing_header_reports_ttfb_without_header_mark() {
+        let timing = RequestTiming::new();
+
+        let value = server_timing_value(&timing);
+        assert!(
+            value.starts_with("ttfb;desc=\"Time to first byte\";dur="),
+            "{value}"
+        );
+        assert!(value.contains(", total;dur="), "{value}");
     }
 
     #[test]
@@ -945,10 +1387,11 @@ mod tests {
             version: Version::HTTP_11,
             headers: HeaderMap::new(),
         };
+        let timing = RequestTiming::new();
         AccessFormat::parse(format).unwrap().render(
             &sample_request(),
             &response,
-            Instant::now(),
+            &timing,
             bytes,
             SystemTime::UNIX_EPOCH,
         )
@@ -975,15 +1418,10 @@ mod tests {
             headers,
         };
         let format = AccessFormat::parse("%I %O %S").unwrap();
+        let timing = RequestTiming::new();
 
         assert_eq!(
-            format.render(
-                &request,
-                &response,
-                Instant::now(),
-                5,
-                SystemTime::UNIX_EPOCH,
-            ),
+            format.render(&request, &response, &timing, 5, SystemTime::UNIX_EPOCH,),
             "52 39 91"
         );
     }

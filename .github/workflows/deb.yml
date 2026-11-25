@@ -30,7 +30,7 @@ jobs:
         variant:
           - package: project-charlotte
             args: ""
-            features: acme, hosting, http3, proxy
+            features: acme, hosting, http3, proxy, swarm
           - package: project-charlotte-proxy
             args: --variant proxy
             features: acme, http3, proxy

@@ -210,7 +210,7 @@ pub(crate) fn load_certified_key(
             files.cert.display()
         )
     })?;
-    let certs = cert_sections
+    let mut certs = cert_sections
         .into_iter()
         .filter_map(|(kind, der)| {
             (kind == pem::SectionKind::Certificate).then(|| CertificateDer::from(der))
@@ -222,6 +222,32 @@ pub(crate) fn load_certified_key(
             files.cert.display()
         )
         .into());
+    }
+    if let Some(chain_path) = &files.chain {
+        let chain_sections = read_pem_sections(chain_path).map_err(|error| {
+            format!("could not read TLS chain {}: {error}", chain_path.display())
+        })?;
+        let chain_certs = chain_sections
+            .into_iter()
+            .filter_map(|(kind, der)| {
+                (kind == pem::SectionKind::Certificate).then(|| CertificateDer::from(der))
+            })
+            .collect::<Vec<_>>();
+        if chain_certs.is_empty() {
+            return Err(format!(
+                "TLS chain file contains no certificates: {}",
+                chain_path.display()
+            )
+            .into());
+        }
+        for certificate in chain_certs {
+            if !certs
+                .iter()
+                .any(|existing| existing.as_ref() == certificate.as_ref())
+            {
+                certs.push(certificate);
+            }
+        }
     }
 
     let key_sections = read_pem_sections(&files.key).map_err(|error| {
@@ -260,6 +286,8 @@ fn server_config(
         .with_protocol_versions(versions)?
         .with_no_client_auth()
         .with_cert_resolver(resolver);
+    config.session_storage = rustls::server::ServerSessionMemoryCache::new(16_384);
+    config.ticketer = rustls::crypto::ring::Ticketer::new()?;
     config.alpn_protocols = alpn_protocols.to_vec();
     Ok(Arc::new(config))
 }
@@ -295,6 +323,7 @@ mod tests {
         let files = TlsFiles {
             cert: directory.join("cert.pem"),
             key: directory.join("key.pem"),
+            chain: None,
         };
         std::fs::write(&files.cert, generated.cert.pem()).unwrap();
         std::fs::write(&files.key, generated.signing_key.serialize_pem()).unwrap();
@@ -327,6 +356,48 @@ mod tests {
             format!(
                 "TLS private-key file contains no private key: {}",
                 files.key.display()
+            )
+        );
+    }
+
+    #[test]
+    fn appends_certificates_from_a_separate_chain_file() {
+        let (_directory, mut files, _) = certificate_files("leaf-chain.test");
+        let chain_certificate =
+            rcgen::generate_simple_self_signed(vec!["intermediate-chain.test".to_owned()]).unwrap();
+        let chain_path = files.cert.with_file_name("chain.pem");
+        std::fs::write(&chain_path, chain_certificate.cert.pem()).unwrap();
+        files.chain = Some(chain_path);
+
+        let key = load_certified_key(&files).unwrap();
+
+        assert_eq!(key.cert.len(), 2);
+    }
+
+    #[test]
+    fn does_not_append_certificates_already_in_the_leaf_file() {
+        let (_directory, mut files, _) = certificate_files("duplicate-chain.test");
+        files.chain = Some(files.cert.clone());
+
+        let key = load_certified_key(&files).unwrap();
+
+        assert_eq!(key.cert.len(), 1);
+    }
+
+    #[test]
+    fn rejects_a_chain_file_without_certificates() {
+        let (_directory, mut files, _) = certificate_files("empty-chain.test");
+        let chain_path = files.cert.with_file_name("empty-chain.pem");
+        std::fs::write(&chain_path, "not a certificate").unwrap();
+        files.chain = Some(chain_path.clone());
+
+        let error = load_certified_key(&files).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "TLS chain file contains no certificates: {}",
+                chain_path.display()
             )
         );
     }

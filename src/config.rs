@@ -8,6 +8,10 @@
     allow(dead_code)
 )]
 
+#[cfg(feature = "hosting")]
+use crate::cgroup::CgroupSpec;
+#[cfg(feature = "swarm")]
+use crate::swarm::SwarmConfig;
 use crate::{
     bot::{BotPolicy, BotPolicyFile},
     forwarded::TrustedProxy,
@@ -47,15 +51,56 @@ pub struct FastCgiApp {
     pub program: PathBuf,
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
+    pub mode: FastCgiAppMode,
+    pub php_defaults: bool,
+    pub min_workers: usize,
     pub max_workers: usize,
     pub idle_timeout: Duration,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FastCgiAppMode {
+    #[default]
+    Cgi,
+    Fpm,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Input shape of a command-line option exposed to the configure wizard.
+pub enum OptionKind {
+    /// Boolean switch.
+    Flag,
+    /// One scalar value.
+    Value,
+    /// A repeatable scalar value.
+    List,
+}
+
+#[derive(Clone, Debug)]
+/// Metadata for a visible global command-line option.
+pub struct OptionInfo {
+    /// YAML/CLI option name, normalized to underscores.
+    pub name: String,
+    /// Help text shown in the generic wizard menu.
+    pub help: String,
+    /// Whether the option is a switch, scalar, or repeatable list.
+    pub kind: OptionKind,
+    /// The CLI value placeholder, when one is defined.
+    pub value_name: Option<String>,
+    /// The first CLI default value, when one is defined.
+    pub default: Option<String>,
 }
 
 #[derive(Clone, Debug)]
 pub struct Config {
     pub debug: bool,
+    pub server_timing: bool,
     pub plain_http: bool,
+    pub https_redirect: bool,
     pub bind: SocketAddr,
+    pub max_connections: usize,
+    pub header_read_timeout: Duration,
+    pub tls_handshake_timeout: Duration,
     pub tls_bind: Option<SocketAddr>,
     pub http3_bind: SocketAddr,
     pub root: PathBuf,
@@ -67,10 +112,16 @@ pub struct Config {
     pub try_files: Vec<String>,
     pub fastcgi: Vec<FastCgiBackend>,
     pub fastcgi_timeout: Duration,
+    pub fastcgi_keepalive: usize,
+    pub static_cache_ttl: Duration,
     pub threads: Option<usize>,
     pub worker_threads: usize,
     pub worker_idle_timeout: Duration,
+    #[cfg(feature = "hosting")]
+    pub worker_cgroup: Option<CgroupSpec>,
     pub(crate) rate_limit: Option<RateLimit>,
+    #[cfg(feature = "swarm")]
+    pub(crate) swarm: Option<SwarmConfig>,
     pub(crate) trusted_proxies: Vec<TrustedProxy>,
     pub(crate) access_log: bool,
     pub(crate) access_log_file: Option<PathBuf>,
@@ -106,6 +157,7 @@ pub struct AcmeSettings {
 pub struct TlsFiles {
     pub cert: PathBuf,
     pub key: PathBuf,
+    pub chain: Option<PathBuf>,
 }
 
 pub enum ParseResult {
@@ -116,6 +168,7 @@ pub enum ParseResult {
 const HOSTING: bool = cfg!(feature = "hosting");
 const ACME: bool = cfg!(feature = "acme");
 const HTTP3: bool = cfg!(feature = "http3");
+const SWARM: bool = cfg!(feature = "swarm");
 
 /// Command-line options. Every build accepts the same set so that options of
 /// a compiled-out feature can be refused with a clear message; those options
@@ -131,6 +184,9 @@ struct Cli {
     /// Log verbose startup details
     #[arg(long)]
     debug: bool,
+    /// Add per-request stage durations to the Server-Timing response header
+    #[arg(long)]
+    server_timing: bool,
     /// Drop privileges to this user after binding the listeners
     #[arg(long, value_name = "USER", value_parser = parse_cli_name("--user", "user"), allow_hyphen_values = true)]
     user: Option<String>,
@@ -140,9 +196,21 @@ struct Cli {
     /// Plain HTTP listen address
     #[arg(long, value_name = "ADDRESS", default_value = "127.0.0.1:8080", value_parser = parse_cli_address("socket address"), allow_hyphen_values = true)]
     bind: SocketAddr,
+    /// Maximum number of concurrent client connections
+    #[arg(long, value_name = "N", default_value = "4096", value_parser = parse_positive_usize, allow_hyphen_values = true)]
+    max_connections: usize,
+    /// Seconds allowed to receive a complete request head
+    #[arg(long, value_name = "SECS", default_value = "30", value_parser = parse_cli_timeout, allow_hyphen_values = true)]
+    header_read_timeout: Duration,
+    /// Seconds allowed to complete a TLS handshake
+    #[arg(long, value_name = "SECS", default_value = "10", value_parser = parse_cli_timeout, allow_hyphen_values = true)]
+    tls_handshake_timeout: Duration,
     /// Disable the plain HTTP listener
     #[arg(long)]
     no_plain_http: bool,
+    /// Redirect HTTP requests for certified virtual hosts to HTTPS
+    #[arg(long)]
+    https_redirect: bool,
     /// TLS (HTTP/1.1 and HTTP/2) listen address
     #[arg(long, value_name = "ADDRESS", value_parser = parse_cli_address("TLS socket address"), allow_hyphen_values = true)]
     tls_bind: Option<SocketAddr>,
@@ -173,15 +241,30 @@ struct Cli {
     /// Maximum worker processes of a spawned FastCGI application
     #[arg(long, alias = "fastcgi-app-workers", value_name = "EXT=N", hide = !HOSTING, allow_hyphen_values = true)]
     fastcgi_app_max_workers: Vec<String>,
+    /// Minimum number of warm spawned FastCGI application workers
+    #[arg(long, value_name = "EXT=N", hide = !HOSTING, allow_hyphen_values = true)]
+    fastcgi_app_min_workers: Vec<String>,
     /// Seconds an idle FastCGI application worker is kept before it is stopped
     #[arg(long, value_name = "EXT=SECS", hide = !HOSTING, allow_hyphen_values = true)]
     fastcgi_app_idle_timeout: Vec<String>,
     /// Environment variable of a spawned FastCGI application
     #[arg(long, value_name = "EXT=KEY=VALUE", hide = !HOSTING, allow_hyphen_values = true)]
     fastcgi_app_env: Vec<String>,
+    /// Run a spawned PHP app as CGI or a single managed PHP-FPM process
+    #[arg(long, value_name = "EXT=cgi|fpm", hide = !HOSTING, allow_hyphen_values = true)]
+    fastcgi_app_mode: Vec<String>,
+    /// Enable default OPcache and realpath settings for a PHP app
+    #[arg(long, value_name = "EXT=on|off", hide = !HOSTING, allow_hyphen_values = true)]
+    fastcgi_app_php_defaults: Vec<String>,
     /// FastCGI/CGI timeout in seconds
     #[arg(long, value_name = "SECS", default_value = "60", value_parser = parse_cli_fastcgi_timeout, hide = !HOSTING, allow_hyphen_values = true)]
     fastcgi_timeout: Duration,
+    /// Idle keep-alive connections kept per FastCGI TCP/Unix backend (0 disables reuse)
+    #[arg(long, value_name = "N", default_value = "8", value_parser = parse_fastcgi_keepalive, hide = !HOSTING, allow_hyphen_values = true)]
+    fastcgi_keepalive: usize,
+    /// Milliseconds small static files stay cached in memory (0 disables the cache)
+    #[arg(long, value_name = "MS", default_value = "1000", value_parser = parse_static_cache_ttl, hide = !HOSTING, allow_hyphen_values = true)]
+    static_cache_ttl_ms: u64,
     /// Runtime threads of the master process
     #[arg(long, value_name = "N", value_parser = parse_thread_count, allow_hyphen_values = true)]
     threads: Option<usize>,
@@ -191,6 +274,18 @@ struct Cli {
     /// Seconds a hosted worker is kept alive without requests; 0 disables reaping
     #[arg(long, value_name = "SECS", default_value = "300", hide = !HOSTING, allow_hyphen_values = true)]
     worker_idle_timeout: u64,
+    /// Cgroup v2 path for hosted workers, relative to /sys/fs/cgroup
+    #[arg(long, value_name = "PATH", hide = !HOSTING, allow_hyphen_values = true)]
+    worker_cgroup: Option<String>,
+    /// Memory limit for hosted workers (bytes or K/M/G/T; max for unlimited)
+    #[arg(long, value_name = "LIMIT", hide = !HOSTING, allow_hyphen_values = true)]
+    worker_cgroup_memory_max: Option<String>,
+    /// CPU limit for hosted workers (max, percentage, or QUOTA [PERIOD])
+    #[arg(long, value_name = "LIMIT", hide = !HOSTING, allow_hyphen_values = true)]
+    worker_cgroup_cpu_max: Option<String>,
+    /// PID limit for hosted workers (positive integer or max)
+    #[arg(long, value_name = "LIMIT", hide = !HOSTING, allow_hyphen_values = true)]
+    worker_cgroup_pids_max: Option<String>,
     /// Per-client request rate (N/s, N/m, or N/h)
     #[arg(long, value_name = "RATE", allow_hyphen_values = true)]
     rate_limit: Option<String>,
@@ -200,6 +295,51 @@ struct Cli {
     /// Trusted reverse-proxy address or CIDR; may be repeated
     #[arg(long, value_name = "CIDR", allow_hyphen_values = true)]
     trusted_proxy: Vec<String>,
+    /// Redis URL containing logchomper's access data
+    #[arg(long, value_name = "URL", hide = !SWARM, allow_hyphen_values = true)]
+    swarm_redis: Option<String>,
+    /// Local Redis URL containing customer blocklists
+    #[arg(long, value_name = "URL", hide = !SWARM, allow_hyphen_values = true)]
+    swarm_local_redis: Option<String>,
+    /// Maximum number of vhosts before a client is blocked
+    #[arg(long, value_name = "N", hide = !SWARM, allow_hyphen_values = true)]
+    swarm_vhost_threshold: Option<u64>,
+    /// Minimum vhost count before classification limits apply
+    #[arg(long, value_name = "N", hide = !SWARM, allow_hyphen_values = true)]
+    swarm_class_min_vhost_count: Option<u64>,
+    /// Hit count that activates traffic classification limits
+    #[arg(long, value_name = "N", hide = !SWARM, allow_hyphen_values = true)]
+    swarm_hit_threshold: Option<u64>,
+    /// Maximum malicious traffic fraction (0 to 1)
+    #[arg(long, value_name = "FRACTION", hide = !SWARM, allow_hyphen_values = true)]
+    swarm_malicious_pct: Option<f64>,
+    /// Maximum dynamic traffic fraction (0 to 1)
+    #[arg(long, value_name = "FRACTION", hide = !SWARM, allow_hyphen_values = true)]
+    swarm_dynamic_pct: Option<f64>,
+    /// Maximum spam traffic fraction (0 to 1)
+    #[arg(long, value_name = "FRACTION", hide = !SWARM, allow_hyphen_values = true)]
+    swarm_spam_pct: Option<f64>,
+    /// Enable classification-based thresholds
+    #[arg(long, hide = !SWARM)]
+    swarm_classification_limits: bool,
+    /// Whitelisted client address or CIDR; may be repeated
+    #[arg(long, value_name = "CIDR", hide = !SWARM, allow_hyphen_values = true)]
+    swarm_whitelist: Vec<String>,
+    /// Redis sorted-set key for this machine's blocklist
+    #[arg(long, value_name = "KEY", hide = !SWARM, allow_hyphen_values = true)]
+    swarm_machine_key: Option<String>,
+    /// Maximum time spent checking Redis in milliseconds
+    #[arg(long, value_name = "MS", hide = !SWARM, allow_hyphen_values = true)]
+    swarm_timeout_ms: Option<u64>,
+    /// Negative-result cache lifetime in seconds
+    #[arg(long, value_name = "SECS", hide = !SWARM, allow_hyphen_values = true)]
+    swarm_neg_cache_ttl: Option<u64>,
+    /// Positive-result cache lifetime in seconds
+    #[arg(long, value_name = "SECS", hide = !SWARM, allow_hyphen_values = true)]
+    swarm_pos_cache_ttl: Option<u64>,
+    /// Positive-result cache idle lifetime in seconds
+    #[arg(long, value_name = "SECS", hide = !SWARM, allow_hyphen_values = true)]
+    swarm_pos_cache_tti: Option<u64>,
     /// Write access-log records to stdout
     #[arg(long)]
     access_log: bool,
@@ -227,15 +367,21 @@ struct Cli {
     /// Load a bot-detection policy from YAML (also enables detection)
     #[arg(long, value_name = "FILE", allow_hyphen_values = true)]
     bot_config: Option<PathBuf>,
+    /// Only activate bot protection while server traffic is busy (N/s, N/m, or N/h)
+    #[arg(long, value_name = "RATE", allow_hyphen_values = true)]
+    bot_busy_threshold: Option<String>,
     /// ModSecurity rules file (repeatable)
     #[arg(long, value_name = "FILE", allow_hyphen_values = true)]
     modsecurity_rules: Vec<PathBuf>,
     /// HTTP status returned for blocking interventions
     #[arg(long, value_name = "CODE", value_parser = parse_modsecurity_block_status, allow_hyphen_values = true)]
     modsecurity_block_status: Option<u16>,
-    /// Request and response body inspection limit
+    /// Request body inspection limit
     #[arg(long, value_name = "BYTES", value_parser = parse_cli_body_limit, allow_hyphen_values = true)]
     modsecurity_body_limit: Option<usize>,
+    /// Response body inspection limit (defaults to 64 KiB)
+    #[arg(long, value_name = "BYTES", value_parser = parse_cli_body_limit, allow_hyphen_values = true)]
+    modsecurity_response_body_limit: Option<usize>,
     /// Virtual-host YAML file
     #[arg(long = "config", value_name = "YAML_FILE", allow_hyphen_values = true)]
     config_file: Option<PathBuf>,
@@ -296,11 +442,20 @@ const FEATURE_OPTIONS: &[(&str, bool, &[&str])] = &[
             "fastcgi_app",
             "fastcgi_app_arg",
             "fastcgi_app_max_workers",
+            "fastcgi_app_min_workers",
             "fastcgi_app_idle_timeout",
             "fastcgi_app_env",
+            "fastcgi_app_mode",
+            "fastcgi_app_php_defaults",
             "fastcgi_timeout",
+            "fastcgi_keepalive",
+            "static_cache_ttl_ms",
             "worker_threads",
             "worker_idle_timeout",
+            "worker_cgroup",
+            "worker_cgroup_memory_max",
+            "worker_cgroup_cpu_max",
+            "worker_cgroup_pids_max",
         ],
     ),
     (
@@ -314,9 +469,82 @@ const FEATURE_OPTIONS: &[(&str, bool, &[&str])] = &[
         ],
     ),
     ("http3", HTTP3, &["http3_bind"]),
+    (
+        "swarm",
+        SWARM,
+        &[
+            "swarm_redis",
+            "swarm_local_redis",
+            "swarm_vhost_threshold",
+            "swarm_class_min_vhost_count",
+            "swarm_hit_threshold",
+            "swarm_malicious_pct",
+            "swarm_dynamic_pct",
+            "swarm_spam_pct",
+            "swarm_classification_limits",
+            "swarm_whitelist",
+            "swarm_machine_key",
+            "swarm_timeout_ms",
+            "swarm_neg_cache_ttl",
+            "swarm_pos_cache_ttl",
+            "swarm_pos_cache_tti",
+        ],
+    ),
 ];
 
 impl Config {
+    pub(crate) fn from_options(
+        options: &serde_yaml_ng::Value,
+        config_path: &Path,
+    ) -> Result<Self, String> {
+        let matches = Cli::command()
+            .try_get_matches_from(["project-charlotte"])
+            .map_err(|error| error.to_string())?;
+        let args = options_to_args(options, &matches, config_path)?;
+        match Self::parse(args)? {
+            ParseResult::Config(config) => Ok(*config),
+            ParseResult::Help => Err("could not construct configuration from options".to_owned()),
+        }
+    }
+
+    pub(crate) fn configurable_options() -> Vec<OptionInfo> {
+        Cli::command()
+            .get_arguments()
+            .filter_map(|arg| {
+                let long = arg.get_long()?;
+                let name = long.replace('-', "_");
+                if arg.is_hide_set()
+                    || matches!(
+                        name.as_str(),
+                        "config" | "check_config" | "help" | "worker" | "worker_uid" | "worker_gid"
+                    )
+                {
+                    return None;
+                }
+                let kind = if matches!(arg.get_action(), ArgAction::SetTrue) {
+                    OptionKind::Flag
+                } else if matches!(arg.get_action(), ArgAction::Append) {
+                    OptionKind::List
+                } else {
+                    OptionKind::Value
+                };
+                Some(OptionInfo {
+                    name,
+                    help: arg.get_help().map_or_else(String::new, ToString::to_string),
+                    kind,
+                    value_name: arg
+                        .get_value_names()
+                        .and_then(|names| names.first())
+                        .map(ToString::to_string),
+                    default: arg
+                        .get_default_values()
+                        .first()
+                        .map(|value| value.to_string_lossy().into_owned()),
+                })
+            })
+            .collect()
+    }
+
     pub fn parse(args: impl IntoIterator<Item = String>) -> Result<ParseResult, String> {
         let args = args.into_iter().collect::<Vec<_>>();
         let matches = match Cli::command().try_get_matches_from(
@@ -381,6 +609,52 @@ impl Config {
         reject_compiled_out_options(&matches)?;
         let cli = Cli::from_arg_matches(&matches).map_err(|error| error.to_string())?;
 
+        #[cfg(feature = "swarm")]
+        let swarm = match cli.swarm_redis.clone() {
+            Some(upstream) => {
+                let whitelist = cli
+                    .swarm_whitelist
+                    .iter()
+                    .map(|value| value.parse())
+                    .collect::<Result<Vec<TrustedProxy>, String>>()?;
+                Some(SwarmConfig::new(
+                    upstream,
+                    cli.swarm_local_redis.clone(),
+                    cli.swarm_vhost_threshold,
+                    cli.swarm_class_min_vhost_count,
+                    cli.swarm_hit_threshold,
+                    cli.swarm_malicious_pct,
+                    cli.swarm_dynamic_pct,
+                    cli.swarm_spam_pct,
+                    cli.swarm_classification_limits,
+                    whitelist,
+                    cli.swarm_machine_key.clone(),
+                    cli.swarm_timeout_ms,
+                    cli.swarm_neg_cache_ttl,
+                    cli.swarm_pos_cache_ttl,
+                    cli.swarm_pos_cache_tti,
+                )?)
+            }
+            None if cli.swarm_local_redis.is_some()
+                || cli.swarm_vhost_threshold.is_some()
+                || cli.swarm_class_min_vhost_count.is_some()
+                || cli.swarm_hit_threshold.is_some()
+                || cli.swarm_malicious_pct.is_some()
+                || cli.swarm_dynamic_pct.is_some()
+                || cli.swarm_spam_pct.is_some()
+                || cli.swarm_classification_limits
+                || !cli.swarm_whitelist.is_empty()
+                || cli.swarm_machine_key.is_some()
+                || cli.swarm_timeout_ms.is_some()
+                || cli.swarm_neg_cache_ttl.is_some()
+                || cli.swarm_pos_cache_ttl.is_some()
+                || cli.swarm_pos_cache_tti.is_some() =>
+            {
+                return Err("swarm options require --swarm-redis".to_owned());
+            }
+            None => None,
+        };
+
         let mut backend_values = indexed_values(&matches, "fastcgi", &cli.fastcgi);
         backend_values.extend(indexed_values(&matches, "cgi", &cli.cgi));
         backend_values.extend(indexed_values(&matches, "fastcgi_app", &cli.fastcgi_app));
@@ -424,6 +698,24 @@ impl Config {
             fastcgi_app_max_workers.push((extension, max_workers));
         }
 
+        let mut fastcgi_app_min_workers = Vec::new();
+        for value in &cli.fastcgi_app_min_workers {
+            let (extension, min_workers) = value.split_once('=').ok_or_else(|| {
+                format!("invalid FastCGI app min worker count: {value}; expected EXT=N")
+            })?;
+            let extension = normalize_extension(extension)?;
+            let min_workers = parse_fastcgi_app_min_workers(min_workers)?;
+            if fastcgi_app_min_workers
+                .iter()
+                .any(|(existing, _): &(String, usize)| existing == &extension)
+            {
+                return Err(format!(
+                    "duplicate FastCGI app min worker count for extension: {extension}"
+                ));
+            }
+            fastcgi_app_min_workers.push((extension, min_workers));
+        }
+
         let mut fastcgi_app_idle_timeouts = Vec::new();
         for value in &cli.fastcgi_app_idle_timeout {
             let (extension, timeout) = value.split_once('=').ok_or_else(|| {
@@ -461,21 +753,72 @@ impl Config {
             ));
         }
 
+        let mut fastcgi_app_modes = Vec::new();
+        for value in &cli.fastcgi_app_mode {
+            let (extension, mode) = value.split_once('=').ok_or_else(|| {
+                format!("invalid FastCGI app mode: {value}; expected EXT=cgi|fpm")
+            })?;
+            let extension = normalize_extension(extension)?;
+            let mode = parse_fastcgi_app_mode(mode)?;
+            if fastcgi_app_modes
+                .iter()
+                .any(|(existing, _): &(String, FastCgiAppMode)| existing == &extension)
+            {
+                return Err(format!(
+                    "duplicate FastCGI app mode for extension: {extension}"
+                ));
+            }
+            fastcgi_app_modes.push((extension, mode));
+        }
+
+        let mut fastcgi_app_php_defaults = Vec::new();
+        for value in &cli.fastcgi_app_php_defaults {
+            let (extension, enabled) = value.split_once('=').ok_or_else(|| {
+                format!("invalid FastCGI app PHP defaults setting: {value}; expected EXT=on|off")
+            })?;
+            let extension = normalize_extension(extension)?;
+            let enabled = parse_fastcgi_app_php_defaults(enabled)?;
+            if fastcgi_app_php_defaults
+                .iter()
+                .any(|(existing, _): &(String, bool)| existing == &extension)
+            {
+                return Err(format!(
+                    "duplicate FastCGI app PHP defaults setting for extension: {extension}"
+                ));
+            }
+            fastcgi_app_php_defaults.push((extension, enabled));
+        }
+
         let Cli {
             user: master_user,
             group: master_group,
             debug,
+            server_timing,
             bind,
+            max_connections,
+            header_read_timeout,
+            tls_handshake_timeout,
             no_plain_http,
+            https_redirect,
             tls_bind,
             root,
             index,
             no_listing,
             try_files,
             fastcgi_timeout,
+            fastcgi_keepalive,
+            static_cache_ttl_ms,
+            fastcgi_app_min_workers: _,
+            fastcgi_app_max_workers: _,
+            fastcgi_app_mode: _,
+            fastcgi_app_php_defaults: _,
             threads,
             worker_threads,
             worker_idle_timeout,
+            worker_cgroup,
+            worker_cgroup_memory_max,
+            worker_cgroup_cpu_max,
+            worker_cgroup_pids_max,
             rate_limit,
             rate_limit_burst,
             trusted_proxy,
@@ -488,9 +831,11 @@ impl Config {
             error_log_format,
             bot_detection,
             bot_config,
+            bot_busy_threshold,
             modsecurity_rules,
             modsecurity_block_status,
             modsecurity_body_limit: body_limit,
+            modsecurity_response_body_limit: response_body_limit,
             config_file,
             vhost_dir,
             control_socket,
@@ -530,17 +875,28 @@ impl Config {
             let content = std::fs::read_to_string(&path).map_err(|error| {
                 format!("could not read bot policy {}: {error}", path.display())
             })?;
-            let policy: BotPolicyFile = serde_yaml_ng::from_str(&content)
+            let mut policy: BotPolicyFile = serde_yaml_ng::from_str(&content)
                 .map_err(|error| format!("invalid bot policy {}: {error}", path.display()))?;
+            if let Some(threshold) = bot_busy_threshold {
+                policy.set_busy_threshold(threshold);
+            }
             BotPolicy::parse(policy.clone())?;
             Some(policy)
         } else if bot_detection {
-            Some(BotPolicyFile::default())
+            let mut policy = BotPolicyFile::default();
+            if let Some(threshold) = bot_busy_threshold {
+                policy.set_busy_threshold(threshold);
+            }
+            BotPolicy::parse(policy.clone())?;
+            Some(policy)
+        } else if bot_busy_threshold.is_some() {
+            return Err("--bot-busy-threshold requires --bot-detection or --bot-config".to_owned());
         } else {
             None
         };
         let modsecurity_body_limit = body_limit.unwrap_or(16 * 1024 * 1024);
-        let modsecurity_response_body_limit = body_limit.unwrap_or(1024 * 1024);
+        let modsecurity_response_body_limit =
+            response_body_limit.or(body_limit).unwrap_or(64 * 1024);
 
         validate_index_names(&index).map_err(|error| format!("--index {error}"))?;
         validate_try_files(&try_files)?;
@@ -572,6 +928,21 @@ impl Config {
                 ));
             };
             app.max_workers = max_workers;
+            app.min_workers = app.min_workers.min(max_workers);
+        }
+        for (extension, min_workers) in fastcgi_app_min_workers {
+            let Some(FastCgiBackend {
+                address: FastCgiAddress::Spawn(app),
+                ..
+            }) = fastcgi
+                .iter_mut()
+                .find(|backend| backend.extension == extension)
+            else {
+                return Err(format!(
+                    "FastCGI app min worker count references undeclared app extension: {extension}"
+                ));
+            };
+            app.min_workers = min_workers.min(app.max_workers);
         }
         for (extension, idle_timeout) in fastcgi_app_idle_timeouts {
             let Some(FastCgiBackend {
@@ -590,9 +961,41 @@ impl Config {
         for (extension, key, value) in fastcgi_app_env {
             add_fastcgi_app_env(&mut fastcgi, &extension, key, value)?;
         }
+        for (extension, mode) in fastcgi_app_modes {
+            let Some(FastCgiBackend {
+                address: FastCgiAddress::Spawn(app),
+                ..
+            }) = fastcgi
+                .iter_mut()
+                .find(|backend| backend.extension == extension)
+            else {
+                return Err(format!(
+                    "FastCGI app mode references undeclared app extension: {extension}"
+                ));
+            };
+            app.mode = mode;
+        }
+        for (extension, enabled) in fastcgi_app_php_defaults {
+            let Some(FastCgiBackend {
+                address: FastCgiAddress::Spawn(app),
+                ..
+            }) = fastcgi
+                .iter_mut()
+                .find(|backend| backend.extension == extension)
+            else {
+                return Err(format!(
+                    "FastCGI app PHP defaults references undeclared app extension: {extension}"
+                ));
+            };
+            app.php_defaults = enabled;
+        }
 
         let tls = match (tls_cert, tls_key) {
-            (Some(cert), Some(key)) => Some(TlsFiles { cert, key }),
+            (Some(cert), Some(key)) => Some(TlsFiles {
+                cert,
+                key,
+                chain: None,
+            }),
             (None, None) => None,
             _ => return Err("--tls-cert and --tls-key must be supplied together".to_owned()),
         };
@@ -634,14 +1037,45 @@ impl Config {
         if worker && worker_uid.is_none() {
             return Err("--worker requires worker uid/gid options".to_owned());
         }
+        #[cfg(feature = "hosting")]
+        let worker_cgroup = match worker_cgroup {
+            Some(path) => Some(
+                CgroupSpec::new(
+                    &path,
+                    worker_cgroup_memory_max.as_deref(),
+                    worker_cgroup_cpu_max.as_deref(),
+                    worker_cgroup_pids_max.as_deref(),
+                )
+                .map_err(|error| format!("--worker-cgroup: {error}"))?,
+            ),
+            None if worker_cgroup_memory_max.is_some()
+                || worker_cgroup_cpu_max.is_some()
+                || worker_cgroup_pids_max.is_some() =>
+            {
+                return Err("--worker-cgroup limits require --worker-cgroup".to_owned());
+            }
+            None => None,
+        };
+        #[cfg(not(feature = "hosting"))]
+        let _ = (
+            worker_cgroup,
+            worker_cgroup_memory_max,
+            worker_cgroup_cpu_max,
+            worker_cgroup_pids_max,
+        );
         if worker && check_config {
             return Err("--check-config cannot be used with --worker".to_owned());
         }
 
         Ok(ParseResult::Config(Box::new(Self {
             debug,
+            server_timing,
             plain_http: !no_plain_http,
+            https_redirect,
             bind,
+            max_connections,
+            header_read_timeout,
+            tls_handshake_timeout,
             tls_bind,
             http3_bind: http3_bind.unwrap_or_else(|| tls_bind.unwrap_or(bind)),
             root,
@@ -653,10 +1087,16 @@ impl Config {
             try_files,
             fastcgi,
             fastcgi_timeout,
+            fastcgi_keepalive,
+            static_cache_ttl: Duration::from_millis(static_cache_ttl_ms),
             threads,
             worker_threads,
             worker_idle_timeout: Duration::from_secs(worker_idle_timeout),
+            #[cfg(feature = "hosting")]
+            worker_cgroup,
             rate_limit,
+            #[cfg(feature = "swarm")]
+            swarm,
             trusted_proxies,
             access_log,
             access_log_file,
@@ -857,6 +1297,7 @@ fn compiled_features() -> String {
         ("hosting", cfg!(feature = "hosting")),
         ("http3", cfg!(feature = "http3")),
         ("proxy", cfg!(feature = "proxy")),
+        ("swarm", cfg!(feature = "swarm")),
     ]
     .into_iter()
     .filter_map(|(name, enabled)| enabled.then_some(name))
@@ -938,6 +1379,31 @@ fn parse_cli_id(
     }
 }
 
+pub const DEFAULT_FASTCGI_KEEPALIVE: usize = 8;
+pub const MAX_FASTCGI_KEEPALIVE: usize = 1024;
+pub const DEFAULT_STATIC_CACHE_TTL_MS: u64 = 1000;
+pub const MAX_STATIC_CACHE_TTL_MS: u64 = 3_600_000;
+
+fn parse_fastcgi_keepalive(value: &str) -> Result<usize, String> {
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|count| *count <= MAX_FASTCGI_KEEPALIVE)
+        .ok_or_else(|| {
+            format!("invalid FastCGI keep-alive count: {value}; expected 0-{MAX_FASTCGI_KEEPALIVE}")
+        })
+}
+
+fn parse_static_cache_ttl(value: &str) -> Result<u64, String> {
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|ttl| *ttl <= MAX_STATIC_CACHE_TTL_MS)
+        .ok_or_else(|| {
+            format!("invalid static cache TTL: {value}; expected 0-{MAX_STATIC_CACHE_TTL_MS} milliseconds")
+        })
+}
+
 fn parse_cli_fastcgi_timeout(value: &str) -> Result<Duration, String> {
     value
         .parse::<u64>()
@@ -945,6 +1411,23 @@ fn parse_cli_fastcgi_timeout(value: &str) -> Result<Duration, String> {
         .filter(|seconds| *seconds > 0)
         .map(Duration::from_secs)
         .ok_or_else(|| format!("invalid FastCGI timeout: {value}"))
+}
+
+fn parse_positive_usize(value: &str) -> Result<usize, String> {
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|number| *number > 0)
+        .ok_or_else(|| format!("invalid positive number: {value}"))
+}
+
+fn parse_cli_timeout(value: &str) -> Result<Duration, String> {
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+        .ok_or_else(|| format!("invalid timeout: {value}; expected a positive number of seconds"))
 }
 
 fn parse_cli_body_limit(value: &str) -> Result<usize, String> {
@@ -1142,10 +1625,33 @@ pub(crate) fn parse_fastcgi_app(value: &str) -> Result<FastCgiBackend, String> {
             program: PathBuf::from(program),
             args: Vec::new(),
             env: BTreeMap::new(),
-            max_workers: 1,
+            mode: FastCgiAppMode::Cgi,
+            php_defaults: true,
+            min_workers: 1,
+            max_workers: default_fastcgi_app_max_workers(),
             idle_timeout: Duration::from_secs(DEFAULT_FASTCGI_APP_IDLE_TIMEOUT_SECS),
         }),
     })
+}
+
+pub(crate) fn parse_fastcgi_app_mode(value: &str) -> Result<FastCgiAppMode, String> {
+    match value {
+        "cgi" => Ok(FastCgiAppMode::Cgi),
+        "fpm" => Ok(FastCgiAppMode::Fpm),
+        _ => Err(format!(
+            "invalid FastCGI app mode: {value}; expected cgi or fpm"
+        )),
+    }
+}
+
+pub(crate) fn parse_fastcgi_app_php_defaults(value: &str) -> Result<bool, String> {
+    match value {
+        "on" => Ok(true),
+        "off" => Ok(false),
+        _ => Err(format!(
+            "invalid FastCGI app PHP defaults setting: {value}; expected on or off"
+        )),
+    }
 }
 
 pub(crate) fn normalize_extension(extension: &str) -> Result<String, String> {
@@ -1170,8 +1676,13 @@ pub(crate) fn validate_env_key(key: &str) -> Result<(), String> {
 pub const DEFAULT_WORKER_THREADS: usize = 2;
 pub const MAX_THREADS: usize = 1024;
 pub const MAX_FASTCGI_APP_WORKERS: usize = 256;
+pub const DEFAULT_FASTCGI_APP_MIN_WORKERS: usize = 1;
 pub const DEFAULT_FASTCGI_APP_IDLE_TIMEOUT_SECS: u64 = 60;
 pub const MAX_FASTCGI_APP_IDLE_TIMEOUT_SECS: u64 = 86_400;
+
+pub(crate) fn default_fastcgi_app_max_workers() -> usize {
+    std::thread::available_parallelism().map_or(1, |count| count.get().min(8))
+}
 
 pub fn parse_modsecurity_block_status(value: &str) -> Result<u16, String> {
     value
@@ -1189,6 +1700,18 @@ pub fn parse_fastcgi_app_max_workers(value: &str) -> Result<usize, String> {
         .ok_or_else(|| {
             format!(
                 "invalid FastCGI app max worker count: {value}; expected 1-{MAX_FASTCGI_APP_WORKERS}"
+            )
+        })
+}
+
+pub fn parse_fastcgi_app_min_workers(value: &str) -> Result<usize, String> {
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|workers| *workers <= MAX_FASTCGI_APP_WORKERS)
+        .ok_or_else(|| {
+            format!(
+                "invalid FastCGI app min worker count: {value}; expected 0-{MAX_FASTCGI_APP_WORKERS}"
             )
         })
 }
@@ -1218,10 +1741,12 @@ pub fn parse_thread_count(value: &str) -> Result<usize, String> {
 mod tests {
     use super::{Config, ParseResult, parse_modsecurity_block_status};
     #[cfg(feature = "hosting")]
-    use super::{DEFAULT_FASTCGI_APP_IDLE_TIMEOUT_SECS, FastCgiAddress, validate_try_files};
+    use super::{
+        DEFAULT_FASTCGI_APP_IDLE_TIMEOUT_SECS, FastCgiAddress, FastCgiAppMode,
+        default_fastcgi_app_max_workers, validate_try_files,
+    };
     use crate::forwarded::TrustedProxy;
     use crate::ratelimit::RateLimit;
-    #[cfg(feature = "hosting")]
     use std::time::Duration;
     use std::{
         fs,
@@ -1241,6 +1766,41 @@ mod tests {
         path
     }
 
+    #[test]
+    fn from_options_uses_server_parser_and_config_relative_paths() {
+        let options_yaml = if cfg!(feature = "hosting") {
+            "bind: 0.0.0.0:9000\ndebug: true\nindex: [home.htm, index.html]\naccess_log_file: logs/access.log\n"
+        } else {
+            "bind: 0.0.0.0:9000\ndebug: true\naccess_log_file: logs/access.log\n"
+        };
+        let options: serde_yaml_ng::Value = serde_yaml_ng::from_str(options_yaml).unwrap();
+        let config = Config::from_options(
+            &options,
+            std::path::Path::new("/tmp/charlotte/options.yaml"),
+        )
+        .unwrap();
+
+        assert_eq!(config.bind.to_string(), "0.0.0.0:9000");
+        assert!(config.debug);
+        #[cfg(feature = "hosting")]
+        assert_eq!(config.index, ["home.htm", "index.html"]);
+        assert_eq!(
+            config.access_log_file.as_deref(),
+            Some(std::path::Path::new("/tmp/charlotte/logs/access.log"))
+        );
+    }
+
+    #[test]
+    fn from_options_rejects_unknown_reserved_and_invalid_options() {
+        for yaml in ["unknown_option: true", "worker: true", "group: www-data"] {
+            let options: serde_yaml_ng::Value = serde_yaml_ng::from_str(yaml).unwrap();
+            assert!(
+                Config::from_options(&options, std::path::Path::new("charlotte.yaml")).is_err(),
+                "accepted {yaml}"
+            );
+        }
+    }
+
     #[cfg(feature = "hosting")]
     #[test]
     fn parses_options() {
@@ -1258,6 +1818,9 @@ mod tests {
             panic!("expected config")
         };
         assert_eq!(config.bind.to_string(), "0.0.0.0:9000");
+        assert_eq!(config.max_connections, 4096);
+        assert_eq!(config.header_read_timeout, Duration::from_secs(30));
+        assert_eq!(config.tls_handshake_timeout, Duration::from_secs(10));
         assert_eq!(config.http3_bind, config.bind);
         assert_eq!(config.root.as_path(), std::path::Path::new("public"));
         assert_eq!(config.config_file, None);
@@ -1265,6 +1828,76 @@ mod tests {
         assert_eq!(config.index, ["home.htm"]);
         assert!(!config.listing);
         assert!(config.try_files.is_empty());
+        assert!(config.worker_cgroup.is_none());
+    }
+
+    #[cfg(feature = "hosting")]
+    #[test]
+    fn parses_worker_cgroup_path_and_limits() {
+        let parsed = Config::parse([
+            "--worker-cgroup".to_owned(),
+            "/charlotte/sites/{uid}/{name}".to_owned(),
+            "--worker-cgroup-memory-max".to_owned(),
+            "64M".to_owned(),
+            "--worker-cgroup-cpu-max".to_owned(),
+            "150%".to_owned(),
+            "--worker-cgroup-pids-max".to_owned(),
+            "32".to_owned(),
+        ])
+        .unwrap();
+        let ParseResult::Config(config) = parsed else {
+            panic!("expected config")
+        };
+        let cgroup = config.worker_cgroup.unwrap();
+        assert_eq!(cgroup.path, PathBuf::from("charlotte/sites/{uid}/{name}"));
+        assert_eq!(cgroup.memory_max.as_deref(), Some("67108864"));
+        assert_eq!(cgroup.cpu_max.as_deref(), Some("150000 100000"));
+        assert_eq!(cgroup.pids_max.as_deref(), Some("32"));
+
+        assert!(
+            Config::parse(["--worker-cgroup-memory-max".to_owned(), "1G".to_owned(),]).is_err()
+        );
+        assert!(Config::parse(["--worker-cgroup".to_owned(), "../escape".to_owned(),]).is_err());
+        assert!(
+            Config::parse([
+                "--worker-cgroup".to_owned(),
+                "site".to_owned(),
+                "--worker-cgroup-pids-max".to_owned(),
+                "0".to_owned(),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn parses_connection_limits_and_timeouts() {
+        let parsed = Config::parse([
+            "--max-connections".to_owned(),
+            "12".to_owned(),
+            "--header-read-timeout".to_owned(),
+            "3".to_owned(),
+            "--tls-handshake-timeout".to_owned(),
+            "2".to_owned(),
+        ])
+        .unwrap();
+        let ParseResult::Config(config) = parsed else {
+            panic!("expected config")
+        };
+        assert_eq!(config.max_connections, 12);
+        assert_eq!(config.header_read_timeout, Duration::from_secs(3));
+        assert_eq!(config.tls_handshake_timeout, Duration::from_secs(2));
+
+        for (option, value) in [
+            ("--max-connections", "0"),
+            ("--max-connections", "not-a-number"),
+            ("--header-read-timeout", "0"),
+            ("--tls-handshake-timeout", "-1"),
+        ] {
+            assert!(
+                Config::parse([option.to_owned(), value.to_owned()]).is_err(),
+                "accepted {option} {value}"
+            );
+        }
     }
 
     #[cfg(feature = "hosting")]
@@ -1332,6 +1965,60 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "swarm")]
+    #[test]
+    fn parses_swarm_options_and_requires_upstream_redis() {
+        let parsed = Config::parse([
+            "--swarm-redis".to_owned(),
+            "redis://127.0.0.1:6379/".to_owned(),
+            "--swarm-vhost-threshold".to_owned(),
+            "250".to_owned(),
+            "--swarm-classification-limits".to_owned(),
+            "--swarm-whitelist".to_owned(),
+            "192.0.2.0/24".to_owned(),
+            "--swarm-timeout-ms".to_owned(),
+            "25".to_owned(),
+        ])
+        .unwrap();
+        let ParseResult::Config(config) = parsed else {
+            panic!("expected config")
+        };
+        let swarm = config.swarm.expect("swarm config");
+        assert_eq!(swarm.vhost_threshold, 250);
+        assert!(swarm.classification_limits);
+        assert_eq!(swarm.whitelist, ["192.0.2.0/24".parse().unwrap()]);
+        assert_eq!(swarm.timeout, Duration::from_millis(25));
+
+        assert!(
+            Config::parse([
+                "--swarm-local-redis".to_owned(),
+                "redis://localhost/".to_owned()
+            ])
+            .is_err()
+        );
+        assert!(
+            Config::parse([
+                "--swarm-redis".to_owned(),
+                "redis://127.0.0.1:6379/".to_owned(),
+                "--swarm-malicious-pct".to_owned(),
+                "1.1".to_owned(),
+            ])
+            .is_err()
+        );
+    }
+
+    #[cfg(not(feature = "swarm"))]
+    #[test]
+    fn rejects_swarm_options_when_feature_is_disabled() {
+        let Err(error) = Config::parse([
+            "--swarm-redis".to_owned(),
+            "redis://127.0.0.1:6379/".to_owned(),
+        ]) else {
+            panic!("expected swarm options to be rejected")
+        };
+        assert!(error.contains("requires the `swarm` feature"), "{error}");
+    }
+
     #[test]
     fn parses_trusted_proxies_and_access_logging() {
         let parsed = Config::parse([
@@ -1383,6 +2070,50 @@ mod tests {
             panic!("expected config")
         };
         assert!(config.bot.is_some());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn bot_busy_threshold_requires_and_configures_bot_detection() {
+        let parsed = Config::parse([
+            "--bot-detection".to_owned(),
+            "--bot-busy-threshold".to_owned(),
+            "20/s".to_owned(),
+        ])
+        .unwrap();
+        let ParseResult::Config(config) = parsed else {
+            panic!("expected config")
+        };
+        assert!(config.bot.is_some());
+
+        let error = Config::parse(["--bot-busy-threshold".to_owned(), "20/s".to_owned()])
+            .err()
+            .unwrap();
+        assert!(error.contains("requires --bot-detection or --bot-config"));
+        assert!(
+            Config::parse([
+                "--bot-detection".to_owned(),
+                "--bot-busy-threshold".to_owned(),
+                "invalid".to_owned(),
+            ])
+            .is_err()
+        );
+
+        let path = std::env::temp_dir().join(format!(
+            "project-charlotte-bot-busy-config-{}-{}.yaml",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::write(&path, "busy_threshold: invalid\n").unwrap();
+        assert!(
+            Config::parse([
+                "--bot-config".to_owned(),
+                path.to_string_lossy().into_owned(),
+                "--bot-busy-threshold".to_owned(),
+                "20/s".to_owned(),
+            ])
+            .is_ok()
+        );
         std::fs::remove_file(path).unwrap();
     }
 
@@ -1511,6 +2242,10 @@ mod tests {
             "php=APP_MODE=production".to_owned(),
             "--fastcgi-app-max-workers".to_owned(),
             "php=4".to_owned(),
+            "--fastcgi-app-mode".to_owned(),
+            "php=fpm".to_owned(),
+            "--fastcgi-app-php-defaults".to_owned(),
+            "php=off".to_owned(),
             "--fastcgi-app-idle-timeout".to_owned(),
             "php=12".to_owned(),
             "--fastcgi-app".to_owned(),
@@ -1531,6 +2266,8 @@ mod tests {
         assert_eq!(app.args, ["--foreground", "--bind"]);
         assert_eq!(app.max_workers, 4);
         assert_eq!(app.idle_timeout, Duration::from_secs(12));
+        assert_eq!(app.mode, FastCgiAppMode::Fpm);
+        assert!(!app.php_defaults);
         assert_eq!(
             app.env.get("APP_MODE").map(String::as_str),
             Some("production")
@@ -1539,7 +2276,7 @@ mod tests {
 
     #[cfg(feature = "hosting")]
     #[test]
-    fn fastcgi_app_defaults_to_one_worker() {
+    fn fastcgi_app_defaults_to_one_warm_worker_and_cpu_bound_maximum() {
         let parsed = Config::parse(["--fastcgi-app".to_owned(), "php=php-cgi".to_owned()]).unwrap();
         let ParseResult::Config(config) = parsed else {
             panic!("expected config")
@@ -1547,10 +2284,93 @@ mod tests {
         let FastCgiAddress::Spawn(app) = &config.fastcgi[0].address else {
             panic!("expected spawned FastCGI app")
         };
-        assert_eq!(app.max_workers, 1);
+        assert_eq!(app.min_workers, 1);
+        assert_eq!(app.mode, FastCgiAppMode::Cgi);
+        assert!(app.php_defaults);
+        assert_eq!(app.max_workers, default_fastcgi_app_max_workers());
+        assert!((1..=8).contains(&app.max_workers));
+        assert_eq!(config.modsecurity_response_body_limit, 64 * 1024);
         assert_eq!(
             app.idle_timeout,
             Duration::from_secs(DEFAULT_FASTCGI_APP_IDLE_TIMEOUT_SECS)
+        );
+    }
+
+    #[cfg(feature = "hosting")]
+    #[test]
+    fn validates_fastcgi_app_mode_and_php_default_options() {
+        for (option, value) in [
+            ("--fastcgi-app-mode", "php=bad"),
+            ("--fastcgi-app-php-defaults", "php=yes"),
+        ] {
+            assert!(
+                Config::parse([
+                    "--fastcgi-app".to_owned(),
+                    "php=php-cgi".to_owned(),
+                    option.to_owned(),
+                    value.to_owned(),
+                ])
+                .is_err()
+            );
+        }
+        assert!(Config::parse(["--fastcgi-app-mode".to_owned(), "php=fpm".to_owned(),]).is_err());
+        assert!(
+            Config::parse([
+                "--fastcgi-app".to_owned(),
+                "php=php-cgi".to_owned(),
+                "--fastcgi-app-mode".to_owned(),
+                "php=cgi".to_owned(),
+                "--fastcgi-app-mode".to_owned(),
+                "php=fpm".to_owned(),
+            ])
+            .is_err()
+        );
+    }
+
+    #[cfg(feature = "hosting")]
+    #[test]
+    fn fastcgi_app_min_workers_and_response_body_limit_options() {
+        let parsed = Config::parse([
+            "--fastcgi-app".to_owned(),
+            "php=php-cgi".to_owned(),
+            "--fastcgi-app-max-workers".to_owned(),
+            "php=2".to_owned(),
+            "--fastcgi-app-min-workers".to_owned(),
+            "php=5".to_owned(),
+            "--modsecurity-body-limit".to_owned(),
+            "1000".to_owned(),
+        ])
+        .unwrap();
+        let ParseResult::Config(config) = parsed else {
+            panic!("expected config")
+        };
+        let FastCgiAddress::Spawn(app) = &config.fastcgi[0].address else {
+            panic!("expected spawned FastCGI app")
+        };
+        assert_eq!(app.min_workers, 2, "the minimum is clamped to the maximum");
+        assert_eq!(config.modsecurity_response_body_limit, 1000);
+        let ParseResult::Config(config) = Config::parse([
+            "--modsecurity-body-limit".to_owned(),
+            "1000".to_owned(),
+            "--modsecurity-response-body-limit".to_owned(),
+            "2000".to_owned(),
+        ])
+        .unwrap() else {
+            panic!("expected config")
+        };
+        assert_eq!(config.modsecurity_body_limit, 1000);
+        assert_eq!(config.modsecurity_response_body_limit, 2000);
+        assert!(
+            Config::parse(["--fastcgi-app-min-workers".to_owned(), "php=1".to_owned()]).is_err()
+        );
+        assert!(
+            Config::parse([
+                "--fastcgi-app".to_owned(),
+                "php=php-cgi".to_owned(),
+                "--fastcgi-app-min-workers".to_owned(),
+                "php=257".to_owned(),
+            ])
+            .is_err()
         );
     }
 
@@ -1805,7 +2625,7 @@ mod tests {
     #[test]
     fn parses_global_options_from_config_file_and_resolves_relative_paths() {
         let path = write_config_file(
-            "options:\n  bind: 127.0.0.1:8123\n  debug: true\n  index: [home.htm, index.html]\n  user: charlotte\n  threads: 4\n  access-log-file: logs/access.log\n  log-dir: [logs, audit]\n  tls-dir: certificates\n",
+            "options:\n  bind: 127.0.0.1:8123\n  debug: true\n  https_redirect: true\n  index: [home.htm, index.html]\n  user: charlotte\n  threads: 4\n  access-log-file: logs/access.log\n  log-dir: [logs, audit]\n  tls-dir: certificates\n  worker_cgroup: charlotte/sites/{uid}/{name}\n  worker_cgroup_memory_max: 512M\n  worker_cgroup_cpu_max: 150%\n  worker_cgroup_pids_max: 64\n",
         );
         let parsed =
             Config::parse(["--config".to_owned(), path.to_string_lossy().into_owned()]).unwrap();
@@ -1815,9 +2635,15 @@ mod tests {
 
         assert_eq!(config.bind.to_string(), "127.0.0.1:8123");
         assert!(config.debug);
+        assert!(config.https_redirect);
         assert_eq!(config.index, ["home.htm", "index.html"]);
         assert_eq!(config.master_user.as_deref(), Some("charlotte"));
         assert_eq!(config.threads, Some(4));
+        let cgroup = config.worker_cgroup.as_ref().unwrap();
+        assert_eq!(cgroup.path, PathBuf::from("charlotte/sites/{uid}/{name}"));
+        assert_eq!(cgroup.memory_max.as_deref(), Some("536870912"));
+        assert_eq!(cgroup.cpu_max.as_deref(), Some("150000 100000"));
+        assert_eq!(cgroup.pids_max.as_deref(), Some("64"));
         assert_eq!(
             config.access_log_file,
             Some(path.parent().unwrap().join("logs/access.log"))
@@ -1932,11 +2758,18 @@ mod tests {
             panic!("expected config")
         };
         assert!(!defaults.debug);
+        assert!(!defaults.https_redirect);
 
         let ParseResult::Config(config) = Config::parse(["--debug".to_owned()]).unwrap() else {
             panic!("expected config")
         };
         assert!(config.debug);
+
+        let ParseResult::Config(config) = Config::parse(["--https-redirect".to_owned()]).unwrap()
+        else {
+            panic!("expected config")
+        };
+        assert!(config.https_redirect);
     }
 
     #[test]

@@ -26,13 +26,20 @@ headless validation mode.
 - Optional ModSecurity request and response inspection.
 - Optional TLS with SNI-based certificate selection, ACME HTTP-01 certificate
   provisioning and renewal, and HTTP/3 over QUIC.
-- Hot reload of virtual-host files from a configured directory.
+- Optional Redis-backed swarm access checks, plus per-client rate limiting and
+  bot detection with proof-of-work challenges.
+- A local Unix-socket control API (`charlotte-ctl`), worker cgroup v2 settings,
+  and tools to convert Apache/nginx configurations or interactively create a
+  vhost (`apache2charlotte`, `nginx2charlotte`, and `charlotte-configure`).
+- A configuration validator (`--check-config`) and watched virtual-host file
+  reloads.
 
 ## Requirements
 
 - Rust and Cargo with Rust 2024 edition support (Rust 1.85 or newer).
-- The `modsecurity-rs` dependency checked out as a sibling directory at
-  `../modsecurity-rs`, as specified by the path dependency in `Cargo.toml`.
+- The `libmodsecurity3-rs` crate and the system `libmodsecurity3` development
+  library (`libmodsecurity-dev` on Debian/Ubuntu), required for all builds;
+  ModSecurity support uses this library.
 
 Build and run the test suite from the project directory:
 
@@ -43,7 +50,7 @@ cargo test
 
 ## Build features
 
-The major parts of the server are Cargo features. All four are enabled by
+The major parts of the server are Cargo features. All five are enabled by
 default; leave some out to build a smaller server.
 
 | Feature | Provides | Without it |
@@ -52,6 +59,7 @@ default; leave some out to build a smaller server.
 | `proxy` | Virtual hosts with `proxy_pass`. | Virtual hosts with `proxy_pass` are refused. |
 | `acme` | ACME certificate provisioning (`--acme-*`). | The ACME options and `acme: true` are refused. |
 | `http3` | The HTTP/3 listener (`--http3-bind`). | TLS is served over TCP only. |
+| `swarm` | Redis-backed client access checks compatible with logchomper. | Swarm options and vhost `swarm` settings are refused. |
 
 TLS termination, SNI certificate selection, ModSecurity, `--user`/`--group`,
 and virtual-host reloading are part of every build. A build refuses the
@@ -66,8 +74,8 @@ certificates with ACME, and serves HTTP/3, but hosts nothing itself:
 cargo build --release --no-default-features --features proxy,acme,http3
 ```
 
-`scripts/check-features.sh` checks that every combination of features
-compiles without warnings.
+`scripts/check-features.sh` checks that every combination of the five features
+compiles without warnings, both for the server and all targets.
 
 ### Debian packages
 
@@ -78,7 +86,14 @@ other:
 | Package | Command | Features |
 | --- | --- | --- |
 | `project-charlotte` | `cargo deb` | all |
-| `project-charlotte-proxy` | `cargo deb --variant proxy` | `proxy`, `acme`, `http3` |
+| `project-charlotte-proxy` | `cargo deb --variant proxy` | `proxy`, `acme`, `http3` (no `hosting` or `swarm`) |
+
+The Debian packages workflow currently builds for Ubuntu 24.04 (noble) and
+Ubuntu 26.04 (resolute). To build for Ubuntu 22.04 (jammy) from a newer host,
+run `scripts/build-deb-jammy.sh` (add `--variant proxy` for the proxy package).
+It builds inside an `ubuntu:22.04` container with Docker (set
+`CONTAINER_ENGINE=podman` to use Podman), so the binaries link against jammy's
+glibc and `libmodsecurity3`. Packages are written to `target/jammy/debian/`.
 
 The `Debian packages` GitHub workflow builds both for each supported Ubuntu
 release. Both packages install and enable the `project-charlotte.service`
@@ -118,7 +133,7 @@ FastCGI apps are emitted only when their executable is an absolute path;
 commands such as `php-cgi` or relative paths are skipped with a review comment.
 Apache `DirectoryIndex` and nginx `index` entries are converted to an ordered
 `index` list; entries that are not bare file names are skipped with a review
-comment.
+comment. Apache `SSLCertificateChainFile` maps to the vhost `tls_chain` key.
 
 ### nginx configuration conversion
 
@@ -142,6 +157,10 @@ Add `--user-from-root` to set each vhost's `user` and `group` to the owner of
 its root, overriding configured values. Relative roots are resolved from the
 converter's current working directory; if ownership cannot be determined,
 configured values are kept and a review comment is emitted.
+Nginx `ssl_certificate` is mapped to `tls_cert` as-is; configure it with the
+full chain when it contains intermediates. `ssl_trusted_certificate` is not
+served to clients and remains a review comment, since nginx uses it for OCSP
+stapling or client-certificate verification.
 
 ## Quick start
 
@@ -172,7 +191,11 @@ see all command-line options. Common options include:
 | Option | Purpose |
 | --- | --- |
 | `--bind ADDRESS` | Plain HTTP listener; defaults to `127.0.0.1:8080`. |
-| `--debug` | Log verbose startup details, including listener binding, workers, and TLS initialization. |
+| `--max-connections N` | Maximum concurrent client connections across TCP listeners; defaults to 4096 and must be positive. |
+| `--header-read-timeout SECS` | Maximum time to receive a complete request head, including a client that sends no bytes; defaults to 30 seconds. |
+| `--tls-handshake-timeout SECS` | Maximum time to complete a TLS handshake; defaults to 10 seconds. |
+| `--debug` | Log verbose startup details and a per-request timing summary when the response body finishes. |
+| `--server-timing` | Add request-stage durations to the `Server-Timing` response header. |
 | `--no-plain-http` | Disable the plain HTTP listener; incompatible with ACME HTTP-01. |
 | `--root DIRECTORY` | Fallback document root when no virtual host handles a request; defaults to `.`. |
 | `--user USER [--group GROUP]` | Drop the master process to this account before starting; requires root. |
@@ -184,6 +207,7 @@ see all command-line options. Common options include:
 | `--check-config` | Validate the virtual-host YAML files and exit, reporting errors with source locations. |
 | `--control-socket PATH` | Serve the local HTTP configuration API on a Unix socket. |
 | `--tls-bind ADDRESS` | Listen for HTTPS; configure a certificate with `--tls-cert` and `--tls-key`, or use eligible ACME virtual hosts. |
+| `--https-redirect` | Redirect plain HTTP requests for certified virtual hosts to HTTPS; a vhost can override this with `https_redirect: false`. |
 | `--http3-bind ADDRESS` | Enable the HTTP/3 listener; TLS configuration is required. |
 | `--rate-limit RATE` | Apply a per-client request limit such as `20/s`, `600/m`, or `36000/h`; disabled by default. |
 | `--rate-limit-burst N` | Set the allowed burst; requires `--rate-limit` and defaults to the rate rounded up per second. |
@@ -197,14 +221,56 @@ see all command-line options. Common options include:
 | `--error-log-format FORMAT` | Apache `ErrorLogFormat` string; defaults to `[%t] [%l] [pid %P] [module %m] %M`. |
 | `--bot-detection` | Enable the built-in bot policy in enforcing mode. |
 | `--bot-config FILE` | Load bot-detection settings from YAML; enables detection and overrides the defaults. |
+| `--bot-busy-threshold RATE` | Apply the global bot policy only when server traffic reaches a rate such as `100/s`; requires `--bot-detection` or `--bot-config`. |
 | `--fastcgi EXT=ADDR` | Route a file extension to a FastCGI TCP or Unix-socket backend. |
+| `--fastcgi-keepalive N` | Idle keep-alive connections kept per FastCGI TCP/Unix backend (0–1024, default 8; 0 opens a connection per request). |
+| `--static-cache-ttl-ms MS` | Keep static files of up to 64 KiB in memory for this long (0–3,600,000 ms, default 1000; 0 disables the cache). |
 | `--cgi EXT[=INTERPRETER]` | Execute matching scripts directly or with an interpreter; repeatable. |
 | `--fastcgi-app EXT=PROGRAM` | Start and supervise a FastCGI application for an extension. |
-| `--fastcgi-app-max-workers EXT=N` | Set the on-demand FastCGI app pool limit (1–256); defaults to one. |
+| `--fastcgi-app-max-workers EXT=N` | Set the FastCGI app pool limit (1–256); defaults to the CPU count, capped at 8. |
+| `--fastcgi-app-min-workers EXT=N` | Keep N app workers warm (0–256, capped at the maximum); defaults to one. |
 | `--fastcgi-app-idle-timeout EXT=SECS` | Reap surplus idle app workers after 1–86,400 seconds; defaults to 60 seconds. |
+| `--fastcgi-app-mode EXT=cgi|fpm` | Run an app as individual CGI workers (default) or one supervised PHP-FPM process. |
+| `--fastcgi-app-php-defaults EXT=on|off` | Enable or disable PHP OPcache/realpath defaults; enabled by default for programs whose name contains `php`. |
 | `--modsecurity-rules FILE` | Load ModSecurity rules; can be repeated to load multiple files. |
+| `--modsecurity-response-body-limit BYTES` | Buffer at most this much of an inspected response body; defaults to `--modsecurity-body-limit` if set, otherwise 64 KiB. |
 | `--modsecurity-block-status CODE` | Override the status for ModSecurity blocking interventions (400–599; defaults to the rule status or 403). |
 | `--acme-directory URL --acme-cache DIR` | Configure ACME certificate provisioning and its cache. |
+
+Use `charlotte-configure` to create a virtual-host YAML entry through an
+interactive question-and-answer flow. Fixed-choice settings are presented as
+numbered choices, and Charlotte validates each proposed setting and the
+completed document with its normal configuration checks before writing it. By
+default YAML is printed to stdout, while prompts go to stderr so the output can
+be redirected safely; `--output FILE` writes a new file with mode `0644`, and
+`--force` permits replacing an existing file. The tool only offers hosting,
+proxy, and ACME choices supported by the build you are using. For example:
+
+```sh
+charlotte-configure --output /etc/charlotte/vhosts.d/example.yaml
+```
+
+After the standard setup questions, choose **Configure advanced settings?** to
+set worker thread counts, CGI and additional FastCGI backends, extra managed
+applications and their arguments/environment/pool settings, cgroup limits,
+proxy CA roots, swarm opt-out, log formats, ModSecurity rule exclusions, and
+the detailed fields of a bot policy. Lists are entered one value per line and
+end with a blank line. The wizard validates each proposed change with the same
+configuration checks used at startup and re-asks when it is invalid. The
+directory-index answer replaces the global list rather than appending to it.
+The wizard writes one vhost entry by default. Pass `--server-options` to also
+configure the server-wide `options:` mapping; after those questions, you can
+choose whether to add one vhost to the same file. Common listener, TLS/ACME,
+logging, bot, ModSecurity, rate-limit, trusted-proxy, and swarm settings have
+guided questions. A numbered menu exposes every other visible server CLI
+option; flags offer Yes/No/Unset, repeatable options accept one value per line,
+and scalar options are validated before they are applied. Builds without site
+hosting or proxy support can still use `--server-options` to create an
+options-only file. For example:
+
+```sh
+charlotte-configure --server-options --output /etc/charlotte/charlotte.yaml
+```
 
 Any command-line option can also be set as a global default in the main
 configuration file's top-level `options` mapping. Use the long option name with
@@ -237,6 +303,28 @@ address for rate limiting and access logs. `--access-log` writes the resolved
 client address and direct peer address, request line, status, host, and user
 agent to stdout; quotes, backslashes, and control characters are escaped.
 
+### Swarm access checks
+
+The optional `swarm` feature checks each resolved client IP against the Redis
+data populated by logchomper's `redis-accessproxy`. Enable it with
+`--swarm-redis URL` (or `swarm_redis` in the main config's `options` mapping).
+The default vhost threshold is 1000; `--swarm-vhost-threshold` can override it.
+Other `--swarm-*` options configure a second Redis URL for customer
+blocklists, classification thresholds, whitelist CIDRs, the machine blocklist
+key, the Redis timeout, and cache lifetimes. See `project-charlotte --help`
+for the complete option list.
+
+Charlotte reads, but does not write, logchomper's keys: `<ip>_vhosts`,
+`<HHMM>_hits`, `<HHMM>_<ip>_classes`, `blocklist:global`, and the configured
+machine key. A local Redis instance can provide `customer_blocklist_<ip>`
+entries; these return `403`, while other blocks return `429` with a
+`block-reason` header. The client address honors `--trusted-proxy`, and a vhost
+can opt out with `swarm: false`. Redis connection errors and timeouts fail open;
+the failed Redis instance is temporarily skipped. Nftables allow/deny sets and
+traffic recording are not implemented here—logchomper remains responsible
+for populating the shared data. This feature is included in the default build;
+builds without it reject `--swarm-*` options and vhost `swarm` settings.
+
 ### Logging
 
 Access and error logs can be written directly to files for the whole server
@@ -251,6 +339,19 @@ need not be accessible to the website account. The master and website workers
 still perform website operations under their configured users and groups. The
 server sends error output to stderr when no error log is configured, including
 output from the root helper and worker processes.
+
+Access log formats support `%{NAME}T` and `%{NAME:UNIT}T` for request timing.
+Names are `total`, `headers`, `ttfb`, `bot`, `waf`, `waf_response`, `spawn`,
+and `backend`; units are `us` (the default), `ms`, or `s`. For example,
+`%{ttfb:ms}T %{backend:ms}T %{total:ms}T` logs milliseconds, while a stage
+that did not run is written as `-`. Existing `%D` and `%T` directives now
+measure from request dispatch. The opt-in `--server-timing` header reports the
+available stages, time until response headers, `ttfb` (server-side time to
+first byte), and elapsed time when headers are prepared. Because the status line
+and headers are the first bytes sent, the header's `ttfb` is measured when they
+are ready; the access log's `%{ttfb}T` instead marks the first body byte, which
+is not yet known when the header is written. With `--debug`, a `request timing:` line is written when the
+response body finishes or is dropped.
 
 The helper only works inside directories fixed at startup: the directories
 holding the log files and TLS certificate/key files named by the options and
@@ -357,11 +458,13 @@ storage `503`.
 ### Bot detection
 
 Bot detection is disabled unless `--bot-detection` (the built-in policy in
-enforcing mode) or `--bot-config FILE` (a YAML policy) is used. The master
-evaluates every request after the ACME challenge check and the rate limit, and
-before ModSecurity and routing, so blocked and challenged requests never reach
-the WAF, a worker, a script, or a proxied upstream. The client address is the
-same one used for rate limiting, so it honours `--trusted-proxy`.
+enforcing mode) or `--bot-config FILE` (a YAML policy) is used. Requests are
+counted for the busy-traffic gate first; ACME challenges are then served,
+followed by any configured HTTP-to-HTTPS redirect, rate limiting, optional
+swarm access checks, bot policy, and ModSecurity before routing. Thus requests
+blocked or challenged at those stages do not reach a worker, script, or
+proxied upstream. The client address is the same one used for rate limiting,
+so it honours `--trusted-proxy`.
 
 #### How a request is scored
 
@@ -407,7 +510,10 @@ it. The checks run in this order:
    and resolve forward to the same IP. A verified crawler is allowed unless a
    deny rule matched; an impostor adds 100. Lookups time out after 2 seconds,
    at most 16 run at once, and results are cached for an hour (60 seconds after
-   a lookup error, which adds nothing to the score).
+   a lookup error, which adds nothing to the score). Lookups run in the
+   background: the request that triggers one is scored as a lookup error and
+   is never held up by a slow resolver, and later requests from that address
+   use the cached verdict.
 
 #### What happens next
 
@@ -454,6 +560,9 @@ A policy file, a vhost `bot` map, and the built-in defaults accept these keys:
 | `honeypot_ban` | `3600` | Ban length in seconds (at most 30 days). |
 | `exempt_paths` | `[]` | Path prefixes that skip bot detection. |
 | `verify_crawlers` | `true` | Verify claimed search-engine crawlers through DNS. |
+| `busy_threshold` | disabled | Activate the bot policy when total server traffic reaches this rate, such as `100/s`, `6000/m`, or `360000/h`. |
+| `busy_window` | `10` | Seconds over which the average server request rate is measured (1–60). |
+| `busy_cooldown` | `300` | Seconds to keep the policy active after traffic falls below the threshold (1–86400). |
 
 Unknown keys are rejected, and paths must be local absolute paths.
 
@@ -467,7 +576,16 @@ exempt_paths: [/health, /api/]
 honeypot_paths: [/wp-login.php]
 honeypot_ban: 86400
 verify_crawlers: true
+busy_threshold: 100/s
+busy_window: 10
+busy_cooldown: 300
 ```
+
+Busy gating is disabled unless `busy_threshold` is set. The meter counts all
+requests handled by the server, including vhosts without bot protection, so a
+traffic surge on one site can activate the global policy on another. When the
+threshold is reached, bot protection remains active through the cooldown; the
+global `--bot-busy-threshold` overrides `busy_threshold` in the global policy.
 
 The `--bot-config` file is the global policy. A virtual host inherits it, turns
 it off with `bot: off`, or replaces it with its own policy map (a replacement,
@@ -534,15 +652,60 @@ without it, the rule's `status` is used when valid, otherwise Charlotte returns
 host can override the global setting with `modsecurity_block_status: CODE` in
 its YAML declaration; this requires global ModSecurity rules.
 
-Server-managed FastCGI apps start with no workers. The first request starts one,
-and additional workers are started only when concurrent requests need them, up
-to `--fastcgi-app-max-workers`. Every idle worker is reaped after
-`--fastcgi-app-idle-timeout`, so the pool can scale back to zero; a request after
-that starts a fresh worker. The idle timeout defaults to 60 seconds. The old
+Response bodies are only buffered for inspection when the loaded rules would
+inspect them. At startup Charlotte reads the rule files (following `Include`
+globs) for `SecResponseBodyAccess` and `SecResponseBodyMimeType`, using
+libmodsecurity's defaults (access off; `text/plain` and `text/html`). Responses
+with access off or a `Content-Type` outside the list stream straight through;
+phase 4 still runs, and the transaction is logged when the body ends. Rules
+that switch inspection at runtime (`ctl:responseBodyAccess`,
+`ctl:responseBodyMimeType`), or rule files that cannot be read, make Charlotte
+inspect every response. A vhost can force the choice with
+`modsecurity_response_body: true` or `false`. Before the first byte is sent, at
+most `--modsecurity-response-body-limit` (64 KiB by default) of an inspected
+body is buffered; anything beyond that is streamed.
+
+Server-managed FastCGI apps start `--fastcgi-app-min-workers` workers at
+startup (one by default), so the first request does not pay the app's start-up
+cost. More workers are started when concurrent requests need them, up to
+`--fastcgi-app-max-workers`, which defaults to the CPU count, capped at 8.
+Idle workers beyond the minimum are reaped after `--fastcgi-app-idle-timeout`;
+set the minimum to 0 to let the pool scale to zero. Time spent starting a
+worker for a request is reported as the `spawn` timing stage. In vhost YAML the
+same settings are `min_workers` and `max_workers` on a `fastcgi_app` entry. The
+idle timeout defaults to 60 seconds. The old
 `--fastcgi-app-workers` option remains as a deprecated alias for
 `--fastcgi-app-max-workers`. Workers restart immediately after a clean exit if
 they ran for at least 50 ms; failed or very short-lived processes are delayed
 to avoid a rapid restart loop.
+
+For managed PHP commands, Charlotte supplies OPcache and realpath-cache
+defaults, sets `PHP_FCGI_MAX_REQUESTS=10000`, and configures a private
+`opcache.file_cache` directory under the system temporary directory. The cache
+directory is owned by the server or vhost-worker account and has mode `0700`;
+it is kept across app restarts, subject to the temporary directory's own
+lifetime. A command-line `-d key=value` setting overrides the matching default,
+and an explicit `PHP_FCGI_MAX_REQUESTS` environment value is preserved. Turn
+these defaults off per app with `--fastcgi-app-php-defaults EXT=off` or
+`php_defaults: false` in vhost YAML.
+
+Set `--fastcgi-app-mode EXT=fpm` or `mode: fpm` on a `fastcgi_app` YAML entry
+to run a PHP-FPM binary as one supervised process instead of separate
+`php-cgi` workers. Charlotte writes a private pool configuration and Unix
+socket, limits concurrent FastCGI requests to `max_workers`, and maps
+`min_workers` / `idle_timeout` to PHP-FPM's static, dynamic, or ondemand process
+manager. PHP-FPM workers share the OPcache managed by that FPM process. The
+process runs as the server or hosted-vhost worker account; PHP-FPM must be
+installed and available to that account.
+
+```yaml
+fastcgi_app:
+  - extension: php
+    command: [/usr/sbin/php-fpm8.3]
+    mode: fpm
+    min_workers: 2
+    max_workers: 8
+```
 
 Classic CGI entries can be configured from the command line or in each virtual
 host's YAML `cgi` list. Without an interpreter, the script must be executable;
@@ -628,6 +791,23 @@ Each vhost `index` may be a single filename or an ordered list. Charlotte serves
 the first matching file found in the requested directory, then falls back to a
 directory listing (if enabled).
 
+For a static certificate, `tls_cert` may contain the leaf and its certificate
+chain. Alternatively, set `tls_chain` to a PEM file containing intermediate
+certificates; Charlotte appends certificates not already present in `tls_cert`
+when building the chain sent to clients. `tls_chain` requires both `tls_cert`
+and `tls_key`, and its path is resolved relative to the vhost YAML file. When
+the server runs as root with `--user`, the root TLS helper reads this file just
+like the certificate and key.
+
+Set `--https-redirect` to redirect plain HTTP requests to HTTPS when the
+selected vhost has its own TLS certificate or an ACME certificate has been
+issued for the requested host. The TLS TCP listener must be active. A vhost's
+`https_redirect: true` or `https_redirect: false` overrides the global setting.
+ACME HTTP-01 challenge responses are served before redirects, so issuance can
+still complete. GET and HEAD requests receive `301`; other methods receive
+`308`. The redirect preserves the request path and query and uses the bound TLS
+port (omitting `:443`).
+
 Virtual hosts without `rate_limit` inherit the global CLI limit. Set
 `rate_limit: off` to exempt a host, or give it a rate such as `20/s` to create
 an independent per-host bucket; `rate_limit_burst` is optional and defaults to
@@ -642,6 +822,40 @@ active requests by default; set `--worker-idle-timeout SECS` to change the
 default, or use `worker_idle_timeout: SECS` on a vhost. Set either value to `0`
 to keep workers alive indefinitely. If the master cannot inspect a root because
 of filesystem permissions, it defers that access check to the worker user.
+
+Hosted workers can optionally be placed in a cgroup v2 group under
+`/sys/fs/cgroup`. Set `--worker-cgroup PATH` and any of
+`--worker-cgroup-memory-max`, `--worker-cgroup-cpu-max`, or
+`--worker-cgroup-pids-max` for global defaults; the same options can be set in
+the main config file's `options:` mapping. A vhost can override these with
+`cgroup`, `cgroup_memory_max`, `cgroup_cpu_max`, and `cgroup_pids_max`:
+
+```yaml
+options:
+  worker_cgroup: charlotte/sites/{uid}/{name}
+  worker_cgroup_memory_max: 512M
+  worker_cgroup_cpu_max: 150%
+  worker_cgroup_pids_max: 64
+
+vhost:
+  - server_names: [www.example.com]
+    root: /srv/www/example.com/public
+    user: www-example
+    cgroup: charlotte/sites/{uid}/example-site
+    cgroup_pids_max: 32
+```
+
+The path is relative to the cgroup v2 mount (a leading `/` is also accepted
+and stripped), and supports `{uid}`, `{gid}`, and `{name}` placeholders; `{name}`
+uses the first server name with unsafe characters replaced. Per-vhost paths
+override the global path, while per-vhost limits override only the matching
+global limit. Memory values are positive bytes with optional K/M/G/T suffixes
+or `max`; CPU accepts `max`, an integer percentage such as `150%`, or
+`QUOTA [PERIOD]` in the kernel's `cpu.max` format; PID limits are a positive
+integer or `max`. CGI scripts and FastCGI applications inherit the worker's
+cgroup. The service needs a writable, delegated cgroup v2 hierarchy with the
+requested controllers available; enabling controllers can fail if a non-root
+ancestor cgroup still contains processes.
 
 A proxy vhost can forward requests arriving over HTTP/1.1, HTTP/2, or HTTP/3 to
 an HTTP or HTTPS upstream:
@@ -665,10 +879,35 @@ path and query are appended to that prefix. `proxy_preserve_host` defaults to
 `proxy_timeout` is the response-header timeout in seconds and defaults to 60.
 HTTPS upstreams use the system trust roots unless `proxy_ca_root` points to a
 PEM CA bundle; that path is relative to the YAML file. Request bodies and
-upstream response bodies are streamed. Charlotte removes hop-by-hop headers and
+upstream response bodies are streamed. Upstream sockets use `TCP_NODELAY` and,
+on Linux, `TCP_QUICKACK` after each read, so a backend that leaves Nagle's
+algorithm on is not held back by delayed acknowledgements (about 40 ms per
+response on a reused connection). Up to 64 idle upstream connections per host
+are kept for 90 seconds. Set `proxy_http2: true` to speak HTTP/2 only to the
+upstream; for an `http://` upstream that means prior-knowledge cleartext
+HTTP/2 (h2c), which multiplexes requests over one connection. Charlotte removes hop-by-hop headers and
 sets `X-Forwarded-For`, `X-Forwarded-Proto`, and `X-Forwarded-Host`. Connection
 upgrades, WebSockets, and CONNECT tunnelling are not supported; upstream
 connection failures return 502 and response-header timeouts return 504.
+
+### Performance notes
+
+- Log files are written by a background thread per file, in batches with one
+  flush per batch, so a slow disk does not stall request threads. A full queue
+  (8,192 lines) makes writers wait rather than drop lines, and every queued line
+  is flushed when the server exits. Logs to stdout and stderr stay synchronous.
+- TLS listeners keep a 16,384-entry session cache and issue session tickets,
+  so returning clients resume without a full handshake.
+- HTTP/2 connections, from clients and to hosted workers, use adaptive
+  flow-control windows; clients may open up to 256 concurrent streams.
+- FastCGI TCP and Unix-socket backends reuse connections (`FCGI_KEEP_CONN`).
+  A connection is pooled again only after its response was read in full, idle
+  connections are dropped after 30 seconds, and a request whose pooled
+  connection was closed by the backend is retried once on a new connection.
+  Server-managed FastCGI apps are not affected.
+- Static files of up to 64 KiB are cached in memory for `--static-cache-ttl-ms`
+  (1 second by default; at most 1,024 files and 32 MiB). A change to a file can
+  therefore take up to that long to be served.
 
 ### HTTP/3-only reverse proxy
 
@@ -712,8 +951,13 @@ general server configuration.
 Run tests with `cargo test`. Tests that need a feature are compiled only when
 it is enabled, so a reduced build is tested with the same feature flags it is
 built with, for example
-`cargo test --no-default-features --features proxy,acme,http3`. Fuzz target
-setup, seed tests, and target commands are documented in
+`cargo test --no-default-features --features proxy,acme,http3`. On Linux, the
+root-only tests are marked ignored in ordinary runs; after building as the
+normal user, run them with `sudo -E env PATH="$PATH" cargo test -- --ignored`.
+The privileged tests copy the server executable into a temporary directory so
+workers running as other accounts can execute it; that directory and its
+ancestors must be traversable by those accounts.
+Fuzz target setup, seed tests, and target commands are documented in
 [FUZZING.md](FUZZING.md); the fuzz targets need the default features.
 
 Run coverage with `cargo tarpaulin` (install it with

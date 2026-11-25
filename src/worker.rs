@@ -98,7 +98,9 @@ async fn run_inner(mut config: Config) -> Result<(), Box<dyn Error + Send + Sync
         async move { Ok::<_, std::convert::Infallible>(dispatch(request, config).await) }
     });
     let io = TokioIo::new(socket);
-    let connection = http2::Builder::new(TokioExecutor::new()).serve_connection(io, service);
+    let connection = http2::Builder::new(TokioExecutor::new())
+        .adaptive_window(true)
+        .serve_connection(io, service);
     // A worker that is killed outright cannot drop `_fastcgi_apps`, which would
     // orphan every app it spawned and leak the descriptors they inherited. Shut
     // down on a signal instead so that those handles run their cleanup.
@@ -156,6 +158,7 @@ async fn dispatch(
             local: Some(local),
             server_name,
             error_log: None,
+            timing: None,
         },
         handler::handle_request(request, config, peer, local),
     )

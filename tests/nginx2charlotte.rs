@@ -51,6 +51,7 @@ http {
     index index.php index.html /index.php;
     ssl_certificate /etc/ssl/example.pem;
     ssl_certificate_key /etc/ssl/example.key;
+    ssl_trusted_certificate /etc/ssl/ca-bundle.pem;
     access_log /var/log/nginx/access.log charlotte;
     error_log /var/log/nginx/error.log warn;
     add_header X-Test "kept # as text";
@@ -135,6 +136,7 @@ http {
     assert_eq!(static_host["listing"], true);
     assert_eq!(static_host["tls_cert"], "/etc/ssl/example.pem");
     assert_eq!(static_host["tls_key"], "/etc/ssl/example.key");
+    assert!(yaml.contains("used for OCSP stapling or client-certificate verification"));
     assert_eq!(static_host["access_log"], "/var/log/nginx/access.log");
     assert_eq!(static_host["access_log_format"], "%a - \"%r\" %s %O %I");
     assert_eq!(static_host["error_log"], "/var/log/nginx/error.log");
@@ -228,6 +230,55 @@ fn omits_comments_when_requested() {
     let hosts = document["vhost"].as_sequence().unwrap();
     assert_eq!(hosts[0]["server_names"][0], "no-comments.example.test");
 
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+#[cfg(feature = "hosting")]
+fn converted_yaml_passes_charlotte_config_validation() {
+    let root = temp_dir();
+    let site = root.join("site");
+    fs::create_dir_all(&site).unwrap();
+    fs::write(site.join("index.html"), "converted config validation").unwrap();
+    let nginx_config = root.join("nginx.conf");
+    let output_config = root.join("charlotte.yaml");
+    fs::write(
+        &nginx_config,
+        format!(
+            "http {{ server {{ server_name converted-nginx.test; root {}; }} }}\n",
+            site.display()
+        ),
+    )
+    .unwrap();
+
+    let conversion = Command::new(env!("CARGO_BIN_EXE_nginx2charlotte"))
+        .arg(&nginx_config)
+        .arg("--user-from-root")
+        .arg("--output")
+        .arg(&output_config)
+        .output()
+        .unwrap();
+    assert!(
+        conversion.status.success(),
+        "converter failed: {}",
+        String::from_utf8_lossy(&conversion.stderr)
+    );
+
+    let validation = Command::new(env!("CARGO_BIN_EXE_project-charlotte"))
+        .arg("--check-config")
+        .arg("--config")
+        .arg(&output_config)
+        .output()
+        .unwrap();
+    assert!(
+        validation.status.success(),
+        "converted configuration was rejected: {}",
+        String::from_utf8_lossy(&validation.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&validation.stdout).trim(),
+        "Configuration OK"
+    );
     let _ = fs::remove_dir_all(root);
 }
 

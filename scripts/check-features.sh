@@ -8,7 +8,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-features=(acme hosting http3 proxy)
+features=(acme hosting http3 proxy swarm)
 export RUSTFLAGS="${RUSTFLAGS:-} -D warnings"
 
 failed=()

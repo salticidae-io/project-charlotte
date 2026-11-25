@@ -4,7 +4,10 @@ use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     str::FromStr,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -20,6 +23,7 @@ use crate::{forwarded::TrustedProxy, ja4::ClientHelloInfo};
 
 const CACHE_SHARDS: usize = 16;
 const CACHE_CAPACITY: usize = 256;
+const BUSY_BUCKETS: usize = 60;
 pub(crate) const CHALLENGE_PATH: &str = "/.well-known/charlotte-bot-challenge";
 const BOT_COOKIE: &str = "charlotte_bot";
 const SHA256_JS: &str = r#"const sha256K=[],sha256H=[];function sha256(input){if(!sha256K.length){const marked={};for(let candidate=2,n=0;n<64;candidate++){if(!marked[candidate]){for(let multiple=candidate*candidate;multiple<313;multiple+=candidate)marked[multiple]=true;if(n<8)sha256H[n]=(Math.sqrt(candidate)%1*4294967296)|0;sha256K[n]=(Math.pow(candidate,1/3)%1*4294967296)|0;n++}}}const bitLength=input.length*8;input+='\x80';while(input.length%64!==56)input+='\x00';const words=[];for(let i=0;i<input.length;i++)words[i>>2]=(words[i>>2]||0)|(input.charCodeAt(i)<<(24-(i%4)*8));words.push((bitLength/4294967296)|0,bitLength|0);const hash=sha256H.slice(),rotate=(x,n)=>(x>>>n)|(x<<(32-n));for(let offset=0;offset<words.length;offset+=16){const schedule=words.slice(offset,offset+16);for(let i=16;i<64;i++){const x=schedule[i-15],y=schedule[i-2],s0=rotate(x,7)^rotate(x,18)^(x>>>3),s1=rotate(y,17)^rotate(y,19)^(y>>>10);schedule[i]=(schedule[i-16]+s0+schedule[i-7]+s1)|0}let[a,b,c,d,e,f,g,h]=hash;for(let i=0;i<64;i++){const s1=rotate(e,6)^rotate(e,11)^rotate(e,25),choice=(e&f)^(~e&g),t1=(h+s1+choice+sha256K[i]+schedule[i])|0,s0=rotate(a,2)^rotate(a,13)^rotate(a,22),majority=(a&b)^(a&c)^(b&c),t2=(s0+majority)|0;h=g;g=f;f=e;e=(d+t1)|0;d=c;c=b;b=a;a=(t1+t2)|0}hash[0]=(hash[0]+a)|0;hash[1]=(hash[1]+b)|0;hash[2]=(hash[2]+c)|0;hash[3]=(hash[3]+d)|0;hash[4]=(hash[4]+e)|0;hash[5]=(hash[5]+f)|0;hash[6]=(hash[6]+g)|0;hash[7]=(hash[7]+h)|0}return hash.map(value=>(value>>>0).toString(16).padStart(8,'0')).join('')}"#;
@@ -70,6 +74,12 @@ pub(crate) struct BotPolicyFile {
     ja4_allow: Vec<String>,
     #[serde(default)]
     ja4_deny: Vec<String>,
+    #[serde(default)]
+    busy_threshold: Option<String>,
+    #[serde(default = "default_busy_window")]
+    busy_window: u64,
+    #[serde(default = "default_busy_cooldown")]
+    busy_cooldown: u64,
 }
 
 impl Default for BotPolicyFile {
@@ -92,7 +102,16 @@ impl Default for BotPolicyFile {
             verify_crawlers: true,
             ja4_allow: Vec::new(),
             ja4_deny: Vec::new(),
+            busy_threshold: None,
+            busy_window: default_busy_window(),
+            busy_cooldown: default_busy_cooldown(),
         }
+    }
+}
+
+impl BotPolicyFile {
+    pub(crate) fn set_busy_threshold(&mut self, threshold: String) {
+        self.busy_threshold = Some(threshold);
     }
 }
 
@@ -120,6 +139,14 @@ const fn default_ban_ttl() -> u64 {
     3600
 }
 
+const fn default_busy_window() -> u64 {
+    10
+}
+
+const fn default_busy_cooldown() -> u64 {
+    300
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct BotPolicy {
     mode: BotMode,
@@ -139,6 +166,77 @@ pub(crate) struct BotPolicy {
     verify_crawlers: bool,
     ja4_allow: Vec<String>,
     ja4_deny: Vec<String>,
+    busy: Option<BusyGate>,
+}
+
+#[derive(Clone, Debug)]
+struct BusyGate {
+    requests: u64,
+    period_seconds: u64,
+    window_seconds: u64,
+    cooldown_seconds: u64,
+    active_until: Arc<AtomicU64>,
+}
+
+struct TrafficMeter {
+    started: Instant,
+    buckets: [AtomicU64; BUSY_BUCKETS],
+}
+
+impl TrafficMeter {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
+
+    fn now_seconds(&self) -> u64 {
+        self.started.elapsed().as_secs()
+    }
+
+    fn record_request(&self) {
+        self.record_request_at(self.now_seconds());
+    }
+
+    fn record_request_at(&self, second: u64) {
+        let stamp = bucket_stamp(second);
+        let bucket = &self.buckets[(second % BUSY_BUCKETS as u64) as usize];
+        let mut current = bucket.load(Ordering::Relaxed);
+        loop {
+            let current_stamp = (current >> 32) as u32;
+            let count = if current_stamp == stamp {
+                (current as u32).saturating_add(1)
+            } else {
+                1
+            };
+            let next = (u64::from(stamp) << 32) | u64::from(count);
+            match bucket.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => return,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    fn rate_over_at(&self, window_seconds: u64, now: u64) -> u64 {
+        let window_seconds = window_seconds.clamp(1, BUSY_BUCKETS as u64);
+        let start = now.saturating_sub(window_seconds - 1);
+        (start..=now).fold(0_u64, |total, second| {
+            let stamp = bucket_stamp(second);
+            let bucket =
+                self.buckets[(second % BUSY_BUCKETS as u64) as usize].load(Ordering::Relaxed);
+            if (bucket >> 32) as u32 == stamp {
+                total.saturating_add(u64::from(bucket as u32))
+            } else {
+                total
+            }
+        })
+    }
+}
+
+fn bucket_stamp(second: u64) -> u32 {
+    u32::try_from(second.min(u64::from(u32::MAX) - 1)).unwrap_or(u32::MAX - 1) + 1
 }
 
 impl BotPolicy {
@@ -162,6 +260,12 @@ impl BotPolicy {
                     .to_owned(),
             );
         }
+        if !(1..=60).contains(&file.busy_window) {
+            return Err("bot busy_window must be between 1 and 60 seconds".to_owned());
+        }
+        if !(1..=24 * 3600).contains(&file.busy_cooldown) {
+            return Err("bot busy_cooldown must be between 1 second and 1 day".to_owned());
+        }
         if file
             .allow_user_agents
             .iter()
@@ -184,6 +288,18 @@ impl BotPolicy {
                 return Err(format!("bot paths must be local absolute paths: {path}"));
             }
         }
+        let busy = file
+            .busy_threshold
+            .as_deref()
+            .map(parse_busy_threshold)
+            .transpose()?
+            .map(|(requests, period_seconds)| BusyGate {
+                requests,
+                period_seconds,
+                window_seconds: file.busy_window,
+                cooldown_seconds: file.busy_cooldown,
+                active_until: Arc::new(AtomicU64::new(0)),
+            });
         Ok(Self {
             mode: file.mode,
             challenge_threshold: file.challenge_threshold,
@@ -202,6 +318,7 @@ impl BotPolicy {
             verify_crawlers: file.verify_crawlers,
             ja4_allow: file.ja4_allow,
             ja4_deny: file.ja4_deny,
+            busy,
         })
     }
 
@@ -212,6 +329,54 @@ impl BotPolicy {
 
     pub(crate) fn challenge_parameters(&self) -> (u8, u64) {
         (self.challenge_difficulty, self.challenge_ttl)
+    }
+
+    fn is_active(&self, state: &BotState) -> bool {
+        self.busy.as_ref().is_none_or(|busy| busy.is_active(state))
+    }
+}
+
+fn parse_busy_threshold(value: &str) -> Result<(u64, u64), String> {
+    let (amount, period_seconds) = if let Some(amount) = value.strip_suffix("/s") {
+        (amount, 1)
+    } else if let Some(amount) = value.strip_suffix("/m") {
+        (amount, 60)
+    } else if let Some(amount) = value.strip_suffix("/h") {
+        (amount, 3600)
+    } else {
+        return Err(format!(
+            "invalid bot busy_threshold: {value}; expected N/s, N/m, or N/h"
+        ));
+    };
+    let requests = amount
+        .parse::<u64>()
+        .ok()
+        .filter(|requests| *requests > 0)
+        .ok_or_else(|| format!("invalid bot busy_threshold: {value}; rate must be positive"))?;
+    Ok((requests, period_seconds))
+}
+
+impl BusyGate {
+    fn is_active(&self, state: &BotState) -> bool {
+        self.is_active_at(state, state.traffic.now_seconds())
+    }
+
+    fn is_active_at(&self, state: &BotState, now: u64) -> bool {
+        let request_count = state.traffic.rate_over_at(self.window_seconds, now);
+        if u128::from(request_count) * u128::from(self.period_seconds)
+            >= u128::from(self.requests) * u128::from(self.window_seconds)
+        {
+            let active_until = now.saturating_add(self.cooldown_seconds);
+            let previous = self.active_until.fetch_max(active_until, Ordering::Relaxed);
+            if previous <= now {
+                crate::log_notice!(
+                    "bot protection activated during busy traffic: {} requests per {} seconds",
+                    request_count,
+                    self.window_seconds
+                );
+            }
+        }
+        now < self.active_until.load(Ordering::Relaxed)
     }
 }
 
@@ -237,8 +402,9 @@ struct TtlEntry<T> {
 pub(crate) struct BotState {
     key: hmac::Key,
     bans: Vec<Mutex<HashMap<IpAddr, TtlEntry<()>>>>,
-    crawlers: Vec<Mutex<HashMap<(IpAddr, &'static str), TtlEntry<CrawlerCheck>>>>,
+    crawlers: Arc<Vec<Mutex<HashMap<(IpAddr, &'static str), TtlEntry<CrawlerCheck>>>>>,
     crawler_dns_slots: Arc<Semaphore>,
+    traffic: TrafficMeter,
 }
 
 impl BotState {
@@ -252,11 +418,18 @@ impl BotState {
             bans: (0..CACHE_SHARDS)
                 .map(|_| Mutex::new(HashMap::new()))
                 .collect(),
-            crawlers: (0..CACHE_SHARDS)
-                .map(|_| Mutex::new(HashMap::new()))
-                .collect(),
+            crawlers: Arc::new(
+                (0..CACHE_SHARDS)
+                    .map(|_| Mutex::new(HashMap::new()))
+                    .collect(),
+            ),
             crawler_dns_slots: Arc::new(Semaphore::new(16)),
+            traffic: TrafficMeter::new(),
         }))
+    }
+
+    pub(crate) fn record_request(&self) {
+        self.traffic.record_request();
     }
 
     fn shard(&self, ip: IpAddr) -> usize {
@@ -297,50 +470,14 @@ impl BotState {
         let shard = self.shard(ip);
         let key = (ip, suffix);
         let now = Instant::now();
-        {
-            let mut cache = self.crawlers[shard]
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            cache.retain(|_, entry| entry.expires > now);
-            if let Some(entry) = cache.get(&key) {
-                return entry.value;
-            }
-        }
-
-        let lookup = tokio::time::timeout(Duration::from_secs(2), async {
-            let permit = Arc::clone(&self.crawler_dns_slots)
-                .try_acquire_owned()
-                .ok()?;
-            let reverse_ip = ip;
-            let (hostname, _permit) =
-                tokio::task::spawn_blocking(move || (dns_lookup::lookup_addr(&reverse_ip), permit))
-                    .await
-                    .ok()?;
-            let hostname = hostname.ok()?;
-            let hostname = hostname.trim_end_matches('.').to_ascii_lowercase();
-            if !hostname.ends_with(suffix) {
-                return Some(false);
-            }
-            let mut addresses = tokio::net::lookup_host((hostname.as_str(), 80))
-                .await
-                .ok()?;
-            Some(addresses.any(|address| address.ip() == ip))
-        })
-        .await;
-        let check = match lookup {
-            Ok(Some(true)) => CrawlerCheck::Verified,
-            Ok(Some(false)) => CrawlerCheck::Impostor,
-            Ok(None) | Err(_) => CrawlerCheck::Error,
-        };
-        let ttl = if check == CrawlerCheck::Error {
-            Duration::from_secs(60)
-        } else {
-            Duration::from_secs(3600)
-        };
         let mut cache = self.crawlers[shard]
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         cache.retain(|_, entry| entry.expires > now);
+        if let Some(entry) = cache.get(&key) {
+            return entry.value;
+        }
+        let pending_ttl = Duration::from_secs(5);
         if cache.len() >= CACHE_CAPACITY {
             if let Some(key) = cache.keys().next().copied() {
                 cache.remove(&key);
@@ -349,11 +486,68 @@ impl BotState {
         cache.insert(
             key,
             TtlEntry {
-                expires: now + ttl,
-                value: check,
+                expires: now + pending_ttl,
+                value: CrawlerCheck::Error,
             },
         );
-        check
+        drop(cache);
+
+        let Some(permit) = Arc::clone(&self.crawler_dns_slots).try_acquire_owned().ok() else {
+            return CrawlerCheck::Error;
+        };
+        let crawlers = Arc::clone(&self.crawlers);
+        tokio::spawn(async move {
+            let check = tokio::time::timeout(Duration::from_secs(2), async move {
+                let reverse_ip = ip;
+                let (hostname, _permit) = tokio::task::spawn_blocking(move || {
+                    (dns_lookup::lookup_addr(&reverse_ip), permit)
+                })
+                .await
+                .ok()?;
+                let hostname = hostname.ok()?;
+                let hostname = hostname.trim_end_matches('.').to_ascii_lowercase();
+                if !hostname.ends_with(suffix) {
+                    return Some(false);
+                }
+                let mut addresses = tokio::net::lookup_host((hostname.as_str(), 80))
+                    .await
+                    .ok()?;
+                Some(addresses.any(|address| address.ip() == ip))
+            })
+            .await;
+            let check = match check {
+                Ok(Some(true)) => CrawlerCheck::Verified,
+                Ok(Some(false)) => CrawlerCheck::Impostor,
+                Ok(None) | Err(_) => CrawlerCheck::Error,
+            };
+            let now = Instant::now();
+            let ttl = if check == CrawlerCheck::Error {
+                Duration::from_secs(60)
+            } else {
+                Duration::from_secs(3600)
+            };
+            let shard = match ip {
+                IpAddr::V4(ip) => usize::from(ip.octets()[3]) % CACHE_SHARDS,
+                IpAddr::V6(ip) => usize::from(ip.octets()[15]) % CACHE_SHARDS,
+            };
+            let mut cache = crawlers[shard]
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            cache.retain(|_, entry| entry.expires > now);
+            if cache.len() >= CACHE_CAPACITY {
+                if let Some(key) = cache.keys().next().copied() {
+                    cache.remove(&key);
+                }
+            }
+            cache.insert(
+                (ip, suffix),
+                TtlEntry {
+                    expires: now + ttl,
+                    value: check,
+                },
+            );
+        });
+        CrawlerCheck::Error
     }
 
     fn signature(&self, data: &[u8]) -> String {
@@ -510,6 +704,7 @@ pub(crate) async fn evaluate<B>(
 ) -> Verdict {
     let path = request.uri().path();
     if policy.mode == BotMode::Off
+        || !policy.is_active(state)
         || policy
             .exempt_paths
             .iter()
@@ -886,14 +1081,157 @@ fn javascript_string(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        BotAction, BotMode, BotPolicy, BotPolicyFile, BotState, CHALLENGE_PATH, evaluate,
-        unix_time, verify_pow,
+        BotAction, BotMode, BotPolicy, BotPolicyFile, BotState, CHALLENGE_PATH, CrawlerCheck,
+        TrafficMeter, TtlEntry, evaluate, javascript_string, unix_time, verify_pow,
     };
     use http::{HeaderMap, HeaderValue, Request, StatusCode, Version, header};
-    use std::{net::SocketAddr, str::FromStr};
+    use std::{
+        net::{IpAddr, SocketAddr},
+        str::FromStr,
+        time::{Duration, Instant},
+    };
 
     fn address(value: &str) -> SocketAddr {
         SocketAddr::from_str(value).unwrap()
+    }
+
+    fn challenge_request(query: &str) -> Request<()> {
+        Request::builder()
+            .uri(format!("{CHALLENGE_PATH}?{query}"))
+            .body(())
+            .unwrap()
+    }
+
+    fn seed_crawler(state: &BotState, ip: IpAddr, value: CrawlerCheck) {
+        const SUFFIX: &str = ".googlebot.com";
+        let shard = state.shard(ip);
+        state.crawlers[shard].lock().unwrap().insert(
+            (ip, SUFFIX),
+            TtlEntry {
+                expires: Instant::now() + Duration::from_secs(60),
+                value,
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn crawler_cache_miss_returns_without_waiting_for_dns_capacity() {
+        let state = BotState::new().unwrap();
+        let permits = (0..16)
+            .map(|_| state.crawler_dns_slots.clone().try_acquire_owned().unwrap())
+            .collect::<Vec<_>>();
+        let ip = IpAddr::from([192, 0, 2, 1]);
+        let started = Instant::now();
+
+        assert_eq!(
+            state.crawler_check(ip, ".googlebot.com").await,
+            CrawlerCheck::Error
+        );
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert_eq!(
+            state.crawlers[state.shard(ip)]
+                .lock()
+                .unwrap()
+                .get(&(ip, ".googlebot.com"))
+                .map(|entry| entry.value),
+            Some(CrawlerCheck::Error)
+        );
+        drop(permits);
+    }
+
+    fn signed_cookie(state: &BotState, ip: IpAddr, expires: u64) -> String {
+        format!(
+            "charlotte_bot={expires}.{}",
+            state.cookie_value(ip, expires)
+        )
+    }
+
+    #[test]
+    fn traffic_meter_counts_only_requests_inside_the_window() {
+        let meter = TrafficMeter::new();
+        meter.record_request_at(10);
+        meter.record_request_at(10);
+        meter.record_request_at(11);
+
+        assert_eq!(meter.rate_over_at(2, 11), 3);
+        assert_eq!(meter.rate_over_at(1, 11), 1);
+        assert_eq!(meter.rate_over_at(1, 12), 0);
+        assert_eq!(meter.rate_over_at(60, 11), 3);
+    }
+
+    #[test]
+    fn busy_gate_activates_and_remains_active_for_its_cooldown() {
+        let policy = BotPolicy::parse(BotPolicyFile {
+            busy_threshold: Some("2/s".to_owned()),
+            busy_window: 1,
+            busy_cooldown: 3,
+            ..BotPolicyFile::default()
+        })
+        .unwrap();
+        let state = BotState::new().unwrap();
+        let gate = policy.busy.as_ref().unwrap();
+        state.traffic.record_request_at(10);
+        state.traffic.record_request_at(10);
+
+        assert!(gate.is_active_at(&state, 10));
+        assert!(gate.is_active_at(&state, 12));
+        assert!(!gate.is_active_at(&state, 13));
+    }
+
+    #[tokio::test]
+    async fn inactive_busy_gate_skips_scoring() {
+        let policy = BotPolicy::parse(BotPolicyFile {
+            busy_threshold: Some("1/s".to_owned()),
+            verify_crawlers: false,
+            ..BotPolicyFile::default()
+        })
+        .unwrap();
+        let state = BotState::new().unwrap();
+        let scanner = Request::builder()
+            .header("user-agent", "nuclei/3.0")
+            .body(())
+            .unwrap();
+
+        assert_eq!(
+            evaluate(&policy, &state, &scanner, address("192.0.2.18:80"), None)
+                .await
+                .action,
+            BotAction::Allow
+        );
+    }
+
+    #[test]
+    fn busy_gate_rejects_invalid_rate_and_window_values() {
+        for threshold in ["0/s", "20", "10/sec", "-1/m", "5/d"] {
+            assert!(
+                BotPolicy::parse(BotPolicyFile {
+                    busy_threshold: Some(threshold.to_owned()),
+                    ..BotPolicyFile::default()
+                })
+                .is_err(),
+                "accepted threshold {threshold}"
+            );
+        }
+        for file in [
+            BotPolicyFile {
+                busy_window: 0,
+                ..BotPolicyFile::default()
+            },
+            BotPolicyFile {
+                busy_window: 61,
+                ..BotPolicyFile::default()
+            },
+            BotPolicyFile {
+                busy_cooldown: 0,
+                ..BotPolicyFile::default()
+            },
+            BotPolicyFile {
+                busy_cooldown: 24 * 3600 + 1,
+                ..BotPolicyFile::default()
+            },
+        ] {
+            assert!(BotPolicy::parse(file).is_err());
+        }
     }
 
     #[tokio::test]
@@ -1022,6 +1360,509 @@ mod tests {
             })
             .is_ok()
         );
+    }
+
+    #[test]
+    fn rejects_invalid_policy_thresholds_ttls_patterns_ips_and_paths() {
+        let invalid_policies = [
+            BotPolicyFile {
+                challenge_threshold: 81,
+                block_threshold: 80,
+                ..BotPolicyFile::default()
+            },
+            BotPolicyFile {
+                challenge_threshold: 0,
+                ..BotPolicyFile::default()
+            },
+            BotPolicyFile {
+                block_threshold: 101,
+                ..BotPolicyFile::default()
+            },
+            BotPolicyFile {
+                challenge_ttl: 0,
+                ..BotPolicyFile::default()
+            },
+            BotPolicyFile {
+                honeypot_ban: 30 * 24 * 3600 + 1,
+                ..BotPolicyFile::default()
+            },
+            BotPolicyFile {
+                allow_user_agents: vec![String::new()],
+                ..BotPolicyFile::default()
+            },
+            BotPolicyFile {
+                deny_ips: vec!["not-an-ip".to_owned()],
+                ..BotPolicyFile::default()
+            },
+            BotPolicyFile {
+                exempt_paths: vec!["health".to_owned()],
+                ..BotPolicyFile::default()
+            },
+        ];
+        for file in invalid_policies {
+            assert!(BotPolicy::parse(file).is_err());
+        }
+
+        assert!(serde_yaml_ng::from_str::<BotPolicyFile>("unknown_option: true").is_err());
+    }
+
+    #[tokio::test]
+    async fn explicit_rules_deny_and_allow_ip_bypasses_bot_checks() {
+        let state = BotState::new().unwrap();
+        let denied = BotPolicy::parse(BotPolicyFile {
+            deny_ips: vec!["192.0.2.0/24".to_owned()],
+            allow_user_agents: vec!["nuclei".to_owned()],
+            ..BotPolicyFile::default()
+        })
+        .unwrap();
+        let scanner = Request::builder()
+            .header("user-agent", "nuclei/3.0")
+            .body(())
+            .unwrap();
+        let verdict = evaluate(&denied, &state, &scanner, address("192.0.2.10:80"), None).await;
+        assert_eq!(verdict.action, BotAction::Block);
+        assert!(verdict.reasons.contains(&"explicit deny rule"));
+
+        let denied_user_agent = BotPolicy::parse(BotPolicyFile {
+            deny_user_agents: vec!["nuclei".to_owned()],
+            allow_user_agents: vec!["nuclei".to_owned()],
+            ..BotPolicyFile::default()
+        })
+        .unwrap();
+        assert_eq!(
+            evaluate(
+                &denied_user_agent,
+                &state,
+                &scanner,
+                address("192.0.2.10:81"),
+                None
+            )
+            .await
+            .action,
+            BotAction::Block
+        );
+
+        let allowed_ip = BotPolicy::parse(BotPolicyFile {
+            allow_ips: vec!["192.0.2.0/24".to_owned()],
+            honeypot_paths: vec!["/trap".to_owned()],
+            ..BotPolicyFile::default()
+        })
+        .unwrap();
+        let trap = Request::builder()
+            .uri("/trap")
+            .header("user-agent", "nuclei/3.0")
+            .body(())
+            .unwrap();
+        assert_eq!(
+            evaluate(&allowed_ip, &state, &trap, address("192.0.2.11:80"), None)
+                .await
+                .action,
+            BotAction::Allow
+        );
+        assert!(!state.banned("192.0.2.11".parse().unwrap(), Instant::now()));
+    }
+
+    #[tokio::test]
+    async fn off_and_log_modes_have_expected_honeypot_and_browser_actions() {
+        let state = BotState::new().unwrap();
+        let off = BotPolicy::parse(BotPolicyFile {
+            mode: BotMode::Off,
+            honeypot_paths: vec!["/trap".to_owned()],
+            ..BotPolicyFile::default()
+        })
+        .unwrap();
+        let trap = Request::builder().uri("/trap").body(()).unwrap();
+        assert_eq!(
+            evaluate(&off, &state, &trap, address("192.0.2.12:80"), None)
+                .await
+                .action,
+            BotAction::Allow
+        );
+
+        let log = BotPolicy::parse(BotPolicyFile {
+            mode: BotMode::Log,
+            honeypot_paths: vec!["/trap".to_owned()],
+            verify_crawlers: false,
+            ..BotPolicyFile::default()
+        })
+        .unwrap();
+        assert_eq!(
+            evaluate(&log, &state, &trap, address("192.0.2.13:80"), None)
+                .await
+                .action,
+            BotAction::Log
+        );
+        let browser = Request::builder()
+            .header("user-agent", "Mozilla/5.0 Chrome/130.0")
+            .header("accept", "text/html")
+            .header("accept-language", "en-US")
+            .body(())
+            .unwrap();
+        assert_eq!(
+            evaluate(&log, &state, &browser, address("192.0.2.14:80"), None)
+                .await
+                .action,
+            BotAction::Allow
+        );
+    }
+
+    #[tokio::test]
+    async fn builtins_challenge_toggle_custom_threshold_and_empty_user_agent_are_covered() {
+        let state = BotState::new().unwrap();
+        let scanner = Request::builder()
+            .header("user-agent", "nuclei/3.0")
+            .body(())
+            .unwrap();
+        let no_builtins = BotPolicy::parse(BotPolicyFile {
+            builtin_rules: false,
+            verify_crawlers: false,
+            ..BotPolicyFile::default()
+        })
+        .unwrap();
+        assert_eq!(
+            evaluate(
+                &no_builtins,
+                &state,
+                &scanner,
+                address("192.0.2.15:80"),
+                None
+            )
+            .await
+            .action,
+            BotAction::Allow
+        );
+
+        let no_challenge = BotPolicy::parse(BotPolicyFile {
+            challenge: false,
+            verify_crawlers: false,
+            ..BotPolicyFile::default()
+        })
+        .unwrap();
+        let automation = Request::builder()
+            .header("user-agent", "curl/8.0")
+            .body(())
+            .unwrap();
+        assert_eq!(
+            evaluate(
+                &no_challenge,
+                &state,
+                &automation,
+                address("192.0.2.16:80"),
+                None
+            )
+            .await
+            .action,
+            BotAction::Allow
+        );
+        assert_eq!(
+            evaluate(
+                &no_challenge,
+                &state,
+                &scanner,
+                address("192.0.2.17:80"),
+                None
+            )
+            .await
+            .action,
+            BotAction::Block
+        );
+
+        let custom_threshold = BotPolicy::parse(BotPolicyFile {
+            challenge_threshold: 30,
+            verify_crawlers: false,
+            ..BotPolicyFile::default()
+        })
+        .unwrap();
+        let browser = Request::builder()
+            .header("user-agent", "Mozilla/5.0 Chrome/130.0")
+            .body(())
+            .unwrap();
+        assert_eq!(
+            evaluate(
+                &custom_threshold,
+                &state,
+                &browser,
+                address("192.0.2.18:80"),
+                None
+            )
+            .await
+            .action,
+            BotAction::Challenge
+        );
+        let empty = Request::new(());
+        assert_eq!(
+            evaluate(
+                &custom_threshold,
+                &state,
+                &empty,
+                address("192.0.2.19:80"),
+                None
+            )
+            .await
+            .action,
+            BotAction::Challenge
+        );
+    }
+
+    #[tokio::test]
+    async fn ja4_rules_and_chromium_fingerprint_signals_are_applied() {
+        let state = BotState::new().unwrap();
+        let fingerprint = crate::ja4::ClientHelloInfo {
+            ja4: "test-fingerprint".to_owned(),
+            max_version: 0x0301,
+            ciphers: Vec::new(),
+            extensions: Vec::new(),
+            alpn: Vec::new(),
+            sig_algs: Vec::new(),
+            sni: None,
+            grease: false,
+        };
+        let automation = Request::builder()
+            .header("user-agent", "curl/8.0")
+            .body(())
+            .unwrap();
+        let ja4_allow = BotPolicy::parse(BotPolicyFile {
+            ja4_allow: vec![fingerprint.ja4.clone()],
+            verify_crawlers: false,
+            ..BotPolicyFile::default()
+        })
+        .unwrap();
+        assert_eq!(
+            evaluate(
+                &ja4_allow,
+                &state,
+                &automation,
+                address("192.0.2.20:80"),
+                Some(&fingerprint)
+            )
+            .await
+            .action,
+            BotAction::Allow
+        );
+
+        let ja4_deny = BotPolicy::parse(BotPolicyFile {
+            ja4_allow: vec![fingerprint.ja4.clone()],
+            ja4_deny: vec![fingerprint.ja4.clone()],
+            verify_crawlers: false,
+            ..BotPolicyFile::default()
+        })
+        .unwrap();
+        assert_eq!(
+            evaluate(
+                &ja4_deny,
+                &state,
+                &automation,
+                address("192.0.2.21:80"),
+                Some(&fingerprint)
+            )
+            .await
+            .action,
+            BotAction::Block
+        );
+
+        let chrome = Request::builder()
+            .header("user-agent", "Mozilla/5.0 Chrome/130.0")
+            .body(())
+            .unwrap();
+        let signals = evaluate(
+            &BotPolicy::parse(BotPolicyFile {
+                verify_crawlers: false,
+                ..BotPolicyFile::default()
+            })
+            .unwrap(),
+            &state,
+            &chrome,
+            address("192.0.2.22:80"),
+            Some(&fingerprint),
+        )
+        .await;
+        assert!(signals.reasons.contains(&"Chromium JA4 lacks GREASE"));
+        assert!(signals.reasons.contains(&"browser negotiated old TLS"));
+        assert!(signals.reasons.contains(&"browser JA4 lacks browser ALPN"));
+        assert!(signals.score >= 100);
+        assert_eq!(signals.action, BotAction::Block);
+    }
+
+    #[tokio::test]
+    async fn crawler_verification_uses_cached_results_and_obeys_explicit_denies() {
+        let state = BotState::new().unwrap();
+        let client = address("192.0.2.23:80");
+        let crawler = Request::builder()
+            .header("user-agent", "Googlebot/2.1")
+            .body(())
+            .unwrap();
+        let policy = BotPolicy::default_enforcing();
+        seed_crawler(&state, client.ip(), CrawlerCheck::Impostor);
+        assert_eq!(
+            evaluate(&policy, &state, &crawler, client, None)
+                .await
+                .action,
+            BotAction::Block
+        );
+
+        seed_crawler(&state, client.ip(), CrawlerCheck::Verified);
+        assert_eq!(
+            evaluate(&policy, &state, &crawler, client, None)
+                .await
+                .action,
+            BotAction::Allow
+        );
+        let denied = BotPolicy::parse(BotPolicyFile {
+            deny_user_agents: vec!["googlebot".to_owned()],
+            ..BotPolicyFile::default()
+        })
+        .unwrap();
+        assert_eq!(
+            evaluate(&denied, &state, &crawler, client, None)
+                .await
+                .action,
+            BotAction::Block
+        );
+
+        let skip_verification = BotPolicy::parse(BotPolicyFile {
+            verify_crawlers: false,
+            ..BotPolicyFile::default()
+        })
+        .unwrap();
+        assert_eq!(
+            evaluate(
+                &skip_verification,
+                &state,
+                &crawler,
+                address("192.0.2.24:80"),
+                None
+            )
+            .await
+            .action,
+            BotAction::Allow
+        );
+    }
+
+    #[test]
+    fn bans_are_per_ip_and_expired_entries_are_removed() {
+        let state = BotState::new().unwrap();
+        let first: IpAddr = "192.0.2.25".parse().unwrap();
+        let second: IpAddr = "192.0.2.26".parse().unwrap();
+        let now = Instant::now();
+        state.ban(first, Duration::from_secs(60), now);
+        assert!(state.banned(first, now));
+        assert!(!state.banned(second, now));
+
+        let expired_at = now - Duration::from_secs(2);
+        state.ban(second, Duration::from_secs(1), expired_at);
+        assert!(!state.banned(second, now));
+    }
+
+    #[test]
+    fn cookies_validate_prefix_tampering_expiry_and_malformed_values() {
+        let state = BotState::new().unwrap();
+        let client: IpAddr = "192.0.2.17".parse().unwrap();
+        let expires = unix_time() + 60;
+        let cookie = signed_cookie(&state, client, expires);
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, HeaderValue::from_str(&cookie).unwrap());
+        assert!(state.has_valid_cookie(&headers, "192.0.2.99".parse().unwrap()));
+        assert!(!state.has_valid_cookie(&headers, "192.0.3.17".parse().unwrap()));
+
+        let mut tampered = cookie.clone();
+        let last = tampered.pop().unwrap();
+        tampered.push(if last == '0' { '1' } else { '0' });
+        headers.insert(header::COOKIE, HeaderValue::from_str(&tampered).unwrap());
+        assert!(!state.has_valid_cookie(&headers, client));
+
+        for expires in [
+            unix_time().saturating_sub(1),
+            unix_time().saturating_add(7 * 24 * 3600 + 1),
+        ] {
+            let expired_or_future = signed_cookie(&state, client, expires);
+            headers.insert(
+                header::COOKIE,
+                HeaderValue::from_str(&expired_or_future).unwrap(),
+            );
+            assert!(!state.has_valid_cookie(&headers, client));
+        }
+        for malformed in [
+            "charlotte_bot=malformed",
+            "charlotte_bot=nope.sig",
+            "other=x",
+        ] {
+            headers.insert(header::COOKIE, HeaderValue::from_str(malformed).unwrap());
+            assert!(!state.has_valid_cookie(&headers, client));
+        }
+
+        let ipv6: IpAddr = "2001:db8:1:2::1".parse().unwrap();
+        let ipv6_cookie = signed_cookie(&state, ipv6, unix_time() + 60);
+        headers.insert(header::COOKIE, HeaderValue::from_str(&ipv6_cookie).unwrap());
+        assert!(state.has_valid_cookie(&headers, "2001:db8:1:2::abcd".parse().unwrap()));
+        assert!(!state.has_valid_cookie(&headers, "2001:db8:1:3::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn challenge_rejects_missing_or_invalid_parameters_and_weak_proofs() {
+        let state = BotState::new().unwrap();
+        let client = address("192.0.2.27:8080");
+        for query in ["", "exp=1", "exp=1&seed=x", "exp=1&seed=x&nonce=0"] {
+            assert_eq!(
+                state
+                    .solve_challenge(&challenge_request(query), client, false, 4, 3600)
+                    .status,
+                StatusCode::FORBIDDEN
+            );
+        }
+
+        let expires = unix_time() + 60;
+        let seed = state.expected_seed(client.ip(), expires);
+        let weak_nonce = (0_u64..)
+            .find(|nonce| !verify_pow(&seed, &nonce.to_string(), 24))
+            .unwrap();
+        let invalid_queries = [
+            format!("exp={expires}&seed=wrong&nonce=0&return=%2F"),
+            format!("exp={expires}&seed={seed}&nonce=bad&return=%2F"),
+            format!("exp={expires}&seed={seed}&nonce=0&return=%2F%2Fevil"),
+            format!("exp={expires}&seed={seed}&nonce=0&return=%2F%5Cevil"),
+            format!("exp={expires}&seed={seed}&nonce=0&return=%GG"),
+            format!("exp={expires}&seed={seed}&nonce={weak_nonce}&return=%2F"),
+        ];
+        for query in invalid_queries {
+            assert_eq!(
+                state
+                    .solve_challenge(&challenge_request(&query), client, false, 24, 3600)
+                    .status,
+                StatusCode::FORBIDDEN,
+                "accepted query {query}"
+            );
+        }
+    }
+
+    #[test]
+    fn successful_challenges_set_secure_only_for_tls_and_escape_script_text() {
+        let state = BotState::new().unwrap();
+        let client = address("192.0.2.28:8080");
+        let expires = unix_time() + 60;
+        let seed = state.expected_seed(client.ip(), expires);
+        let nonce = (0_u64..)
+            .find(|nonce| verify_pow(&seed, &nonce.to_string(), 4))
+            .unwrap();
+        let query = format!("exp={expires}&seed={seed}&nonce={nonce}&return=%2Fwelcome");
+        let secure = state.solve_challenge(&challenge_request(&query), client, true, 4, 3600);
+        assert_eq!(secure.status, StatusCode::SEE_OTHER);
+        assert!(secure.set_cookie.unwrap().ends_with("; Secure"));
+        let plain = state.solve_challenge(&challenge_request(&query), client, false, 4, 3600);
+        assert_eq!(plain.status, StatusCode::SEE_OTHER);
+        assert!(!plain.set_cookie.unwrap().contains("; Secure"));
+
+        assert_eq!(javascript_string("</script>'\""), "\\x3c/script\\x3e\\'\"");
+        let challenge = state.challenge(
+            &Request::builder()
+                .uri("/?q=%3C%2Fscript%3E%27%22")
+                .body(())
+                .unwrap(),
+            client,
+            4,
+            60,
+        );
+        assert_eq!(challenge.body.matches("</script>").count(), 1);
+        assert!(challenge.body.contains("%3C%2Fscript%3E%27%22"));
     }
 
     #[test]

@@ -207,9 +207,12 @@ pub(crate) struct DirectPeer(pub SocketAddr);
 
 #[cfg(test)]
 mod tests {
-    use super::{DirectPeer, TrustedProxy, resolve, sanitize};
+    use super::{DirectPeer, MAX_FORWARDED_HOPS, TrustedProxy, resolve, sanitize};
     use http::{HeaderMap, HeaderValue};
-    use std::{net::SocketAddr, str::FromStr};
+    use std::{
+        net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+        str::FromStr,
+    };
 
     fn peer(value: &str) -> SocketAddr {
         value.parse().unwrap()
@@ -220,6 +223,131 @@ mod tests {
             .iter()
             .map(|value| TrustedProxy::from_str(value).unwrap())
             .collect()
+    }
+
+    #[test_fuzz::test_fuzz]
+    fn trusted_proxy_spec(value: String) {
+        if let Ok(proxy) = TrustedProxy::from_str(&value) {
+            let width = match proxy.network {
+                IpAddr::V4(_) => 32,
+                IpAddr::V6(_) => 128,
+            };
+            assert!(proxy.prefix <= width);
+            assert!(proxy.contains(proxy.network));
+
+            let address = value
+                .split_once('/')
+                .map_or(value.as_str(), |(address, _)| address);
+            if let Ok(address) = address.parse::<IpAddr>() {
+                assert!(proxy.contains(address));
+            }
+        }
+    }
+
+    #[test]
+    fn fuzz_seed_trusted_proxy_spec() {
+        trusted_proxy_spec("192.0.2.1".to_owned());
+        trusted_proxy_spec("10.2.3.4/8".to_owned());
+        trusted_proxy_spec("2001:db8::1/64".to_owned());
+        trusted_proxy_spec("::ffff:192.0.2.1/120".to_owned());
+        trusted_proxy_spec("192.0.2.1/33".to_owned());
+    }
+
+    #[test_fuzz::test_fuzz]
+    fn forwarded_resolve(
+        peer_bytes: Vec<u8>,
+        peer_port: u16,
+        header_values: Vec<Vec<u8>>,
+        proxy_values: Vec<String>,
+    ) {
+        let peer_ip = match peer_bytes.as_slice() {
+            [a, b, c, d] => IpAddr::V4(Ipv4Addr::from([*a, *b, *c, *d])),
+            bytes if bytes.len() == 16 => {
+                let bytes = <[u8; 16]>::try_from(bytes).expect("length was checked");
+                IpAddr::V6(Ipv6Addr::from(bytes))
+            }
+            _ => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        };
+        let peer = SocketAddr::new(peer_ip, peer_port);
+        let mut headers = HeaderMap::new();
+        for value in header_values {
+            if let Ok(value) = HeaderValue::from_bytes(&value) {
+                headers.append("x-forwarded-for", value);
+            }
+        }
+        let trusted_proxies = proxy_values
+            .iter()
+            .filter_map(|value| TrustedProxy::from_str(value).ok())
+            .collect::<Vec<_>>();
+        let peer_is_trusted = trusted_proxies
+            .iter()
+            .any(|proxy| proxy.contains(peer.ip()));
+
+        let (client, chain) = resolve(peer, &headers, &trusted_proxies);
+        if !peer_is_trusted {
+            assert_eq!((client, chain), (peer, None));
+            return;
+        }
+
+        let Some(chain) = chain else {
+            assert_eq!(client, peer);
+            return;
+        };
+
+        let chain_addresses = chain
+            .split(", ")
+            .map(|address| {
+                address
+                    .parse::<IpAddr>()
+                    .expect("resolved chain contains IPs")
+            })
+            .collect::<Vec<_>>();
+        assert!(!chain_addresses.is_empty());
+        assert!(chain_addresses.len() <= MAX_FORWARDED_HOPS);
+        assert!(HeaderValue::from_str(&chain).is_ok());
+        assert!(chain_addresses.contains(&client.ip()));
+        if trusted_proxies
+            .iter()
+            .any(|proxy| proxy.contains(client.ip()))
+        {
+            assert!(
+                chain_addresses.iter().all(|address| {
+                    trusted_proxies.iter().any(|proxy| proxy.contains(*address))
+                })
+            );
+        }
+
+        let mut sanitized = headers;
+        sanitize(&mut sanitized, Some(&chain));
+        let sanitized_values = sanitized.get_all("x-forwarded-for");
+        assert_eq!(sanitized_values.iter().count(), 1);
+        assert_eq!(
+            sanitized_values.iter().next().unwrap().as_bytes(),
+            chain.as_bytes()
+        );
+    }
+
+    #[test]
+    fn fuzz_seed_forwarded_resolve() {
+        forwarded_resolve(
+            vec![127, 0, 0, 1],
+            8080,
+            vec![b"203.0.113.9".to_vec(), b"10.0.0.2".to_vec()],
+            vec!["127.0.0.1".to_owned(), "10.0.0.0/8".to_owned()],
+        );
+        forwarded_resolve(
+            vec![198, 51, 100, 4],
+            54321,
+            vec![b"203.0.113.9".to_vec()],
+            vec!["127.0.0.1".to_owned()],
+        );
+        forwarded_resolve(
+            vec![0; 16],
+            443,
+            vec![b"invalid, [2001:db8::1]:4321".to_vec()],
+            vec!["::/0".to_owned()],
+        );
+        forwarded_resolve(vec![1, 2, 3], 80, vec![vec![0xff]], vec!["bad".to_owned()]);
     }
 
     #[test]
