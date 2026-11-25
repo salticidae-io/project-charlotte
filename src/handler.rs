@@ -988,27 +988,42 @@ mod tests {
         tokio::fs::write(root.join("cached.txt"), "first")
             .await
             .unwrap();
-        let mut config = try_files_config(root.clone(), &[]);
-        config.static_cache_ttl = std::time::Duration::from_millis(200);
-        let config = Arc::new(config);
-        let fetch = || async {
+        // A long lifetime keeps the hit deterministic on slow machines; expiry
+        // is checked through a second config for the same root (and therefore
+        // the same cache key) whose lifetime has certainly elapsed.
+        let mut long_lived = try_files_config(root.clone(), &[]);
+        long_lived.static_cache_ttl = std::time::Duration::from_secs(3600);
+        let mut short_lived = try_files_config(root.clone(), &[]);
+        short_lived.static_cache_ttl = std::time::Duration::from_millis(1);
+        let long_lived = Arc::new(long_lived);
+        let short_lived = Arc::new(short_lived);
+        let fetch = |config: Arc<crate::config::Config>| async move {
             let request = http::Request::builder()
                 .uri("/cached.txt")
                 .body(Full::new(Bytes::new()))
                 .unwrap();
             let (peer, local) = fuzz_support::addresses();
-            let response = super::handle_request(request, Arc::clone(&config), peer, local).await;
+            let response = super::handle_request(request, config, peer, local).await;
             assert_eq!(response.status(), http::StatusCode::OK);
             response.into_body().collect().await.unwrap().to_bytes()
         };
 
-        assert_eq!(fetch().await, Bytes::from_static(b"first"));
+        assert_eq!(
+            fetch(Arc::clone(&long_lived)).await,
+            Bytes::from_static(b"first")
+        );
         tokio::fs::write(root.join("cached.txt"), "second!")
             .await
             .unwrap();
-        assert_eq!(fetch().await, Bytes::from_static(b"first"));
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-        assert_eq!(fetch().await, Bytes::from_static(b"second!"));
+        assert_eq!(
+            fetch(Arc::clone(&long_lived)).await,
+            Bytes::from_static(b"first")
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert_eq!(
+            fetch(Arc::clone(&short_lived)).await,
+            Bytes::from_static(b"second!")
+        );
 
         tokio::fs::remove_dir_all(root).await.unwrap();
     }
