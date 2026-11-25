@@ -63,6 +63,16 @@ fn blank_lines(count: usize) -> String {
     "\n".repeat(count)
 }
 
+/// Menu number of "Reverse proxy"; the three hosted site types precede it
+/// only when hosting is compiled in.
+fn proxy_site_choice() -> &'static str {
+    if project_charlotte::configure_support::HOSTING_ENABLED {
+        "4"
+    } else {
+        "1"
+    }
+}
+
 const CURATED_SERVER_OPTIONS: &[&str] = &[
     "bind",
     "no_plain_http",
@@ -158,7 +168,7 @@ fn server_options_answers(
     if configure_vhost {
         answers.extend([
             "combined.example".to_owned(),
-            "4".to_owned(), // reverse proxy
+            proxy_site_choice().to_owned(), // reverse proxy
             "http://127.0.0.1:3000".to_owned(),
         ]);
         answers.extend((0..12).map(|_| String::new()));
@@ -172,7 +182,8 @@ fn proxy_vhost_output_is_validated_by_the_server() {
     let temp = TempDir::new();
     let output_path = temp.path().join("proxy.yaml");
     let answers = format!(
-        "proxy.example\n4\nhttp://127.0.0.1:3000\n{}",
+        "proxy.example\n{}\nhttp://127.0.0.1:3000\n{}",
+        proxy_site_choice(),
         blank_lines(12)
     );
     let output = run_configure(&[], &answers);
@@ -194,7 +205,10 @@ fn proxy_vhost_output_is_validated_by_the_server() {
     );
     assert!(parsed["vhost"][0].get("proxy_preserve_host").is_none());
     assert!(parsed["vhost"][0].get("proxy_http2").is_none());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("  4) Reverse proxy"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains(&format!("  {}) Reverse proxy", proxy_site_choice()))
+    );
 
     let checked = Command::new(env!("CARGO_BIN_EXE_project-charlotte"))
         .args(["--check-config", "--config"])
@@ -356,7 +370,8 @@ fn invalid_core_answers_are_rejected_and_reasked() {
     let temp = TempDir::new();
     let output_path = temp.path().join("reasked.yaml");
     let answers = format!(
-        "bad name\n99\n4\nnot an upstream\nbad name\n\nhttp://127.0.0.1:3000\ngood.example\n\n\n{}",
+        "bad name\n99\n{}\nnot an upstream\nbad name\n\nhttp://127.0.0.1:3000\ngood.example\n\n\n{}",
+        proxy_site_choice(),
         blank_lines(12)
     );
     let output = run_configure(&["--output", output_path.to_str().unwrap()], &answers);
@@ -505,7 +520,7 @@ fn proxy_advanced_bot_and_log_formats_are_emitted() {
     let output_path = temp.path().join("bot-proxy.yaml");
     let mut answers = vec![
         "bot-proxy.example".to_owned(),
-        "4".to_owned(),
+        proxy_site_choice().to_owned(),
         "http://127.0.0.1:3000".to_owned(),
         String::new(),  // preserve host default
         String::new(),  // HTTP/2 default remains off
