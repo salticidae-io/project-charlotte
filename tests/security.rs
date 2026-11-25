@@ -281,7 +281,8 @@ async fn root_helper_restricts_new_log_paths_after_master_drops_privileges() {
     let stderr_path = base.join("server.stderr");
     let stderr_file = fs::File::create(&stderr_path).unwrap();
     let address = common::reserve_tcp_address();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_project-charlotte"));
+    let binary = common::worker_accessible_server_binary(base);
+    let mut command = Command::new(binary);
     command
         .arg("--user")
         .arg(&user.name)
