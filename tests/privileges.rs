@@ -109,7 +109,8 @@ fn master_drop_uses_target_groups_and_removes_identity_capabilities() {
     let root = temp_root("master-groups");
     fs::write(root.join("index.html"), "ready").unwrap();
     let address = common::reserve_tcp_address();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_project-charlotte"));
+    let binary = common::worker_accessible_server_binary(&root);
+    let mut command = Command::new(binary);
     command
         .arg("--user")
         .arg(&user.name)
@@ -163,7 +164,8 @@ async fn hosted_worker_uses_the_configured_users_supplementary_groups() {
     )
     .unwrap();
     let address = common::reserve_tcp_address();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_project-charlotte"));
+    let binary = common::worker_accessible_server_binary(&base);
+    let mut command = Command::new(binary);
     command
         .arg("--bind")
         .arg(address.to_string())
@@ -257,7 +259,8 @@ async fn hosted_worker_joins_its_configured_cgroup_before_exec() {
     )
     .unwrap();
     let address = common::reserve_tcp_address();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_project-charlotte"));
+    let binary = common::worker_accessible_server_binary(&base);
+    let mut command = Command::new(binary);
     command
         .arg("--user")
         .arg(&user.name)

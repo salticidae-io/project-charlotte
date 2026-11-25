@@ -5,6 +5,8 @@
 use std::{
     fs,
     net::{SocketAddr, TcpListener, UdpSocket},
+    os::unix::fs::{MetadataExt, PermissionsExt},
+    path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Output, Stdio},
     sync::Mutex,
     thread::sleep,
@@ -68,6 +70,58 @@ pub fn output(command: &mut Command) -> std::io::Result<Output> {
 pub fn status(command: &mut Command) -> std::io::Result<ExitStatus> {
     let mut child = spawn(command)?;
     child.wait()
+}
+
+#[allow(dead_code)]
+pub fn worker_accessible_server_binary(dir: &Path) -> PathBuf {
+    fs::create_dir_all(dir).unwrap_or_else(|error| {
+        panic!(
+            "could not create worker binary directory {}: {error}",
+            dir.display()
+        )
+    });
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).unwrap_or_else(|error| {
+        panic!(
+            "could not make worker binary directory {} accessible: {error}",
+            dir.display()
+        )
+    });
+
+    let canonical_dir = fs::canonicalize(dir).unwrap_or_else(|error| {
+        panic!(
+            "could not resolve worker binary directory {}: {error}",
+            dir.display()
+        )
+    });
+    for ancestor in canonical_dir.ancestors() {
+        let metadata = fs::metadata(ancestor).unwrap_or_else(|error| {
+            panic!(
+                "could not inspect worker binary path {}: {error}",
+                ancestor.display()
+            )
+        });
+        assert_ne!(
+            metadata.mode() & 0o001,
+            0,
+            "worker user cannot traverse {} (other-execute permission is required)",
+            ancestor.display()
+        );
+    }
+
+    let binary = canonical_dir.join("project-charlotte-worker-binary");
+    fs::copy(env!("CARGO_BIN_EXE_project-charlotte"), &binary).unwrap_or_else(|error| {
+        panic!(
+            "could not copy server binary to {}: {error}",
+            binary.display()
+        )
+    });
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap_or_else(|error| {
+        panic!(
+            "could not make worker binary {} executable: {error}",
+            binary.display()
+        )
+    });
+    binary
 }
 
 /// Stops a spawned webserver without orphaning the processes it started.

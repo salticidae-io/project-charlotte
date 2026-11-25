@@ -954,6 +954,9 @@ built with, for example
 `cargo test --no-default-features --features proxy,acme,http3`. On Linux, the
 root-only tests are marked ignored in ordinary runs; after building as the
 normal user, run them with `sudo -E env PATH="$PATH" cargo test -- --ignored`.
+The privileged tests copy the server executable into a temporary directory so
+workers running as other accounts can execute it; that directory and its
+ancestors must be traversable by those accounts.
 Fuzz target setup, seed tests, and target commands are documented in
 [FUZZING.md](FUZZING.md); the fuzz targets need the default features.
 

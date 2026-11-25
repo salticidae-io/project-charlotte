@@ -317,7 +317,8 @@ async fn root_helper_opens_vhost_logs_after_master_drops_privileges() {
     )
     .unwrap();
     let address = common::reserve_tcp_address();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_project-charlotte"));
+    let binary = common::worker_accessible_server_binary(&base);
+    let mut command = Command::new(binary);
     command
         .arg("--user")
         .arg(&user.name)
@@ -380,7 +381,7 @@ async fn root_helper_opens_vhost_logs_after_master_drops_privileges() {
     }
 
     let response = get(address, "/noisy.cgi", "logs.example.test").await;
-    assert!(response.starts_with(b"HTTP/1.1 200"));
+    assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
     let access = wait_for_line(&vhost_log, "noisy.cgi").await;
     assert!(
         access.contains("logs.example.test 200 /noisy.cgi"),
