@@ -34,6 +34,7 @@ mod response;
 #[cfg(feature = "swarm")]
 mod swarm;
 mod tls;
+mod traffic;
 mod vhost;
 mod waf;
 #[cfg(feature = "hosting")]

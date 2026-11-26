@@ -300,6 +300,7 @@ async fn handle_request(request: Request<Incoming>, state: ControlState) -> Resp
                 "uptime_seconds": state.started.elapsed().as_secs(),
                 "vhosts": state.router.control_vhost_count(),
                 "version": env!("CARGO_PKG_VERSION"),
+                "traffic": state.router.control_traffic(),
             }),
         ),
         "/vhosts" if method == Method::GET => json_response(

@@ -28,7 +28,8 @@ headless validation mode.
   provisioning and renewal, and HTTP/3 over QUIC.
 - Optional Redis-backed swarm access checks, plus per-client rate limiting and
   bot detection with proof-of-work challenges.
-- A local Unix-socket control API (`charlotte-ctl`), worker cgroup v2 settings,
+- A local Unix-socket control API (`charlotte-ctl`), a web administration and
+  traffic-statistics UI (`charlotte-admin`), worker cgroup v2 settings,
   and tools to convert Apache/nginx configurations or interactively create a
   vhost (`apache2charlotte`, `nginx2charlotte`, and `charlotte-configure`).
 - A configuration validator (`--check-config`) and watched virtual-host file
@@ -419,7 +420,14 @@ validates the change against the complete vhost configuration, including
 duplicate names and worker setup, before atomically writing a mode-`0640` YAML
 file and switching the running router. Invalid changes leave both the file and
 the active configuration unchanged. `GET /status` reports uptime, vhost count,
-and version; it is the read-only starting point for future server statistics.
+version, and a `traffic` object with process-lifetime counters: `total` for
+the whole server and `vhosts` keyed by each vhost's primary server name. Each
+entry has `requests`, `client_errors` (4xx), `server_errors` (5xx),
+`bytes_in` (request body bytes), and `bytes_out` (response body bytes).
+Requests are counted when dispatched, errors when response headers are
+produced, and bytes as body data is streamed. Requests that match no vhost
+count only towards `total`; control API requests are not counted. Counters
+reset when the server restarts and survive configuration reloads.
 
 ```sh
 curl --unix-socket /run/charlotte/control.sock http://localhost/vhosts
@@ -454,6 +462,44 @@ The API uses `201` for a successful create, `200` for a successful get or
 replace, and `204` for delete. Invalid requests return `400`, missing vhosts
 `404`, create conflicts `409`, oversized bodies `413`, and unavailable mutation
 storage `503`.
+
+### Web administration UI
+
+`charlotte-admin` is a separate process that serves a browser UI on top of the
+control socket: server and per-vhost traffic graphs (requests, 4xx and 5xx per
+second, and inbound/outbound bandwidth), the raw status, and vhost
+list/get/create/replace/delete. It needs read/write access to the control
+socket, so run it as the server's account or a member of its group.
+
+```sh
+CHARLOTTE_ADMIN_PASSWORD='long random secret' charlotte-admin \
+  --bind 127.0.0.1:9090 --base-url https://admin.example.com/charlotte \
+  --socket /run/charlotte/control.sock --allow-ip 127.0.0.1
+```
+
+- `--base-url` (or `CHARLOTTE_ADMIN_BASE_URL`) is the public URL including any
+  path prefix; the UI is served under that prefix. It must be `https://`
+  unless both it and `--bind` are loopback. The process itself speaks plain
+  HTTP, so terminate TLS at a reverse proxy.
+- Authentication: a static password (`--password` or, preferably,
+  `CHARLOTTE_ADMIN_PASSWORD`), Google OAuth (`--google-client-id`,
+  `--google-client-secret` or the `CHARLOTTE_GOOGLE_CLIENT_*` variables, plus
+  one or more `--google-email` allowlist entries; register
+  `<base-url>/oauth/callback` as the redirect URI), or both. Startup fails if
+  neither is fully configured. Google accounts must have a verified email.
+- `--allow-ip` restricts access by TCP peer address (repeatable); by default
+  only loopback peers are accepted. Forwarding headers are ignored, so behind
+  a reverse proxy the proxy's address is what is checked and client
+  restrictions must also be enforced at the proxy.
+- Graphs are built by sampling `GET /status` every `--sample-interval` seconds
+  (default 10) and keeping the last `--history` samples (default 360, one
+  hour) in memory. History starts empty when `charlotte-admin` restarts, and a
+  server restart is shown as a counter reset rather than a spike.
+
+Sessions are in-memory, expire after eight hours, and use `HttpOnly`,
+`SameSite=Lax` cookies (`Secure` over HTTPS). State-changing requests require
+both a matching `Origin` and a per-session CSRF token. There is no built-in
+login rate limiting or audit log.
 
 ### Bot detection
 

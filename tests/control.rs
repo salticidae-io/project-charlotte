@@ -276,6 +276,12 @@ async fn control_socket_validates_persists_and_routes_vhost_crud() {
     assert_eq!(response.status, 200);
     let status: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
     assert_eq!(status["vhosts"], 1);
+    let site_traffic = &status["traffic"]["vhosts"]["control.example"];
+    assert_eq!(site_traffic["requests"], 2);
+    assert_eq!(site_traffic["client_errors"], 0);
+    assert_eq!(site_traffic["server_errors"], 0);
+    assert_eq!(site_traffic["bytes_out"], 2 * b"managed site".len() as u64);
+    assert!(status["traffic"]["total"]["requests"].as_u64().unwrap() >= 2);
     let response = control_request(&fixture.socket, "PATCH", "/vhosts/site", b"").await;
     assert_eq!(response.status, 405);
     let oversized = vec![b' '; 1024 * 1024 + 1];

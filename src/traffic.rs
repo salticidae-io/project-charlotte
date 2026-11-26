@@ -1,0 +1,188 @@
+//! Process-lifetime traffic counters for the whole server and each virtual host.
+//!
+//! Counters are keyed by a vhost's primary name rather than stored on the
+//! vhost itself, so they survive configuration reloads. Only configured names
+//! are used as keys, which keeps the map bounded by the configuration.
+
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+};
+
+use bytes::Bytes;
+use http_body::{Body, Frame};
+
+#[derive(Default)]
+pub(crate) struct Counters {
+    requests: AtomicU64,
+    client_errors: AtomicU64,
+    server_errors: AtomicU64,
+    bytes_in: AtomicU64,
+    bytes_out: AtomicU64,
+}
+
+impl Counters {
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "requests": self.requests.load(Ordering::Relaxed),
+            "client_errors": self.client_errors.load(Ordering::Relaxed),
+            "server_errors": self.server_errors.load(Ordering::Relaxed),
+            "bytes_in": self.bytes_in.load(Ordering::Relaxed),
+            "bytes_out": self.bytes_out.load(Ordering::Relaxed),
+        })
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct Traffic {
+    total: Arc<Counters>,
+    vhosts: Mutex<BTreeMap<String, Arc<Counters>>>,
+}
+
+/// The counters a single request contributes to.
+#[derive(Clone)]
+pub(crate) struct RequestTraffic {
+    total: Arc<Counters>,
+    vhost: Option<Arc<Counters>>,
+}
+
+impl Traffic {
+    /// Records the start of a request routed to `vhost` (if any).
+    pub(crate) fn start(&self, vhost: Option<&str>) -> RequestTraffic {
+        let vhost = vhost.map(|name| {
+            let mut vhosts = self.vhosts.lock().unwrap_or_else(|e| e.into_inner());
+            Arc::clone(vhosts.entry(name.to_owned()).or_default())
+        });
+        let traffic = RequestTraffic {
+            total: Arc::clone(&self.total),
+            vhost,
+        };
+        traffic.each(|counters| counters.requests.fetch_add(1, Ordering::Relaxed));
+        traffic
+    }
+
+    pub(crate) fn snapshot(&self) -> serde_json::Value {
+        let vhosts = self.vhosts.lock().unwrap_or_else(|e| e.into_inner());
+        serde_json::json!({
+            "total": self.total.json(),
+            "vhosts": vhosts
+                .iter()
+                .map(|(name, counters)| (name.clone(), counters.json()))
+                .collect::<serde_json::Map<_, _>>(),
+        })
+    }
+}
+
+impl RequestTraffic {
+    fn each(&self, f: impl Fn(&Counters) -> u64) {
+        f(&self.total);
+        if let Some(vhost) = &self.vhost {
+            f(vhost);
+        }
+    }
+
+    pub(crate) fn status(&self, status: http::StatusCode) {
+        if status.is_client_error() {
+            self.each(|c| c.client_errors.fetch_add(1, Ordering::Relaxed));
+        } else if status.is_server_error() {
+            self.each(|c| c.server_errors.fetch_add(1, Ordering::Relaxed));
+        }
+    }
+
+    fn bytes(&self, inbound: bool, len: usize) {
+        let len = u64::try_from(len).unwrap_or(u64::MAX);
+        self.each(|c| {
+            let counter = if inbound { &c.bytes_in } else { &c.bytes_out };
+            counter.fetch_add(len, Ordering::Relaxed)
+        });
+    }
+}
+
+/// Counts body data frames into request traffic as they are polled.
+pub(crate) struct TrafficBody<B> {
+    inner: std::pin::Pin<Box<B>>,
+    traffic: RequestTraffic,
+    inbound: bool,
+}
+
+impl<B> TrafficBody<B> {
+    pub(crate) fn inbound(inner: B, traffic: RequestTraffic) -> Self {
+        Self {
+            inner: Box::pin(inner),
+            traffic,
+            inbound: true,
+        }
+    }
+
+    pub(crate) fn outbound(inner: B, traffic: RequestTraffic) -> Self {
+        Self {
+            inner: Box::pin(inner),
+            traffic,
+            inbound: false,
+        }
+    }
+}
+
+impl<B> Body for TrafficBody<B>
+where
+    B: Body<Data = Bytes>,
+{
+    type Data = Bytes;
+    type Error = B::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let result = self.inner.as_mut().poll_frame(cx);
+        if let std::task::Poll::Ready(Some(Ok(frame))) = &result
+            && let Some(data) = frame.data_ref()
+        {
+            self.traffic.bytes(self.inbound, data.len());
+        }
+        result
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http_body_util::{BodyExt, Full};
+
+    #[tokio::test]
+    async fn counts_server_and_vhost_traffic() {
+        let traffic = Traffic::default();
+        let request = traffic.start(Some("example.com"));
+        request.status(http::StatusCode::NOT_FOUND);
+        let body = TrafficBody::inbound(Full::new(Bytes::from_static(b"abc")), request.clone());
+        body.collect().await.unwrap();
+        let body = TrafficBody::outbound(Full::new(Bytes::from_static(b"hello")), request);
+        body.collect().await.unwrap();
+        traffic
+            .start(None)
+            .status(http::StatusCode::INTERNAL_SERVER_ERROR);
+
+        let snapshot = traffic.snapshot();
+        assert_eq!(snapshot["total"]["requests"], 2);
+        assert_eq!(snapshot["total"]["client_errors"], 1);
+        assert_eq!(snapshot["total"]["server_errors"], 1);
+        assert_eq!(snapshot["total"]["bytes_in"], 3);
+        assert_eq!(snapshot["total"]["bytes_out"], 5);
+        let vhost = &snapshot["vhosts"]["example.com"];
+        assert_eq!(vhost["requests"], 1);
+        assert_eq!(vhost["client_errors"], 1);
+        assert_eq!(vhost["server_errors"], 0);
+        assert_eq!(vhost["bytes_out"], 5);
+    }
+}
