@@ -56,6 +56,8 @@
     .table-controls{display:flex;gap:.65rem;align-items:center;justify-content:space-between;flex-wrap:wrap;margin-bottom:.8rem}
     #host-filter{min-width:min(100%,280px)}
     .table-wrap{overflow-x:auto;border:1px solid #e3e8ef;border-radius:7px}
+    .pager{display:flex;align-items:center;justify-content:space-between;gap:.65rem;flex-wrap:wrap;margin-top:.8rem}
+    .pager-controls{display:flex;align-items:center;gap:.45rem;flex-wrap:wrap}
     table{width:100%;border-collapse:collapse;min-width:900px}
     th,td{text-align:left;padding:.68rem .72rem;border-bottom:1px solid #e8edf2;vertical-align:middle}
     th{font-size:.75rem;text-transform:uppercase;letter-spacing:.04em;color:#64748b;background:#f8fafc;white-space:nowrap}
@@ -145,6 +147,23 @@
             <button id="new-host" class="primary" type="button" onclick="openNewHost()">New virtual host</button>
           </div>
           <div id="hosts" class="table-wrap" aria-live="polite"></div>
+          <div id="host-pager" class="pager">
+            <span id="host-page" class="muted" aria-live="polite"></span>
+            <div class="pager-controls">
+              <label class="muted" for="host-page-size">Rows per page
+                <select id="host-page-size" onchange="changeHostPageSize()" aria-label="Rows per page">
+                  <option value="50">50</option>
+                  <option value="100" selected>100</option>
+                  <option value="250">250</option>
+                  <option value="500">500</option>
+                </select>
+              </label>
+              <button id="host-first" type="button" onclick="setHostPage(1)" aria-label="First page">First</button>
+              <button id="host-prev" type="button" onclick="setHostPage(hostPage - 1)" aria-label="Previous page">Prev</button>
+              <button id="host-next" type="button" onclick="setHostPage(hostPage + 1)" aria-label="Next page">Next</button>
+              <button id="host-last" type="button" onclick="setHostPage(hostPageCount)" aria-label="Last page">Last</button>
+            </div>
+          </div>
         </section>
       </div>
 
@@ -216,6 +235,10 @@
     let samples = [];
     let timer = null;
     let hostList = [];
+    let hostPage = 1;
+    let hostPageSize = 100;
+    let hostPageCount = 1;
+    let lastHostFilter = '';
     let latestStatus = null;
     let editingName = null;
     let activeView = null;
@@ -1075,14 +1098,41 @@
       return button;
     }
 
+    function setHostPage(page) {
+      hostPage = page;
+      renderHosts();
+    }
+
+    function changeHostPageSize() {
+      hostPageSize = Number($('host-page-size').value);
+      hostPage = 1;
+      renderHosts();
+    }
+
     function renderHosts() {
-      const terms = $('host-filter').value.trim().toLowerCase().split(/\s+/).filter(Boolean);
+      const filter = $('host-filter').value.trim().toLowerCase();
+      if (filter !== lastHostFilter) {
+        hostPage = 1;
+        lastHostFilter = filter;
+      }
+      const terms = filter.split(/\s+/).filter(Boolean);
       const visible = hostList.filter(host => {
         const searchable = [host.name, ...(host.server_names || []), host.file, host.source]
           .map(value => String(value || '').toLowerCase());
         return terms.every(term => searchable.some(value => value.includes(term)));
       });
-      $('host-count').textContent = `${visible.length} of ${hostList.length}`;
+      hostPageCount = Math.max(1, Math.ceil(visible.length / hostPageSize));
+      hostPage = Math.min(hostPage, hostPageCount);
+      const start = (hostPage - 1) * hostPageSize;
+      const rows = visible.slice(start, start + hostPageSize);
+      const rangeStart = visible.length ? start + 1 : 0;
+      const rangeEnd = start + rows.length;
+      $('host-count').textContent = `${rangeStart}–${rangeEnd} of ${visible.length} (${hostList.length} total)`;
+      $('host-page').textContent = `Page ${hostPage} of ${hostPageCount}`;
+      $('host-first').disabled = hostPage <= 1;
+      $('host-prev').disabled = hostPage <= 1;
+      $('host-next').disabled = hostPage >= hostPageCount;
+      $('host-last').disabled = hostPage >= hostPageCount;
       const table = document.createElement('table');
       const head = document.createElement('thead');
       const headerRow = document.createElement('tr');
@@ -1094,7 +1144,7 @@
       head.append(headerRow);
       table.append(head);
       const body = document.createElement('tbody');
-      if (!visible.length) {
+      if (!rows.length) {
         const row = document.createElement('tr');
         const empty = document.createElement('td');
         empty.colSpan = 9;
@@ -1103,7 +1153,7 @@
         row.append(empty);
         body.append(row);
       }
-      for (const host of visible) {
+      for (const host of rows) {
         const name = controlName(host);
         const row = document.createElement('tr');
         row.dataset.host = name;

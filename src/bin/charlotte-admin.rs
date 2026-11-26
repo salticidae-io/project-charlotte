@@ -41,6 +41,8 @@ use serde::Deserialize;
 use tokio::io::{AsyncRead, AsyncWrite};
 use url::Url;
 
+const MAX_CONTROL_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+
 #[derive(Parser)]
 #[command(about = "Web administration for a Charlotte control socket")]
 struct Config {
@@ -500,15 +502,22 @@ async fn proxy(
         .body(body)
         .send()
         .await;
-    let Ok(result) = result else {
+    let Ok(mut result) = result else {
         return StatusCode::BAD_GATEWAY.into_response();
     };
     let status = result.status();
-    match result.bytes().await {
-        Ok(bytes) if bytes.len() <= 1024 * 1024 => {
-            (status, [(header::CONTENT_TYPE, "application/json")], bytes).into_response()
+    let mut bytes = Vec::new();
+    loop {
+        match result.chunk().await {
+            Ok(Some(chunk)) if chunk.len() <= MAX_CONTROL_RESPONSE_BYTES - bytes.len() => {
+                bytes.extend_from_slice(&chunk);
+            }
+            Ok(Some(_)) | Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
+            Ok(None) => {
+                return (status, [(header::CONTENT_TYPE, "application/json")], bytes)
+                    .into_response();
+            }
         }
-        _ => StatusCode::BAD_GATEWAY.into_response(),
     }
 }
 
