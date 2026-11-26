@@ -522,6 +522,23 @@ CHARLOTTE_ADMIN_PASSWORD='long random secret' charlotte-admin \
   only loopback peers are accepted. Forwarding headers are ignored, so behind
   a reverse proxy the proxy's address is what is checked and client
   restrictions must also be enforced at the proxy.
+- `charlotte-admin --rate-limit` limits all admin HTTP requests to 600 per
+  minute per peer IP by default; `0` disables it. `--login-rate-limit`
+  separately limits requests to the password and Google sign-in endpoints to
+  10 per minute per peer IP;
+  `0` disables that limit. The dashboard's background polling is below the
+  default general limit.
+- `--max-login-failures` locks a peer IP after 5 failed passwords or rejected
+  Google identities; `0` disables lockouts. `--lockout-seconds` controls both
+  the lockout duration and the time window for counting failures (default
+  900 seconds, minimum 1). A correct password is refused during lockout, while
+  existing sessions remain active.
+- All limits use the TCP peer IP, not forwarding headers. Behind a reverse
+  proxy, its address is shared by all users, so a lockout can affect every user
+  using that proxy; enforce client limits at the proxy or disable/raise the
+  admin-side limits as appropriate. Limiter state is in memory and resets when
+  `charlotte-admin` restarts; each lockout emits a line to stderr, but there is
+  no persistent audit log.
 - Graphs are built by sampling `GET /status` every `--sample-interval` seconds
   (default 10) and keeping the last `--history` samples (default 360, one
   hour) in memory. History starts empty when `charlotte-admin` restarts, and a
@@ -529,8 +546,7 @@ CHARLOTTE_ADMIN_PASSWORD='long random secret' charlotte-admin \
 
 Sessions are in-memory, expire after eight hours, and use `HttpOnly`,
 `SameSite=Lax` cookies (`Secure` over HTTPS). State-changing requests require
-both a matching `Origin` and a per-session CSRF token. There is no built-in
-login rate limiting or audit log.
+both a matching `Origin` and a per-session CSRF token.
 
 ### Bot detection
 

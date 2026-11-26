@@ -8,7 +8,8 @@
 //! http://localhost:8080 --socket /run/charlotte/control.sock`. For Google,
 //! register `<base-url>/oauth/callback` and configure the client ID, secret,
 //! and `--google-domain`. Protect the listener and control socket from
-//! untrusted local users. There is no built-in login rate limiting or audit log.
+//! untrusted local users. Per-peer request and login rate limits are configurable;
+//! lockouts and counters are in memory and are not an audit log.
 //! Traffic graphs are built by sampling the control socket's `/status` counters
 //! every `--sample-interval` seconds; the last `--history` samples are kept in
 //! memory, so graph history starts empty whenever this process restarts.
@@ -77,6 +78,18 @@ struct Config {
     /// Allowed TCP peer IP address; repeat for multiple addresses. Default: loopback only.
     #[arg(long)]
     allow_ip: Vec<IpAddr>,
+    /// Maximum requests per minute per peer IP (0 disables this limit).
+    #[arg(long, default_value_t = 600)]
+    rate_limit: u64,
+    /// Maximum sign-in endpoint requests per minute per peer IP (0 disables this limit).
+    #[arg(long, default_value_t = 10)]
+    login_rate_limit: u64,
+    /// Failed sign-ins before an IP is locked out (0 disables lockouts).
+    #[arg(long, default_value_t = 5)]
+    max_login_failures: u64,
+    /// Lockout duration and failed-sign-in counting window in seconds.
+    #[arg(long, default_value_t = 900, value_parser = clap::value_parser!(u64).range(1..))]
+    lockout_seconds: u64,
     /// Seconds between traffic samples used for graphs.
     #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..=3600))]
     sample_interval: u64,
@@ -93,6 +106,174 @@ struct Attempt {
     browser: String,
     expires: Instant,
 }
+struct ClientLimits {
+    last_seen: Instant,
+    requests_started: Option<Instant>,
+    requests: u64,
+    logins_started: Option<Instant>,
+    logins: u64,
+    failures_started: Option<Instant>,
+    failures: u64,
+    locked_at: Option<Instant>,
+}
+impl ClientLimits {
+    fn new(now: Instant) -> Self {
+        Self {
+            last_seen: now,
+            requests_started: None,
+            requests: 0,
+            logins_started: None,
+            logins: 0,
+            failures_started: None,
+            failures: 0,
+            locked_at: None,
+        }
+    }
+}
+struct Limiter {
+    clients: Mutex<HashMap<IpAddr, ClientLimits>>,
+    request_limit: u64,
+    login_limit: u64,
+    max_login_failures: u64,
+    lockout: Duration,
+}
+impl Limiter {
+    const MAX_CLIENTS: usize = 4096;
+    const WINDOW: Duration = Duration::from_secs(60);
+
+    fn new(config: &Config) -> Self {
+        Self {
+            clients: Mutex::new(HashMap::new()),
+            request_limit: config.rate_limit,
+            login_limit: config.login_rate_limit,
+            max_login_failures: config.max_login_failures,
+            lockout: Duration::from_secs(config.lockout_seconds),
+        }
+    }
+
+    fn entry<'a>(
+        &'a self,
+        clients: &'a mut HashMap<IpAddr, ClientLimits>,
+        ip: IpAddr,
+        now: Instant,
+    ) -> Option<&'a mut ClientLimits> {
+        let idle_timeout = Self::WINDOW.max(self.lockout);
+        clients.retain(|_, client| {
+            now.saturating_duration_since(client.last_seen) < idle_timeout
+                || client
+                    .locked_at
+                    .is_some_and(|at| now.saturating_duration_since(at) < self.lockout)
+        });
+        if !clients.contains_key(&ip) && clients.len() >= Self::MAX_CLIENTS {
+            return None;
+        }
+        let client = clients.entry(ip).or_insert_with(|| ClientLimits::new(now));
+        client.last_seen = now;
+        Some(client)
+    }
+
+    fn request(&self, ip: IpAddr, now: Instant) -> Option<Duration> {
+        if self.request_limit == 0 {
+            return None;
+        }
+        let mut clients = self.clients.lock().unwrap();
+        let Some(client) = self.entry(&mut clients, ip, now) else {
+            return Some(Self::WINDOW);
+        };
+        match client.requests_started {
+            Some(started) if now.saturating_duration_since(started) < Self::WINDOW => {
+                if client.requests >= self.request_limit {
+                    return Some(
+                        Self::WINDOW.saturating_sub(now.saturating_duration_since(started)),
+                    );
+                }
+                client.requests = client.requests.saturating_add(1);
+            }
+            _ => {
+                client.requests_started = Some(now);
+                client.requests = 1;
+            }
+        }
+        None
+    }
+
+    fn login_attempt(&self, ip: IpAddr, now: Instant) -> Option<Duration> {
+        if self.login_limit == 0 && self.max_login_failures == 0 {
+            return None;
+        }
+        let mut clients = self.clients.lock().unwrap();
+        let Some(client) = self.entry(&mut clients, ip, now) else {
+            return Some(Self::WINDOW);
+        };
+        if let Some(locked_at) = client.locked_at {
+            let elapsed = now.saturating_duration_since(locked_at);
+            if elapsed < self.lockout {
+                return Some(self.lockout.saturating_sub(elapsed));
+            }
+            client.locked_at = None;
+            client.failures_started = None;
+            client.failures = 0;
+        }
+        if client
+            .failures_started
+            .is_some_and(|started| now.saturating_duration_since(started) >= self.lockout)
+        {
+            client.failures_started = None;
+            client.failures = 0;
+        }
+        if self.login_limit == 0 {
+            return None;
+        }
+        match client.logins_started {
+            Some(started) if now.saturating_duration_since(started) < Self::WINDOW => {
+                if client.logins >= self.login_limit {
+                    return Some(
+                        Self::WINDOW.saturating_sub(now.saturating_duration_since(started)),
+                    );
+                }
+                client.logins = client.logins.saturating_add(1);
+            }
+            _ => {
+                client.logins_started = Some(now);
+                client.logins = 1;
+            }
+        }
+        None
+    }
+
+    fn failure(&self, ip: IpAddr, now: Instant) {
+        if self.max_login_failures == 0 {
+            return;
+        }
+        let mut clients = self.clients.lock().unwrap();
+        let Some(client) = self.entry(&mut clients, ip, now) else {
+            return;
+        };
+        if client
+            .failures_started
+            .is_none_or(|started| now.saturating_duration_since(started) >= self.lockout)
+        {
+            client.failures_started = Some(now);
+            client.failures = 0;
+        }
+        client.failures = client.failures.saturating_add(1);
+        if client.failures >= self.max_login_failures {
+            client.locked_at = Some(now);
+            eprintln!(
+                "admin login locked out {ip} for {} seconds",
+                self.lockout.as_secs()
+            );
+        }
+    }
+
+    fn success(&self, ip: IpAddr) {
+        if let Some(client) = self.clients.lock().unwrap().get_mut(&ip) {
+            client.failures_started = None;
+            client.failures = 0;
+            client.locked_at = None;
+        }
+    }
+}
 struct App {
     config: Config,
     base: Url,
@@ -101,6 +282,7 @@ struct App {
     google: reqwest::Client,
     sessions: Mutex<HashMap<String, Session>>,
     attempts: Mutex<HashMap<String, Attempt>>,
+    limiter: Limiter,
     history: Mutex<VecDeque<serde_json::Value>>,
 }
 type Shared = Arc<App>;
@@ -195,7 +377,11 @@ async fn guard(
     if !allowed {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let mut response = next.run(request).await;
+    let mut response = if let Some(wait) = app.limiter.request(peer.ip(), Instant::now()) {
+        too_many_requests(wait)
+    } else {
+        next.run(request).await
+    };
     let h = response.headers_mut();
     h.insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
     h.insert(header::X_CONTENT_TYPE_OPTIONS, "nosniff".parse().unwrap());
@@ -208,6 +394,18 @@ async fn guard(
     }
     h.insert(header::CONTENT_SECURITY_POLICY, "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'".parse().unwrap());
     h.insert(header::REFERRER_POLICY, "no-referrer".parse().unwrap());
+    response
+}
+
+fn too_many_requests(wait: Duration) -> Response {
+    let seconds = wait
+        .as_secs()
+        .saturating_add(u64::from(wait.subsec_nanos() > 0))
+        .max(1);
+    let mut response = StatusCode::TOO_MANY_REQUESTS.into_response();
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, seconds.to_string().parse().unwrap());
     response
 }
 
@@ -226,11 +424,24 @@ struct Login {
 }
 async fn login(
     State(app): State<Shared>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(login): Json<Login>,
 ) -> Response {
+    login_at(&app, peer.ip(), headers, login, Instant::now()).await
+}
+async fn login_at(
+    app: &App,
+    ip: IpAddr,
+    headers: HeaderMap,
+    login: Login,
+    now: Instant,
+) -> Response {
     if !valid_origin(&headers, &app) {
         return StatusCode::FORBIDDEN.into_response();
+    }
+    if let Some(wait) = app.limiter.login_attempt(ip, now) {
+        return too_many_requests(wait);
     }
     if app
         .config
@@ -238,8 +449,10 @@ async fn login(
         .as_ref()
         .is_some_and(|p| equal(p, &login.password))
     {
+        app.limiter.success(ip);
         issue_session(&app)
     } else {
+        app.limiter.failure(ip, now);
         StatusCode::UNAUTHORIZED.into_response()
     }
 }
@@ -276,10 +489,16 @@ async fn logout(State(app): State<Shared>, headers: HeaderMap) -> Response {
     response
 }
 
-async fn oauth_start(State(app): State<Shared>) -> Response {
+async fn oauth_start(
+    State(app): State<Shared>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Response {
     let Some(client) = &app.config.google_client_id else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    if let Some(wait) = app.limiter.login_attempt(peer.ip(), Instant::now()) {
+        return too_many_requests(wait);
+    }
     let state = random();
     let browser = random();
     let mut attempts = app.attempts.lock().unwrap();
@@ -355,9 +574,13 @@ fn google_allowed(
 }
 async fn oauth_callback(
     State(app): State<Shared>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     axum::extract::Query(query): axum::extract::Query<Callback>,
 ) -> Response {
+    if let Some(wait) = app.limiter.login_attempt(peer.ip(), Instant::now()) {
+        return too_many_requests(wait);
+    }
     let attempt = app.attempts.lock().unwrap().remove(&query.state);
     if !attempt.is_some_and(|a| {
         a.expires > Instant::now()
@@ -419,8 +642,10 @@ async fn oauth_callback(
         domain,
         &app.config.google_email,
     ) {
+        app.limiter.failure(peer.ip(), Instant::now());
         return StatusCode::FORBIDDEN.into_response();
     }
+    app.limiter.success(peer.ip());
     let session = issue_session(&app);
     if session.status() != StatusCode::NO_CONTENT {
         return session;
@@ -580,6 +805,9 @@ fn validate(config: &Config) -> Result<(Url, String), String> {
     if config.password.as_ref().is_some_and(|p| p.is_empty()) {
         return Err("password must not be empty".into());
     }
+    if config.lockout_seconds == 0 {
+        return Err("lockout duration must be at least one second".into());
+    }
     if config.tls_cert.is_some() != config.tls_key.is_some() {
         return Err("TLS requires both --tls-cert and --tls-key".into());
     }
@@ -658,6 +886,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
     let bind = config.bind;
+    let limiter = Limiter::new(&config);
     let app = Arc::new(App {
         config,
         base,
@@ -666,6 +895,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         google,
         sessions: Mutex::new(HashMap::new()),
         attempts: Mutex::new(HashMap::new()),
+        limiter,
         history: Mutex::new(VecDeque::new()),
     });
     tokio::spawn(sampler(app.clone()));
@@ -730,13 +960,30 @@ mod tests {
             tls_cert: None,
             tls_key: None,
             allow_ip: vec![],
+            rate_limit: 600,
+            login_rate_limit: 10,
+            max_login_failures: 5,
+            lockout_seconds: 900,
             sample_interval: 10,
             history: 3,
         }
     }
     fn app() -> Shared {
-        let config = config();
+        app_with_limits(600, 10, 5, 900)
+    }
+    fn app_with_limits(
+        rate_limit: u64,
+        login_rate_limit: u64,
+        max_login_failures: u64,
+        lockout_seconds: u64,
+    ) -> Shared {
+        let mut config = config();
+        config.rate_limit = rate_limit;
+        config.login_rate_limit = login_rate_limit;
+        config.max_login_failures = max_login_failures;
+        config.lockout_seconds = lockout_seconds;
         let (base, prefix) = validate(&config).unwrap();
+        let limiter = Limiter::new(&config);
         Arc::new(App {
             config,
             base,
@@ -745,8 +992,14 @@ mod tests {
             google: reqwest::Client::new(),
             sessions: Mutex::new(HashMap::new()),
             attempts: Mutex::new(HashMap::new()),
+            limiter,
             history: Mutex::new(VecDeque::new()),
         })
+    }
+    fn origin_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::ORIGIN, "http://localhost:8080".parse().unwrap());
+        headers
     }
     fn session_headers(app: &App) -> HeaderMap {
         let issued = issue_session(app);
@@ -764,6 +1017,173 @@ mod tests {
         );
         headers
     }
+    #[tokio::test]
+    async fn password_lockout_blocks_correct_password_until_expiry() {
+        let app = app_with_limits(0, 0, 2, 5);
+        let ip = "192.0.2.10".parse().unwrap();
+        let now = Instant::now();
+        let headers = origin_headers();
+        assert_eq!(
+            login_at(
+                &app,
+                ip,
+                headers.clone(),
+                Login {
+                    password: "wrong".into()
+                },
+                now,
+            )
+            .await
+            .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            login_at(
+                &app,
+                ip,
+                headers.clone(),
+                Login {
+                    password: "wrong".into()
+                },
+                now + Duration::from_secs(1),
+            )
+            .await
+            .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let locked = login_at(
+            &app,
+            ip,
+            headers.clone(),
+            Login {
+                password: "secret".into(),
+            },
+            now + Duration::from_secs(2),
+        )
+        .await;
+        assert_eq!(locked.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(locked.headers()[header::RETRY_AFTER], "4");
+        let unlocked = login_at(
+            &app,
+            ip,
+            headers,
+            Login {
+                password: "secret".into(),
+            },
+            now + Duration::from_secs(6),
+        )
+        .await;
+        assert_eq!(unlocked.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn successful_login_resets_failed_attempt_count() {
+        let app = app_with_limits(0, 0, 3, 10);
+        let ip = "192.0.2.11".parse().unwrap();
+        let now = Instant::now();
+        for offset in [0, 1] {
+            assert_eq!(
+                login_at(
+                    &app,
+                    ip,
+                    origin_headers(),
+                    Login {
+                        password: "wrong".into()
+                    },
+                    now + Duration::from_secs(offset),
+                )
+                .await
+                .status(),
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        assert_eq!(
+            login_at(
+                &app,
+                ip,
+                origin_headers(),
+                Login {
+                    password: "secret".into()
+                },
+                now + Duration::from_secs(2),
+            )
+            .await
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+        for offset in [3, 4, 5] {
+            assert_eq!(
+                login_at(
+                    &app,
+                    ip,
+                    origin_headers(),
+                    Login {
+                        password: "wrong".into()
+                    },
+                    now + Duration::from_secs(offset),
+                )
+                .await
+                .status(),
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        assert_eq!(
+            login_at(
+                &app,
+                ip,
+                origin_headers(),
+                Login {
+                    password: "secret".into()
+                },
+                now + Duration::from_secs(6),
+            )
+            .await
+            .status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
+    #[test]
+    fn request_and_login_limits_are_per_ip_and_reset_after_a_minute() {
+        let request_limiter = Limiter::new(&Config {
+            rate_limit: 2,
+            login_rate_limit: 0,
+            max_login_failures: 0,
+            ..config()
+        });
+        let first = "192.0.2.20".parse().unwrap();
+        let second = "192.0.2.21".parse().unwrap();
+        let now = Instant::now();
+        assert_eq!(request_limiter.request(first, now), None);
+        assert_eq!(request_limiter.request(first, now), None);
+        assert_eq!(
+            request_limiter.request(first, now),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(request_limiter.request(second, now), None);
+        assert_eq!(
+            request_limiter.request(first, now + Duration::from_secs(60)),
+            None
+        );
+
+        let login_limiter = Limiter::new(&Config {
+            rate_limit: 0,
+            login_rate_limit: 1,
+            max_login_failures: 0,
+            ..config()
+        });
+        assert_eq!(login_limiter.login_attempt(first, now), None);
+        assert_eq!(
+            login_limiter.login_attempt(first, now),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(login_limiter.login_attempt(second, now), None);
+        assert_eq!(
+            login_limiter.login_attempt(first, now + Duration::from_secs(60)),
+            None
+        );
+    }
+
     #[tokio::test]
     async fn history_is_bounded_and_requires_a_session() {
         let app = app();
@@ -787,6 +1207,9 @@ mod tests {
     fn configuration_fails_closed() {
         let mut c = config();
         assert!(validate(&c).is_ok());
+        c.lockout_seconds = 0;
+        assert!(validate(&c).is_err());
+        c.lockout_seconds = 900;
         c.password = None;
         assert!(validate(&c).is_err());
         c.google_client_id = Some("id".into());
@@ -928,6 +1351,7 @@ mod tests {
         );
         let result = oauth_callback(
             State(app.clone()),
+            ConnectInfo("192.0.2.30:12345".parse().unwrap()),
             HeaderMap::new(),
             axum::extract::Query(Callback {
                 state: "state".into(),
