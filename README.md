@@ -28,7 +28,8 @@ headless validation mode.
   provisioning and renewal, and HTTP/3 over QUIC.
 - Optional Redis-backed swarm access checks, plus per-client rate limiting and
   bot detection with proof-of-work challenges.
-- A local Unix-socket control API (`charlotte-ctl`), worker cgroup v2 settings,
+- A local Unix-socket control API (`charlotte-ctl`), a web administration and
+  traffic-statistics UI (`charlotte-admin`), worker cgroup v2 settings,
   and tools to convert Apache/nginx configurations or interactively create a
   vhost (`apache2charlotte`, `nginx2charlotte`, and `charlotte-configure`).
 - A configuration validator (`--check-config`) and watched virtual-host file
@@ -419,7 +420,27 @@ validates the change against the complete vhost configuration, including
 duplicate names and worker setup, before atomically writing a mode-`0640` YAML
 file and switching the running router. Invalid changes leave both the file and
 the active configuration unchanged. `GET /status` reports uptime, vhost count,
-and version; it is the read-only starting point for future server statistics.
+version, and a `traffic` object with process-lifetime counters: `total` for
+the whole server and `vhosts` keyed by each vhost's primary server name. Each
+entry has `requests`, `client_errors` (4xx), `server_errors` (5xx),
+`bytes_in` (request body bytes), and `bytes_out` (response body bytes).
+Requests are counted when dispatched, errors when response headers are
+produced, and bytes as body data is streamed. Requests that match no vhost
+count only towards `total`; control API requests are not counted. Counters
+reset when the server restarts and survive configuration reloads.
+
+`GET /options` returns the main configuration file, its current `options:`
+mapping, a schema for configurable global settings, command-line overrides, and
+whether the file can be edited. `PUT /options` accepts an options mapping in
+JSON or YAML; null values are omitted and hyphenated keys are normalized. The
+server validates the replacement with the same parser and vhost checks used at
+startup, then atomically replaces the config file while preserving its mode
+and other top-level entries such as `vhost` and `vhost_dir`. The file must be
+owned by the server's effective user and its directory must be writable;
+otherwise the endpoint returns `409` and the admin UI shows the reason. A
+successful save does not apply global options to the running server: restart
+Charlotte for them to take effect. Rewriting the YAML may remove comments and
+formatting.
 
 ```sh
 curl --unix-socket /run/charlotte/control.sock http://localhost/vhosts
@@ -441,19 +462,85 @@ charlotte-ctl list
 charlotte-ctl get example
 charlotte-ctl put example example.yaml
 cat example.yaml | charlotte-ctl create example -
+charlotte-ctl options
+charlotte-ctl set-options global-options.yaml
 charlotte-ctl delete example
 ```
 
-For `create` and `put` (also available as `apply`), the file argument is
-optional and defaults to standard input; pass `-` to select standard input
+For `create`, `put` (also available as `apply`), and `set-options`, the file
+argument is optional and defaults to standard input; pass `-` to select standard input
 explicitly. Request files may contain JSON or YAML. Successful JSON responses
 are printed to standard output as pretty-printed JSON; server errors are shown
 on standard error and return a nonzero exit status.
 
 The API uses `201` for a successful create, `200` for a successful get or
 replace, and `204` for delete. Invalid requests return `400`, missing vhosts
-`404`, create conflicts `409`, oversized bodies `413`, and unavailable mutation
-storage `503`.
+`404`, create conflicts or read-only config files `409`, oversized bodies
+`413`, and unavailable mutation storage or a missing main config for `/options`
+`503`.
+
+### Web administration UI
+
+`charlotte-admin` is a separate process that serves a browser UI on top of the
+control socket: server and per-vhost traffic graphs (requests, 4xx and 5xx per
+second, and inbound/outbound bandwidth), a status summary, and a searchable
+virtual-host table with per-host traffic and view/edit/delete actions. Search
+supports multiple terms, and clicking a host opens a shareable per-vhost stats
+view with traffic totals, current rates, and graphs. It also supports vhost
+creation. It needs read/write access to the control
+socket, so run it as the server's account or a member of its group.
+The **Server options** view provides a typed form for the main configuration's
+global `options:` mapping. Command-line overrides are marked and disabled;
+read-only config files explain why they cannot be edited. Saved values are
+validated and persisted, but the dashboard clearly indicates that a server
+restart is required before they take effect.
+
+```sh
+CHARLOTTE_ADMIN_PASSWORD='long random secret' charlotte-admin \
+  --bind 127.0.0.1:9090 --base-url https://admin.example.com/charlotte \
+  --socket /run/charlotte/control.sock --allow-ip 127.0.0.1
+```
+
+- `--base-url` (or `CHARLOTTE_ADMIN_BASE_URL`) is the public URL including any
+  path prefix; the UI is served under that prefix. It must be `https://`
+  unless both it and `--bind` are loopback. By default the process speaks plain
+  HTTP; terminate TLS at a reverse proxy. To serve HTTPS directly, supply both
+  `--tls-cert CERT.pem` and `--tls-key KEY.pem`; in that mode `--base-url` must
+  use `https://`. The certificate file may contain the full PEM chain.
+- Authentication uses a static password (`--password` or, preferably,
+  `CHARLOTTE_ADMIN_PASSWORD`); startup fails if neither is configured.
+- The vhost editor uses typed controls for the vhost options, including
+  repeatable lists and FastCGI app settings. Use **Advanced (JSON)** for fields
+  not represented by the form; unknown fields are preserved when editing.
+- `--allow-ip` restricts access by TCP peer address (repeatable); by default
+  only loopback peers are accepted. Forwarding headers are ignored, so behind
+  a reverse proxy the proxy's address is what is checked and client
+  restrictions must also be enforced at the proxy.
+- `charlotte-admin --rate-limit` limits all admin HTTP requests to 600 per
+  minute per peer IP by default; `0` disables it. `--login-rate-limit`
+  separately limits password sign-in attempts to
+  10 per minute per peer IP;
+  `0` disables that limit. The dashboard's background polling is below the
+  default general limit.
+- `--max-login-failures` locks a peer IP after 5 failed passwords; `0` disables
+  lockouts. `--lockout-seconds` controls both
+  the lockout duration and the time window for counting failures (default
+  900 seconds, minimum 1). A correct password is refused during lockout, while
+  existing sessions remain active.
+- All limits use the TCP peer IP, not forwarding headers. Behind a reverse
+  proxy, its address is shared by all users, so a lockout can affect every user
+  using that proxy; enforce client limits at the proxy or disable/raise the
+  admin-side limits as appropriate. Limiter state is in memory and resets when
+  `charlotte-admin` restarts; each lockout emits a line to stderr, but there is
+  no persistent audit log.
+- Graphs are built by sampling `GET /status` every `--sample-interval` seconds
+  (default 10) and keeping the last `--history` samples (default 360, one
+  hour) in memory. History starts empty when `charlotte-admin` restarts, and a
+  server restart is shown as a counter reset rather than a spike.
+
+Sessions are in-memory, expire after eight hours, and use `HttpOnly`,
+`SameSite=Lax` cookies (`Secure` over HTTPS). State-changing requests require
+both a matching `Origin` and a per-session CSRF token.
 
 ### Bot detection
 

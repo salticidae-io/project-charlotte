@@ -89,6 +89,8 @@ pub struct OptionInfo {
     pub value_name: Option<String>,
     /// The first CLI default value, when one is defined.
     pub default: Option<String>,
+    /// Whether values are resolved relative to the main config file.
+    pub path: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -528,6 +530,7 @@ impl Config {
                 } else {
                     OptionKind::Value
                 };
+                let path = is_path_option(&name);
                 Some(OptionInfo {
                     name,
                     help: arg.get_help().map_or_else(String::new, ToString::to_string),
@@ -540,9 +543,25 @@ impl Config {
                         .get_default_values()
                         .first()
                         .map(|value| value.to_string_lossy().into_owned()),
+                    path,
                 })
             })
             .collect()
+    }
+
+    pub(crate) fn command_line_options(args: &[String]) -> Result<Vec<String>, String> {
+        let matches = Cli::command()
+            .try_get_matches_from(
+                std::iter::once("project-charlotte".to_owned()).chain(args.iter().cloned()),
+            )
+            .map_err(|error| error.to_string().trim_end().to_owned())?;
+        Ok(Cli::command()
+            .get_arguments()
+            .filter(|arg| {
+                matches.value_source(arg.get_id().as_str()) == Some(ValueSource::CommandLine)
+            })
+            .filter_map(|arg| arg.get_long().map(|name| name.replace('-', "_")))
+            .collect())
     }
 
     pub fn parse(args: impl IntoIterator<Item = String>) -> Result<ParseResult, String> {
@@ -1246,7 +1265,7 @@ fn option_scalar(value: &serde_yaml_ng::Value) -> Option<String> {
     }
 }
 
-fn is_path_option(key: &str) -> bool {
+pub(crate) fn is_path_option(key: &str) -> bool {
     matches!(
         key,
         "root"

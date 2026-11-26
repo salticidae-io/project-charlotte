@@ -276,6 +276,12 @@ async fn control_socket_validates_persists_and_routes_vhost_crud() {
     assert_eq!(response.status, 200);
     let status: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
     assert_eq!(status["vhosts"], 1);
+    let site_traffic = &status["traffic"]["vhosts"]["control.example"];
+    assert_eq!(site_traffic["requests"], 2);
+    assert_eq!(site_traffic["client_errors"], 0);
+    assert_eq!(site_traffic["server_errors"], 0);
+    assert_eq!(site_traffic["bytes_out"], 2 * b"managed site".len() as u64);
+    assert!(status["traffic"]["total"]["requests"].as_u64().unwrap() >= 2);
     let response = control_request(&fixture.socket, "PATCH", "/vhosts/site", b"").await;
     assert_eq!(response.status, 405);
     let oversized = vec![b' '; 1024 * 1024 + 1];
@@ -294,6 +300,117 @@ async fn control_socket_validates_persists_and_routes_vhost_crud() {
     let response = site_request(fixture.address, "control.example").await;
     assert_eq!(response.status, 200);
     assert_eq!(response.body, b"fallback");
+}
+
+#[tokio::test]
+async fn control_options_api_validates_persists_and_preserves_main_config() {
+    let fixture = Fixture::start().await;
+    let config_file = fixture.root.join("vhosts.yaml");
+    let original_mode = std::fs::metadata(&config_file)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+
+    let response = control_request(&fixture.socket, "GET", "/options", b"").await;
+    assert_eq!(response.status, 200);
+    let initial: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+    assert_eq!(initial["writable"], true);
+    assert_eq!(initial["options"], serde_json::json!({}));
+    assert_eq!(initial["restart_required"], false);
+    assert!(
+        initial["command_line"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|name| name == "bind")
+    );
+    let max_connections = initial["schema"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|option| option["name"] == "max_connections")
+        .unwrap();
+    assert_eq!(max_connections["kind"], "value");
+    assert_eq!(
+        max_connections["min"].as_f64(),
+        Some(1.0),
+        "{max_connections}"
+    );
+
+    let update = br#"{"debug":true,"header-read-timeout":31,"index":["home.html","index.html"]}"#;
+    let response = control_request(&fixture.socket, "PUT", "/options", update).await;
+    assert_eq!(
+        response.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&response.body)
+    );
+    let saved: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+    assert_eq!(saved["restart_required"], true);
+    assert_eq!(saved["options"]["debug"], true);
+    assert_eq!(saved["options"]["header_read_timeout"], 31);
+    assert_eq!(
+        saved["options"]["index"],
+        serde_json::json!(["home.html", "index.html"])
+    );
+    let document: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(&std::fs::read_to_string(&config_file).unwrap()).unwrap();
+    let mapping = document.as_mapping().unwrap();
+    assert!(mapping.contains_key(serde_yaml_ng::Value::String("vhost".to_owned())));
+    assert_eq!(
+        std::fs::metadata(&config_file)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        original_mode
+    );
+
+    let before_invalid = std::fs::read(&config_file).unwrap();
+    for invalid in [
+        br#"{"unknown_option":true}"#.as_slice(),
+        br#"{"header_read_timeout":"not-a-number"}"#.as_slice(),
+    ] {
+        let response = control_request(&fixture.socket, "PUT", "/options", invalid).await;
+        assert_eq!(response.status, 400);
+        assert!(!String::from_utf8_lossy(&response.body).contains(".options-"));
+        assert_eq!(std::fs::read(&config_file).unwrap(), before_invalid);
+    }
+
+    let response = control_request(&fixture.socket, "GET", "/options", b"").await;
+    assert_eq!(response.status, 200);
+    let current: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+    assert_eq!(current["options"], saved["options"]);
+    assert_eq!(current["restart_required"], true);
+}
+
+#[tokio::test]
+async fn control_cli_reads_and_replaces_global_options() {
+    let fixture = Fixture::start().await;
+
+    let output = control_cli(&fixture.socket, &["options"], None);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let options: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(options["options"], serde_json::json!({}));
+
+    let output = control_cli(
+        &fixture.socket,
+        &["set-options"],
+        Some(br#"{"debug":true,"max_connections":2048}"#),
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let saved: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(saved["options"]["debug"], true);
+    assert_eq!(saved["options"]["max_connections"], 2048);
 }
 
 #[tokio::test]

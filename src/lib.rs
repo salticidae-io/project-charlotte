@@ -34,6 +34,7 @@ mod response;
 #[cfg(feature = "swarm")]
 mod swarm;
 mod tls;
+mod traffic;
 mod vhost;
 mod waf;
 #[cfg(feature = "hosting")]
@@ -242,7 +243,8 @@ pub fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     {
         return logopener::run_helper(0);
     }
-    let config = match Config::parse(std::env::args().skip(1))? {
+    let cli_args = std::env::args().skip(1).collect::<Vec<_>>();
+    let config = match Config::parse(cli_args.clone())? {
         ParseResult::Help => {
             println!("{}", Config::usage());
             return Ok(());
@@ -360,7 +362,7 @@ pub fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
                 .map_or_else(|| "Tokio default".to_owned(), |threads| threads.to_string())
         );
         let runtime = builder.enable_all().build()?;
-        runtime.block_on(run_master(config, main_config))
+        runtime.block_on(run_master(config, main_config, cli_args))
     })();
     if report_startup_errors {
         if let Err(error) = &startup_result {
@@ -374,7 +376,18 @@ pub fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
 async fn run_master(
     config: Config,
     main_config: Option<String>,
+    cli_args: Vec<String>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let startup_options = main_config
+        .as_deref()
+        .and_then(|contents| serde_yaml_ng::from_str::<serde_yaml_ng::Value>(contents).ok())
+        .and_then(|value| {
+            value
+                .as_mapping()?
+                .get(serde_yaml_ng::Value::String("options".to_owned()))
+                .cloned()
+        })
+        .unwrap_or_else(|| serde_yaml_ng::Value::Mapping(Default::default()));
     #[cfg(feature = "hosting")]
     let root = tokio::fs::canonicalize(&config.root)
         .await
@@ -582,6 +595,7 @@ async fn run_master(
         })
         .transpose()?;
     let control_task = if let Some(path) = config.control_socket.clone() {
+        let command_line_options = Config::command_line_options(&cli_args)?;
         Some(
             control::spawn(
                 path,
@@ -589,6 +603,9 @@ async fn run_master(
                 config.clone(),
                 tls_setup.as_ref().map(|tls| tls.sni.clone()),
                 started,
+                startup_options.clone(),
+                cli_args,
+                command_line_options,
                 shutdown_rx.clone(),
             )
             .await?,

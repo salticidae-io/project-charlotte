@@ -276,6 +276,7 @@ pub(crate) struct Router {
     access_log: Option<Arc<crate::logging::AccessLog>>,
     error_log: Arc<crate::logging::ErrorLog>,
     https_port: AtomicU16,
+    traffic: crate::traffic::Traffic,
     #[cfg(feature = "acme")]
     acme: Option<AcmeManager>,
 }
@@ -803,6 +804,10 @@ impl Router {
         self.snapshot().vhosts.len()
     }
 
+    pub(crate) fn control_traffic(&self) -> serde_json::Value {
+        self.traffic.snapshot()
+    }
+
     fn snapshot(&self) -> Arc<VhostTable> {
         Arc::clone(
             &self
@@ -1202,6 +1207,7 @@ impl Router {
             access_log: global_access_log,
             error_log: global_error_log,
             https_port: AtomicU16::new(0),
+            traffic: crate::traffic::Traffic::default(),
             #[cfg(feature = "acme")]
             acme: None,
         })
@@ -1291,6 +1297,11 @@ impl Router {
             .and_then(|host| Self::select_vhost(&table, host))
             .or(table.default);
         let vhost = selected.map(|index| &table.vhosts[index]);
+        let traffic = self.traffic.start(
+            vhost
+                .and_then(|vhost| vhost.names.first())
+                .map(String::as_str),
+        );
         let server_name = vhost
             .and_then(|vhost| vhost.names.first())
             .cloned()
@@ -1329,7 +1340,13 @@ impl Router {
                 .unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicU64::new(0))),
             started: request_started,
         });
-        let request = request.map(|body| crate::logging::CountedBody::new(body, received.clone()));
+        let request_traffic = traffic.clone();
+        let request = request.map(|body| {
+            crate::logging::CountedBody::new(
+                crate::traffic::TrafficBody::inbound(body, request_traffic),
+                received.clone(),
+            )
+        });
         let context = crate::logging::RequestContext {
             client: Some(client),
             local: Some(local),
@@ -1342,6 +1359,7 @@ impl Router {
             self.dispatch_inner(request, client, local, table, host, selected),
         )
         .await;
+        traffic.status(response.status());
         timing.mark_headers();
         let mut response = response;
         if self.fallback.server_timing
@@ -1352,7 +1370,7 @@ impl Router {
                 value,
             );
         }
-        if access_log.is_some() || debug || self.fallback.server_timing {
+        let response = if access_log.is_some() || debug || self.fallback.server_timing {
             let (parts, body) = response.into_parts();
             let access_response =
                 (access_log.is_some() || debug).then(|| crate::logging::AccessResponse {
@@ -1373,7 +1391,12 @@ impl Router {
             Response::from_parts(parts, body)
         } else {
             response
-        }
+        };
+        let (parts, body) = response.into_parts();
+        Response::from_parts(
+            parts,
+            crate::traffic::TrafficBody::outbound(body, traffic).boxed_unsync(),
+        )
     }
 
     async fn dispatch_inner<B>(
