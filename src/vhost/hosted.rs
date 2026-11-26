@@ -26,7 +26,12 @@ use nix::{
     sys::signal::{Signal, kill},
     unistd::{Group, Pid, User},
 };
-use tokio::{io::AsyncReadExt, net::UnixStream, sync::Mutex, time::timeout};
+use tokio::{
+    io::AsyncReadExt,
+    net::UnixStream,
+    sync::{Mutex, Notify},
+    time::timeout,
+};
 
 use super::{Rejection, TlsSni, request_authority};
 use crate::{
@@ -64,6 +69,7 @@ pub(super) struct Worker {
     pub(super) error_log_file: Option<PathBuf>,
     pub(super) error_log_format: String,
     pub(super) process: Mutex<Option<WorkerProcess>>,
+    pub(super) reaper_wake: Arc<Notify>,
 }
 
 pub(super) struct WorkerProcess {
@@ -124,25 +130,51 @@ impl Drop for WorkerProcess {
     }
 }
 
+impl Drop for Worker {
+    fn drop(&mut self) {
+        self.reaper_wake.notify_one();
+    }
+}
+
 impl Worker {
     pub(super) fn spawn_idle_reaper(worker: &Arc<Self>, timeout: Duration) {
+        let wake = Arc::clone(&worker.reaper_wake);
         let worker: Weak<Self> = Arc::downgrade(worker);
         let interval = timeout.min(Duration::from_millis(250));
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(interval).await;
-                let Some(worker) = worker.upgrade() else {
+                let Some(strong_worker) = worker.upgrade() else {
                     break;
                 };
-                worker.reap_idle(timeout).await;
+                let process_running = strong_worker.process.lock().await.is_some();
+                drop(strong_worker);
+                if !process_running {
+                    wake.notified().await;
+                    continue;
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(interval) => {}
+                    _ = wake.notified() => continue,
+                }
+                let Some(strong_worker) = worker.upgrade() else {
+                    break;
+                };
+                let process_remains = strong_worker.reap_idle(timeout).await;
+                drop(strong_worker);
+                if !process_remains {
+                    continue;
+                }
             }
         });
     }
 
-    async fn reap_idle(&self, timeout: Duration) {
+    async fn reap_idle(&self, timeout: Duration) -> bool {
         let mut process = self.process.lock().await;
-        if process.is_none() || self.active.load(Ordering::Acquire) != 0 {
-            return;
+        if process.is_none() {
+            return false;
+        }
+        if self.active.load(Ordering::Acquire) != 0 {
+            return true;
         }
         let is_idle = {
             let last_used = self
@@ -158,6 +190,9 @@ impl Worker {
                 timeout.as_secs()
             );
             drop(process);
+            false
+        } else {
+            true
         }
     }
 
@@ -350,6 +385,7 @@ impl Worker {
                 *process_guard = None;
                 let _spawn_timing = crate::logging::StageTimer::new(crate::logging::Stage::Spawn);
                 *process_guard = Some(self.spawn_process().await?);
+                self.reaper_wake.notify_one();
             }
             process_guard
                 .as_ref()
@@ -741,6 +777,26 @@ mod tests {
         assert!(worker.process_is_running().await);
     }
 
+    #[tokio::test]
+    async fn idle_reaper_wakes_when_a_process_is_started() {
+        let timeout = Duration::from_millis(10);
+        let worker = Arc::new(test_worker(timeout, Instant::now() - Duration::from_secs(1)).await);
+        let process = worker.process.lock().await.take();
+        Worker::spawn_idle_reaper(&worker, timeout);
+        tokio::task::yield_now().await;
+
+        *worker.process.lock().await = process;
+        worker.reaper_wake.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while worker.process_is_running().await {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("idle process should be reaped after the reaper is woken");
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn reap_idle_stops_expired_worker_and_reaps_its_child() {
@@ -824,6 +880,7 @@ mod tests {
                 sender,
                 child: WorkerChild::Direct(child),
             })),
+            reaper_wake: Arc::new(tokio::sync::Notify::new()),
         }
     }
 

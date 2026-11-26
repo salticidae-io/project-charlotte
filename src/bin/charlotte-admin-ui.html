@@ -136,6 +136,7 @@
           <div class="charts">
             <div class="chart-card"><h3>Requests and errors</h3><canvas id="serverRequests" width="560" height="200"></canvas></div>
             <div class="chart-card"><h3>Bandwidth</h3><canvas id="serverBytes" width="560" height="200"></canvas></div>
+            <div class="chart-card"><h3>Bot interventions</h3><canvas id="serverBots" width="560" height="200"></canvas></div>
           </div>
         </section>
 
@@ -187,6 +188,7 @@
           <div class="charts">
             <div class="chart-card"><h3>Requests and errors</h3><canvas id="vhostRequests" width="560" height="200"></canvas></div>
             <div class="chart-card"><h3>Bandwidth</h3><canvas id="vhostBytes" width="560" height="200"></canvas></div>
+            <div class="chart-card"><h3>Bot interventions</h3><canvas id="vhostBots" width="560" height="200"></canvas></div>
           </div>
         </div>
       </section>
@@ -1206,7 +1208,7 @@
       $('hosts').replaceChildren(table);
     }
 
-    const KEYS = ['requests', 'client_errors', 'server_errors', 'bytes_in', 'bytes_out'];
+    const KEYS = ['requests', 'client_errors', 'server_errors', 'bytes_in', 'bytes_out', 'bot_challenges', 'bot_blocks', 'bot_logged'];
     const REQUESTS = [
       {key: 'requests', label: 'requests', color: '#1f6feb'},
       {key: 'client_errors', label: '4xx', color: '#d29922'},
@@ -1215,6 +1217,11 @@
     const BYTES = [
       {key: 'bytes_in', label: 'in', color: '#2da44e'},
       {key: 'bytes_out', label: 'out', color: '#8250df'}
+    ];
+    const BOTS = [
+      {key: 'bot_challenges', label: 'challenges', color: '#bf8700'},
+      {key: 'bot_blocks', label: 'blocks', color: '#cf222e'},
+      {key: 'bot_logged', label: 'logged', color: '#8250df'}
     ];
 
     function rates(pick) {
@@ -1355,6 +1362,7 @@
         content.hidden = true;
         $('vhostRequests').getContext('2d').clearRect(0, 0, $('vhostRequests').width, $('vhostRequests').height);
         $('vhostBytes').getContext('2d').clearRect(0, 0, $('vhostBytes').width, $('vhostBytes').height);
+        $('vhostBots').getContext('2d').clearRect(0, 0, $('vhostBots').width, $('vhostBots').height);
         return;
       }
 
@@ -1385,6 +1393,9 @@
         ['Total requests', number(requests)],
         ['4xx errors', number(clientErrors)],
         ['5xx errors', number(serverErrors)],
+        ['Bot challenges', number(counters.bot_challenges)],
+        ['Bot blocks', number(counters.bot_blocks)],
+        ['Bot logged', number(counters.bot_logged)],
         ['Error rate', errorRate],
         ['Data received', byteSize(counters.bytes_in)],
         ['Data sent', byteSize(counters.bytes_out)],
@@ -1395,12 +1406,14 @@
       const hostRates = rates(sample => sample.traffic.vhosts[key]);
       chart('vhostRequests', hostRates, REQUESTS, false);
       chart('vhostBytes', hostRates, BYTES, true);
+      chart('vhostBots', hostRates, BOTS, false);
     }
 
     function draw() {
       const server = rates(sample => sample.traffic.total);
       chart('serverRequests', server, REQUESTS, false);
       chart('serverBytes', server, BYTES, true);
+      chart('serverBots', server, BOTS, false);
       const select = $('vhost');
       const names = hostList.map(controlName).filter(Boolean).sort();
       const current = routedHostName() || select.value;

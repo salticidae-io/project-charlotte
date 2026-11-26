@@ -20,6 +20,9 @@ pub(crate) struct Counters {
     requests: AtomicU64,
     client_errors: AtomicU64,
     server_errors: AtomicU64,
+    bot_challenges: AtomicU64,
+    bot_blocks: AtomicU64,
+    bot_logged: AtomicU64,
     bytes_in: AtomicU64,
     bytes_out: AtomicU64,
 }
@@ -30,10 +33,20 @@ impl Counters {
             "requests": self.requests.load(Ordering::Relaxed),
             "client_errors": self.client_errors.load(Ordering::Relaxed),
             "server_errors": self.server_errors.load(Ordering::Relaxed),
+            "bot_challenges": self.bot_challenges.load(Ordering::Relaxed),
+            "bot_blocks": self.bot_blocks.load(Ordering::Relaxed),
+            "bot_logged": self.bot_logged.load(Ordering::Relaxed),
             "bytes_in": self.bytes_in.load(Ordering::Relaxed),
             "bytes_out": self.bytes_out.load(Ordering::Relaxed),
         })
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BotIntervention {
+    Challenge,
+    Block,
+    Log,
 }
 
 #[derive(Default)]
@@ -90,6 +103,17 @@ impl RequestTraffic {
         } else if status.is_server_error() {
             self.each(|c| c.server_errors.fetch_add(1, Ordering::Relaxed));
         }
+    }
+
+    pub(crate) fn bot(&self, intervention: BotIntervention) {
+        self.each(|c| {
+            let counter = match intervention {
+                BotIntervention::Challenge => &c.bot_challenges,
+                BotIntervention::Block => &c.bot_blocks,
+                BotIntervention::Log => &c.bot_logged,
+            };
+            counter.fetch_add(1, Ordering::Relaxed)
+        });
     }
 
     fn bytes(&self, inbound: bool, len: usize) {
@@ -165,6 +189,9 @@ mod tests {
         let traffic = Traffic::default();
         let request = traffic.start(Some("example.com"));
         request.status(http::StatusCode::NOT_FOUND);
+        request.bot(BotIntervention::Challenge);
+        request.bot(BotIntervention::Block);
+        request.bot(BotIntervention::Log);
         let body = TrafficBody::inbound(Full::new(Bytes::from_static(b"abc")), request.clone());
         body.collect().await.unwrap();
         let body = TrafficBody::outbound(Full::new(Bytes::from_static(b"hello")), request);
@@ -177,12 +204,18 @@ mod tests {
         assert_eq!(snapshot["total"]["requests"], 2);
         assert_eq!(snapshot["total"]["client_errors"], 1);
         assert_eq!(snapshot["total"]["server_errors"], 1);
+        assert_eq!(snapshot["total"]["bot_challenges"], 1);
+        assert_eq!(snapshot["total"]["bot_blocks"], 1);
+        assert_eq!(snapshot["total"]["bot_logged"], 1);
         assert_eq!(snapshot["total"]["bytes_in"], 3);
         assert_eq!(snapshot["total"]["bytes_out"], 5);
         let vhost = &snapshot["vhosts"]["example.com"];
         assert_eq!(vhost["requests"], 1);
         assert_eq!(vhost["client_errors"], 1);
         assert_eq!(vhost["server_errors"], 0);
+        assert_eq!(vhost["bot_challenges"], 1);
+        assert_eq!(vhost["bot_blocks"], 1);
+        assert_eq!(vhost["bot_logged"], 1);
         assert_eq!(vhost["bytes_out"], 5);
     }
 }

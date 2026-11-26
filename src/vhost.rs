@@ -5,7 +5,7 @@ use std::os::fd::AsRawFd;
 #[cfg(any(feature = "hosting", feature = "proxy"))]
 use std::time::Duration;
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     error::Error,
     fs::{File, OpenOptions},
     io::{self, Read, Write},
@@ -15,6 +15,7 @@ use std::{
         Arc, RwLock,
         atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering},
     },
+    time::Instant,
 };
 
 use bytes::Bytes;
@@ -395,6 +396,25 @@ pub(crate) enum ControlError {
 struct VhostTable {
     vhosts: Vec<Arc<Vhost>>,
     default: Option<usize>,
+    exact_names: HashMap<String, usize>,
+}
+
+impl VhostTable {
+    fn new(vhosts: Vec<Arc<Vhost>>, default: Option<usize>) -> Self {
+        let mut exact_names = HashMap::new();
+        for (index, vhost) in vhosts.iter().enumerate() {
+            for name in &vhost.names {
+                if !name.starts_with("*.") {
+                    exact_names.insert(name.clone(), index);
+                }
+            }
+        }
+        Self {
+            vhosts,
+            default,
+            exact_names,
+        }
+    }
 }
 
 struct SourceState {
@@ -407,6 +427,81 @@ struct LoadedSource {
     content: String,
     entries: Vec<VhostFile>,
     vhosts: Vec<Arc<Vhost>>,
+}
+
+const PARALLEL_VHOST_LOAD_THRESHOLD: usize = 64;
+const MAX_VHOST_LOAD_THREADS: usize = 8;
+
+fn load_candidate(
+    path: &Path,
+    override_file: Option<&(PathBuf, Option<String>)>,
+    old_sources: &BTreeMap<PathBuf, LoadedSource>,
+) -> Result<(PathBuf, String, Vec<VhostFile>), Box<dyn Error + Send + Sync>> {
+    let content = if let Some((override_path, Some(content))) = override_file
+        && override_path == path
+    {
+        content.clone()
+    } else {
+        read_trusted_config(path)?
+    };
+    let entries = if let Some(old) = old_sources
+        .get(path)
+        .filter(|source| source.content == content)
+    {
+        old.entries.clone()
+    } else {
+        let file = parse_file_config(&content)?;
+        if file.options.is_some() {
+            return Err(format!(
+                "{}: options are only allowed in the main config file",
+                path.display()
+            )
+            .into());
+        }
+        file.vhost
+    };
+    Ok((path.to_path_buf(), content, entries))
+}
+
+fn load_candidates(
+    paths: Vec<PathBuf>,
+    override_file: Option<&(PathBuf, Option<String>)>,
+    old_sources: &BTreeMap<PathBuf, LoadedSource>,
+) -> Result<Vec<(PathBuf, String, Vec<VhostFile>)>, Box<dyn Error + Send + Sync>> {
+    let thread_count = if paths.len() < PARALLEL_VHOST_LOAD_THRESHOLD {
+        1
+    } else {
+        std::thread::available_parallelism()
+            .map_or(1, usize::from)
+            .min(MAX_VHOST_LOAD_THREADS)
+            .min(paths.len())
+    };
+    if thread_count == 1 {
+        return paths
+            .iter()
+            .map(|path| load_candidate(path, override_file, old_sources))
+            .collect();
+    }
+
+    let chunk_size = paths.len().div_ceil(thread_count);
+    std::thread::scope(|scope| {
+        let handles = paths
+            .chunks(chunk_size)
+            .map(|chunk| {
+                scope.spawn(move || {
+                    chunk
+                        .iter()
+                        .map(|path| load_candidate(path, override_file, old_sources))
+                        .collect::<Result<Vec<_>, _>>()
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut candidates = Vec::with_capacity(paths.len());
+        for handle in handles {
+            candidates.extend(handle.join().expect("vhost loading thread panicked")?);
+        }
+        Ok(candidates)
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -500,10 +595,13 @@ impl Router {
                     .map(|dir| resolve_config_path(dir, &config_dir))
             })
             .map(|dir| resolve_config_path(dir, &current_dir));
+        let mut identity_cache = HashMap::new();
         let mut router = Self::from_file(
             Arc::clone(&fallback),
             file,
             &config_dir,
+            &current_dir,
+            &mut identity_cache,
             rate_limit,
             waf,
             bot,
@@ -537,7 +635,9 @@ impl Router {
         };
         let mut sources = self.sources.lock().await;
         ensure_trusted_config(dir)?;
+        let scan_started = Instant::now();
         let mut paths = scan_vhost_files(dir)?;
+        let scan_elapsed = scan_started.elapsed();
         if let Some((path, content)) = &override_file {
             if path.parent() != Some(dir.as_path()) {
                 return Err("virtual-host override is outside the configured directory".into());
@@ -566,39 +666,25 @@ impl Router {
                 paths.retain(|candidate| candidate != path);
             }
         }
-        let mut candidates = Vec::with_capacity(paths.len());
-        for path in paths {
-            let content = if let Some((override_path, Some(content))) = &override_file
-                && override_path == &path
-            {
-                content.clone()
-            } else {
-                read_trusted_config(&path)?
-            };
-            let old = sources.files.get(&path);
-            let entries = if old.is_some_and(|source| source.content == content) {
-                old.expect("checked source exists").entries.clone()
-            } else {
-                let file = parse_file_config(&content)?;
-                if file.options.is_some() {
-                    return Err(format!(
-                        "{}: options are only allowed in the main config file",
-                        path.display()
-                    )
-                    .into());
-                }
-                file.vhost
-            };
-            candidates.push((path, content, entries));
-        }
+        let file_count = paths.len();
+        let read_started = Instant::now();
+        let candidates = load_candidates(paths, override_file.as_ref(), &sources.files)?;
+        let read_elapsed = read_started.elapsed();
+        let entry_count = candidates
+            .iter()
+            .map(|(_, _, entries)| entries.len())
+            .sum::<usize>();
 
+        let validate_started = Instant::now();
         let all_entries = sources
             .main_entries
             .iter()
             .chain(candidates.iter().flat_map(|(_, _, entries)| entries));
         validate_vhost_declarations(all_entries.clone())?;
         validate_vhost_waf_declarations(all_entries, self.waf.is_some())?;
+        let validate_elapsed = validate_started.elapsed();
 
+        let build_started = Instant::now();
         let mut changed = sources.main_vhosts.is_none()
             || sources.files.len() != candidates.len()
             || candidates.iter().any(|(path, content, _)| {
@@ -607,6 +693,8 @@ impl Router {
                     .get(path)
                     .is_none_or(|source| source.content != *content)
             });
+        let process_dir = changed.then(std::env::current_dir).transpose()?;
+        let mut identity_cache = HashMap::new();
         let main_vhosts = match &sources.main_vhosts {
             Some(vhosts) => vhosts.clone(),
             None => {
@@ -618,7 +706,13 @@ impl Router {
                 let router = Self::from_file(
                     Arc::clone(&self.fallback),
                     file,
-                    &std::env::current_dir()?,
+                    process_dir
+                        .as_deref()
+                        .expect("initial vhost construction requires the process directory"),
+                    process_dir
+                        .as_deref()
+                        .expect("initial vhost construction requires the process directory"),
+                    &mut identity_cache,
                     self.rate_limit.clone(),
                     self.waf,
                     self.bot.clone(),
@@ -657,6 +751,10 @@ impl Router {
                         options: None,
                     },
                     config_dir,
+                    process_dir
+                        .as_deref()
+                        .expect("changed vhost construction requires the process directory"),
+                    &mut identity_cache,
                     self.rate_limit.clone(),
                     self.waf,
                     self.bot.clone(),
@@ -686,7 +784,9 @@ impl Router {
             ensure_acme_cache_is_private(acme.cache_dir(), &vhosts)?;
         }
         let default = vhosts.iter().position(|vhost| vhost.default);
-        let new_table = Arc::new(VhostTable { vhosts, default });
+        let new_table = Arc::new(VhostTable::new(vhosts, default));
+        let vhost_count = new_table.vhosts.len();
+        let build_elapsed = build_started.elapsed();
         if !changed {
             changed = new_table.vhosts.len() != self.snapshot().vhosts.len();
         }
@@ -709,6 +809,7 @@ impl Router {
                 },
             }
         }
+        let swap_started = Instant::now();
         sources.main_vhosts = Some(main_vhosts);
         sources.files = loaded;
         if changed {
@@ -717,6 +818,21 @@ impl Router {
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = new_table;
         }
+        let swap_elapsed = swap_started.elapsed();
+        crate::log_notice!(
+            "Loaded {vhost_count} virtual host(s) from {file_count} file(s) in {} ms (scan {} ms, read/parse {} ms, validate {} ms, build {} ms, table update {} ms)",
+            scan_elapsed.as_millis()
+                + read_elapsed.as_millis()
+                + validate_elapsed.as_millis()
+                + build_elapsed.as_millis()
+                + swap_elapsed.as_millis(),
+            scan_elapsed.as_millis(),
+            read_elapsed.as_millis(),
+            validate_elapsed.as_millis(),
+            build_elapsed.as_millis(),
+            swap_elapsed.as_millis(),
+        );
+        crate::log_debug!("Parsed {entry_count} virtual-host declaration(s) from vhost files");
         Ok(changed)
     }
 
@@ -929,6 +1045,8 @@ impl Router {
         fallback: Arc<Config>,
         file: FileConfig,
         config_dir: &Path,
+        process_dir: &Path,
+        identity_cache: &mut HashMap<(String, Option<String>), (u32, u32)>,
         rate_limit: Option<Arc<RateLimiter>>,
         waf: Option<Waf>,
         bot: Option<Arc<BotPolicy>>,
@@ -939,7 +1057,6 @@ impl Router {
         validate_vhost_declarations(&file.vhost)?;
         validate_vhost_waf_declarations(&file.vhost, waf.is_some())?;
         let main_entries = file.vhost.clone();
-        let process_dir = std::env::current_dir()?;
         let mut vhosts = Vec::with_capacity(file.vhost.len());
         let default = file.vhost.iter().position(|entry| entry.default);
 
@@ -1093,7 +1210,8 @@ impl Router {
                     .user
                     .as_deref()
                     .ok_or("vhost user is required unless proxy_pass is configured")?;
-                let (uid, gid) = resolve_identity(user, entry.group.as_deref())?;
+                let (uid, gid) =
+                    resolve_identity_cached(identity_cache, user, entry.group.as_deref())?;
                 if uid == 0 {
                     // A worker exists to confine a site to an unprivileged
                     // account; one running as root confines nothing.
@@ -1264,6 +1382,7 @@ impl Router {
                     error_log_file,
                     error_log_format,
                     process: Mutex::new(None),
+                    reaper_wake: Arc::new(tokio::sync::Notify::new()),
                 });
                 if let Some(timeout) = worker.idle_timeout {
                     Worker::spawn_idle_reaper(&worker, timeout);
@@ -1296,10 +1415,7 @@ impl Router {
         let vhosts = vhosts.into_iter().map(Arc::new).collect::<Vec<_>>();
         Ok(Self {
             fallback,
-            table: RwLock::new(Arc::new(VhostTable {
-                vhosts: vhosts.clone(),
-                default,
-            })),
+            table: RwLock::new(Arc::new(VhostTable::new(vhosts.clone(), default))),
             sources: Mutex::new(SourceState {
                 main_entries,
                 main_vhosts: Some(vhosts),
@@ -1469,7 +1585,13 @@ impl Router {
         .await;
         let mut response = response;
         let client_slot = response.extensions_mut().remove::<ClientSlot>();
+        let bot_intervention = response
+            .extensions_mut()
+            .remove::<crate::traffic::BotIntervention>();
         traffic.status(response.status());
+        if let Some(bot_intervention) = bot_intervention {
+            traffic.bot(bot_intervention);
+        }
         timing.mark_headers();
         if self.fallback.server_timing
             && let Ok(value) = HeaderValue::from_str(&crate::logging::server_timing_value(&timing))
@@ -1606,6 +1728,7 @@ impl Router {
             },
             None => None,
         };
+        let mut bot_intervention = None;
         let response = async {
             #[cfg(feature = "swarm")]
             if let Some(swarm) = &self.swarm
@@ -1657,8 +1780,12 @@ impl Router {
                     );
                 }
                 match verdict.action {
-                    BotAction::Allow | BotAction::Log => {}
+                    BotAction::Allow => {}
+                    BotAction::Log => {
+                        bot_intervention = Some(crate::traffic::BotIntervention::Log);
+                    }
                     BotAction::Block => {
+                        bot_intervention = Some(crate::traffic::BotIntervention::Block);
                         return response::error_response(StatusCode::FORBIDDEN, "Forbidden\n");
                     }
                     BotAction::Challenge
@@ -1666,6 +1793,7 @@ impl Router {
                             .bot_state
                             .has_valid_cookie(request.headers(), peer.ip()) => {}
                     BotAction::Challenge => {
+                        bot_intervention = Some(crate::traffic::BotIntervention::Challenge);
                         let (difficulty, ttl) = policy.challenge_parameters();
                         return response::bot_response(
                             self.bot_state.challenge(&request, peer, difficulty, ttl),
@@ -1687,6 +1815,9 @@ impl Router {
         }
         .await;
         let mut response = response;
+        if let Some(bot_intervention) = bot_intervention {
+            response.extensions_mut().insert(bot_intervention);
+        }
         if let Some(client_slot) = client_slot {
             response.extensions_mut().insert(client_slot);
         }
@@ -1772,6 +1903,9 @@ impl Router {
     }
 
     fn select_vhost(table: &VhostTable, host: &str) -> Option<usize> {
+        if let Some(index) = table.exact_names.get(host) {
+            return Some(*index);
+        }
         table
             .vhosts
             .iter()
@@ -1947,6 +2081,21 @@ fn cgroup_for_vhost(
     Ok(Some(
         CgroupSpec::new(path, memory_max, cpu_max, pids_max)?.expand(uid, gid, name)?,
     ))
+}
+
+#[cfg(feature = "hosting")]
+fn resolve_identity_cached(
+    cache: &mut HashMap<(String, Option<String>), (u32, u32)>,
+    user: &str,
+    group: Option<&str>,
+) -> Result<(u32, u32), Box<dyn Error + Send + Sync>> {
+    let key = (user.to_owned(), group.map(str::to_owned));
+    if let Some(identity) = cache.get(&key) {
+        return Ok(*identity);
+    }
+    let identity = resolve_identity(user, group)?;
+    cache.insert(key, identity);
+    Ok(identity)
 }
 
 fn validate_vhost_declarations<'a>(
@@ -2496,8 +2645,9 @@ fn add_parent_directory(directories: &mut Vec<PathBuf>, path: &Path, base: &Path
 
 fn deduplicate_directories(directories: Vec<PathBuf>) -> Vec<PathBuf> {
     let mut unique = Vec::new();
+    let mut seen = HashSet::new();
     for directory in directories {
-        if !unique.contains(&directory) {
+        if seen.insert(directory.clone()) {
             unique.push(directory);
         }
     }
@@ -3741,6 +3891,54 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
+    #[cfg(feature = "proxy")]
+    #[tokio::test]
+    async fn reloads_many_vhost_files_in_order_and_reports_the_first_error() {
+        let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "project-charlotte-vhost-parallel-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        for index in 0..70 {
+            let name = format!("site-{index:03}.test");
+            std::fs::write(
+                directory.join(format!("{index:03}.yaml")),
+                format!("vhost:\n  - server_names: [{name}]\n    proxy_pass: http://127.0.0.1:1\n"),
+            )
+            .unwrap();
+        }
+
+        let ParseResult::Config(config) = Config::parse([
+            "--vhost-dir".to_owned(),
+            directory.to_string_lossy().into_owned(),
+        ])
+        .unwrap() else {
+            panic!("expected a configuration");
+        };
+        let router = Router::load(Arc::new(*config), None, None, None, None)
+            .await
+            .expect("valid vhost directory should load");
+        let names = router
+            .snapshot()
+            .vhosts
+            .iter()
+            .map(|vhost| vhost.names[0].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(names.len(), 70);
+        assert_eq!(names[0], "site-000.test");
+        assert_eq!(names[69], "site-069.test");
+
+        let first_bad = directory.join("001-bad.yaml");
+        std::fs::write(&first_bad, "options: { debug: true }\n").unwrap();
+        std::fs::write(directory.join("999-bad.yaml"), "options: { debug: true }\n").unwrap();
+        let error = router.reload_dir().await.unwrap_err();
+        assert!(error.to_string().contains(&first_bad.display().to_string()));
+        assert_eq!(router.snapshot().vhosts.len(), 70);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn validates_vhost_tls_certificate_pair() {
         let mut entry = declaration(&["example.test"], false);
@@ -4020,18 +4218,42 @@ mod tests {
                     error_log_file: None,
                     error_log_format: "[%l] %M".to_owned(),
                     process: tokio::sync::Mutex::new(None),
+                    reaper_wake: Arc::new(tokio::sync::Notify::new()),
                 })),
                 #[cfg(feature = "proxy")]
                 proxy: None,
             })
         };
-        VhostTable {
-            vhosts: vec![
+        VhostTable::new(
+            vec![
                 vhost(&["example.test", "*.example.test"], false),
-                vhost(&["other.test", "*.dev.example.test"], default),
+                vhost(
+                    &["other.test", "*.dev.example.test", "api.example.test"],
+                    default,
+                ),
             ],
-            default: default.then_some(1),
-        }
+            default.then_some(1),
+        )
+    }
+
+    #[test]
+    fn exact_vhost_name_precedes_a_wildcard_match() {
+        let table = fuzz_table(false);
+
+        assert_eq!(Router::select_vhost(&table, "api.example.test"), Some(1));
+    }
+
+    #[test]
+    fn directory_deduplication_preserves_first_seen_order() {
+        let directories = ["/first", "/second", "/first", "/third", "/second"]
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
+
+        assert_eq!(
+            super::deduplicate_directories(directories),
+            ["/first", "/second", "/third"].map(PathBuf::from)
+        );
     }
 
     /// Routes a request to a vhost in the master and unpacks it again the way
