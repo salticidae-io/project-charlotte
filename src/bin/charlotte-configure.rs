@@ -122,6 +122,7 @@ const ASKED_VHOST_KEYS: &[&str] = &[
     "cgroup_pids_max",
     "rate_limit",
     "rate_limit_burst",
+    "max_clients",
     "bot",
     "tls_cert",
     "tls_key",

@@ -296,6 +296,11 @@ client key is the socket peer IP unless that peer matches a configured
 from the rightmost untrusted `X-Forwarded-For` hop. IPv4 addresses are tracked
 individually and IPv6 addresses are grouped by `/64`.
 
+A vhost can set `max_clients: N` to cap requests being served concurrently by
+that host. A request holds its slot until its response body finishes or is
+dropped; excess requests receive `503 Service Unavailable` with
+`Retry-After: 1`. Omit the setting for no per-vhost concurrency cap.
+
 Charlotte strips `X-Forwarded-For` from requests received from untrusted peers.
 For a trusted proxy, it keeps a normalized IP-only chain and appends the direct
 peer IP when proxying upstream. Configure only proxies that overwrite or safely

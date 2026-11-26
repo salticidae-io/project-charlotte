@@ -12,7 +12,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, RwLock,
-        atomic::{AtomicU16, AtomicU64, Ordering},
+        atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering},
     },
 };
 
@@ -94,6 +94,7 @@ struct VhostFile {
     cgroup_pids_max: Option<String>,
     rate_limit: Option<String>,
     rate_limit_burst: Option<u32>,
+    max_clients: Option<usize>,
     bot: Option<BotPolicyDeclarationFile>,
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
@@ -239,6 +240,7 @@ struct Vhost {
     default: bool,
     waf: Option<Waf>,
     rate_limit: VhostRateLimit,
+    clients: Option<Arc<ClientLimit>>,
     bot: VhostBot,
     access_log: Option<Arc<crate::logging::AccessLog>>,
     error_log: Arc<crate::logging::ErrorLog>,
@@ -248,6 +250,96 @@ struct Vhost {
     worker: Option<Arc<Worker>>,
     #[cfg(feature = "proxy")]
     proxy: Option<Arc<ReverseProxy>>,
+}
+
+struct ClientLimit {
+    limit: usize,
+    active: AtomicUsize,
+}
+
+impl ClientLimit {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            active: AtomicUsize::new(0),
+        }
+    }
+
+    fn try_acquire(self: &Arc<Self>) -> Option<ClientSlot> {
+        let mut active = self.active.load(Ordering::Relaxed);
+        loop {
+            if active >= self.limit {
+                return None;
+            }
+            match self.active.compare_exchange_weak(
+                active,
+                active + 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(ClientSlot(Arc::clone(self))),
+                Err(current) => active = current,
+            }
+        }
+    }
+}
+
+struct ClientSlot(Arc<ClientLimit>);
+
+impl Drop for ClientSlot {
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, Ordering::Release);
+    }
+}
+
+struct ClientSlotBody<B> {
+    body: std::pin::Pin<Box<B>>,
+    slot: std::cell::Cell<Option<ClientSlot>>,
+}
+
+impl<B> ClientSlotBody<B> {
+    fn new(body: B, slot: ClientSlot) -> Self {
+        Self {
+            body: Box::pin(body),
+            slot: std::cell::Cell::new(Some(slot)),
+        }
+    }
+}
+
+impl<B> Unpin for ClientSlotBody<B> {}
+
+impl<B> Body for ClientSlotBody<B>
+where
+    B: Body<Data = Bytes>,
+{
+    type Data = Bytes;
+    type Error = B::Error;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        let frame = this.body.as_mut().poll_frame(cx);
+        if matches!(frame, std::task::Poll::Ready(None))
+            || this.body.as_ref().get_ref().is_end_stream()
+        {
+            this.slot.take();
+        }
+        frame
+    }
+
+    fn is_end_stream(&self) -> bool {
+        let is_end_stream = self.body.as_ref().get_ref().is_end_stream();
+        if is_end_stream {
+            self.slot.take();
+        }
+        is_end_stream
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.body.as_ref().get_ref().size_hint()
+    }
 }
 
 enum VhostRateLimit {
@@ -969,6 +1061,9 @@ impl Router {
                     default: entry.default,
                     waf: vhost_waf,
                     rate_limit: vhost_rate_limit,
+                    clients: entry
+                        .max_clients
+                        .map(|limit| Arc::new(ClientLimit::new(limit))),
                     bot: vhost_bot,
                     #[cfg(feature = "swarm")]
                     swarm_enabled: entry.swarm.unwrap_or(true),
@@ -1172,6 +1267,9 @@ impl Router {
                     default: entry.default,
                     waf: vhost_waf,
                     rate_limit: vhost_rate_limit,
+                    clients: entry
+                        .max_clients
+                        .map(|limit| Arc::new(ClientLimit::new(limit))),
                     bot: vhost_bot,
                     #[cfg(feature = "swarm")]
                     swarm_enabled: entry.swarm.unwrap_or(true),
@@ -1359,9 +1457,10 @@ impl Router {
             self.dispatch_inner(request, client, local, table, host, selected),
         )
         .await;
+        let mut response = response;
+        let client_slot = response.extensions_mut().remove::<ClientSlot>();
         traffic.status(response.status());
         timing.mark_headers();
-        let mut response = response;
         if self.fallback.server_timing
             && let Ok(value) = HeaderValue::from_str(&crate::logging::server_timing_value(&timing))
         {
@@ -1393,6 +1492,11 @@ impl Router {
             response
         };
         let (parts, body) = response.into_parts();
+        let body = if let Some(client_slot) = client_slot {
+            ClientSlotBody::new(body, client_slot).boxed_unsync()
+        } else {
+            body
+        };
         Response::from_parts(
             parts,
             crate::traffic::TrafficBody::outbound(body, traffic).boxed_unsync(),
@@ -1476,82 +1580,107 @@ impl Router {
         {
             return crate::ratelimit::too_many_requests(retry_after);
         }
-        #[cfg(feature = "swarm")]
-        if let Some(swarm) = &self.swarm
-            && selected.is_none_or(|index| table.vhosts[index].swarm_enabled)
-            && let Some(blocked) = swarm.check(peer.ip()).await
-        {
-            let mut response = response::error_response(blocked.status, "Blocked\n");
-            if let Ok(reason) = HeaderValue::from_str(&blocked.reason) {
-                response.headers_mut().insert("block-reason", reason);
-            }
-            return response;
-        }
-        let bot_policy = match selected {
-            Some(index) => match &table.vhosts[index].bot {
-                VhostBot::Inherit => self.bot.as_ref(),
-                VhostBot::Off => None,
-                VhostBot::Policy(policy) => Some(policy),
-            },
-            None => self.bot.as_ref(),
-        };
-        if let Some(policy) = bot_policy {
-            let _bot_timing = crate::logging::StageTimer::new(crate::logging::Stage::Bot);
-            let tls = request.extensions().get::<TlsSni>().is_some();
-            if request.uri().path() == bot::CHALLENGE_PATH {
-                if request.method() != http::Method::GET {
-                    return response::error_response(
-                        StatusCode::FORBIDDEN,
-                        "Invalid bot challenge\n",
+        let client_slot = match selected.and_then(|index| table.vhosts[index].clients.as_ref()) {
+            Some(clients) => match clients.try_acquire() {
+                Some(slot) => Some(slot),
+                None => {
+                    let mut response = response::error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "Too many clients\n",
                     );
+                    response
+                        .headers_mut()
+                        .insert(http::header::RETRY_AFTER, HeaderValue::from_static("1"));
+                    return response;
                 }
-                let (difficulty, ttl) = policy.challenge_parameters();
-                return response::bot_response(
-                    self.bot_state
-                        .solve_challenge(&request, peer, tls, difficulty, ttl),
-                );
-            }
-            let fingerprint = request
-                .extensions()
-                .get::<TlsFingerprint>()
-                .map(|fingerprint| fingerprint.0.as_ref());
-            let verdict = bot::evaluate(policy, &self.bot_state, &request, peer, fingerprint).await;
-            if verdict.action != BotAction::Allow {
-                crate::log_error!(
-                    "bot detection: client={peer} score={} action={:?} reasons={:?}",
-                    verdict.score,
-                    verdict.action,
-                    verdict.reasons
-                );
-            }
-            match verdict.action {
-                BotAction::Allow | BotAction::Log => {}
-                BotAction::Block => {
-                    return response::error_response(StatusCode::FORBIDDEN, "Forbidden\n");
+            },
+            None => None,
+        };
+        let response = async {
+            #[cfg(feature = "swarm")]
+            if let Some(swarm) = &self.swarm
+                && selected.is_none_or(|index| table.vhosts[index].swarm_enabled)
+                && let Some(blocked) = swarm.check(peer.ip()).await
+            {
+                let mut response = response::error_response(blocked.status, "Blocked\n");
+                if let Ok(reason) = HeaderValue::from_str(&blocked.reason) {
+                    response.headers_mut().insert("block-reason", reason);
                 }
-                BotAction::Challenge
-                    if self
-                        .bot_state
-                        .has_valid_cookie(request.headers(), peer.ip()) => {}
-                BotAction::Challenge => {
+                return response;
+            }
+            let bot_policy = match selected {
+                Some(index) => match &table.vhosts[index].bot {
+                    VhostBot::Inherit => self.bot.as_ref(),
+                    VhostBot::Off => None,
+                    VhostBot::Policy(policy) => Some(policy),
+                },
+                None => self.bot.as_ref(),
+            };
+            if let Some(policy) = bot_policy {
+                let _bot_timing = crate::logging::StageTimer::new(crate::logging::Stage::Bot);
+                let tls = request.extensions().get::<TlsSni>().is_some();
+                if request.uri().path() == bot::CHALLENGE_PATH {
+                    if request.method() != http::Method::GET {
+                        return response::error_response(
+                            StatusCode::FORBIDDEN,
+                            "Invalid bot challenge\n",
+                        );
+                    }
                     let (difficulty, ttl) = policy.challenge_parameters();
                     return response::bot_response(
-                        self.bot_state.challenge(&request, peer, difficulty, ttl),
+                        self.bot_state
+                            .solve_challenge(&request, peer, tls, difficulty, ttl),
                     );
                 }
+                let fingerprint = request
+                    .extensions()
+                    .get::<TlsFingerprint>()
+                    .map(|fingerprint| fingerprint.0.as_ref());
+                let verdict =
+                    bot::evaluate(policy, &self.bot_state, &request, peer, fingerprint).await;
+                if verdict.action != BotAction::Allow {
+                    crate::log_error!(
+                        "bot detection: client={peer} score={} action={:?} reasons={:?}",
+                        verdict.score,
+                        verdict.action,
+                        verdict.reasons
+                    );
+                }
+                match verdict.action {
+                    BotAction::Allow | BotAction::Log => {}
+                    BotAction::Block => {
+                        return response::error_response(StatusCode::FORBIDDEN, "Forbidden\n");
+                    }
+                    BotAction::Challenge
+                        if self
+                            .bot_state
+                            .has_valid_cookie(request.headers(), peer.ip()) => {}
+                    BotAction::Challenge => {
+                        let (difficulty, ttl) = policy.challenge_parameters();
+                        return response::bot_response(
+                            self.bot_state.challenge(&request, peer, difficulty, ttl),
+                        );
+                    }
+                }
             }
+            let waf = selected
+                .and_then(|index| table.vhosts[index].waf)
+                .or(self.waf);
+            if let Some(waf) = waf {
+                return waf
+                    .inspect(request, peer, local, |request| {
+                        self.route(request, host, peer, local, &table)
+                    })
+                    .await;
+            }
+            self.route(request, host, peer, local, &table).await
         }
-        let waf = selected
-            .and_then(|index| table.vhosts[index].waf)
-            .or(self.waf);
-        if let Some(waf) = waf {
-            return waf
-                .inspect(request, peer, local, |request| {
-                    self.route(request, host, peer, local, &table)
-                })
-                .await;
+        .await;
+        let mut response = response;
+        if let Some(client_slot) = client_slot {
+            response.extensions_mut().insert(client_slot);
         }
-        self.route(request, host, peer, local, &table).await
+        response
     }
 
     pub(crate) fn sni_certificates(&self) -> (Vec<(String, TlsFiles)>, Option<TlsFiles>) {
@@ -1878,6 +2007,11 @@ fn validate_vhost_declarations<'a>(
                 index + 1
             )
             .into());
+        }
+        if entry.max_clients == Some(0) {
+            return Err(
+                format!("vhost {} max_clients must be greater than zero", index + 1).into(),
+            );
         }
         if entry.tls_cert.is_some() != entry.tls_key.is_some() {
             return Err(
@@ -3023,7 +3157,7 @@ fn persist_vhost_file(dir: &Path, path: &Path, content: &str) -> io::Result<()> 
 #[cfg(all(test, feature = "hosting"))]
 mod tests {
     use super::{
-        FileConfig, Router, TlsSni, Vhost, VhostFile, VhostTable, Worker, WorkerArgs,
+        ClientLimit, FileConfig, Router, TlsSni, Vhost, VhostFile, VhostTable, Worker, WorkerArgs,
         build_worker_args, cgroup_for_vhost, ensure_trusted_config, https_redirect_location,
         match_score, normalize_host, normalize_server_name, parse_file_config,
         render_control_vhost, request_host, resolve_identity, scan_vhost_files, select_route,
@@ -3130,6 +3264,7 @@ mod tests {
             cgroup_pids_max: None,
             rate_limit: None,
             rate_limit_burst: None,
+            max_clients: None,
             bot: None,
             tls_cert: None,
             tls_key: None,
@@ -3162,9 +3297,11 @@ mod tests {
                     root: /tmp/site
                     user: example
                     default: true
+                    max_clients: 4
             "#,
         )
         .unwrap();
+        assert_eq!(parsed.vhost[0].max_clients, Some(4));
         assert!(validate_vhost_declarations(&parsed.vhost).is_ok());
         assert!(
             validate_vhost_declarations(&[
@@ -3180,6 +3317,25 @@ mod tests {
             ])
             .is_err()
         );
+        let mut zero_max_clients = declaration(&["example.com"], false);
+        zero_max_clients.max_clients = Some(0);
+        assert!(validate_vhost_declarations(&[zero_max_clients]).is_err());
+    }
+
+    #[test]
+    fn client_limit_rejects_over_capacity_and_releases_slots() {
+        let limit = Arc::new(ClientLimit::new(2));
+        let first = limit.try_acquire().expect("first client slot");
+        let second = limit.try_acquire().expect("second client slot");
+        assert!(limit.try_acquire().is_none());
+        assert_eq!(limit.active.load(Ordering::Relaxed), 2);
+
+        drop(first);
+        assert_eq!(limit.active.load(Ordering::Relaxed), 1);
+        let third = limit.try_acquire().expect("released slot can be reused");
+        assert!(limit.try_acquire().is_none());
+        drop((second, third));
+        assert_eq!(limit.active.load(Ordering::Relaxed), 0);
     }
 
     #[cfg(feature = "hosting")]
@@ -3819,6 +3975,7 @@ mod tests {
                 default,
                 waf: None,
                 rate_limit: super::VhostRateLimit::Inherit,
+                clients: None,
                 bot: super::VhostBot::Inherit,
                 #[cfg(feature = "swarm")]
                 swarm_enabled: true,
