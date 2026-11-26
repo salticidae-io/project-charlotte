@@ -56,6 +56,11 @@ mod hosted;
 #[cfg(feature = "hosting")]
 use hosted::*;
 
+#[cfg(feature = "hosting")]
+pub(crate) fn set_max_workers(limit: usize) {
+    hosted::set_max_workers(limit);
+}
+
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileConfig {
@@ -1381,7 +1386,7 @@ impl Router {
                     threads,
                     error_log_file,
                     error_log_format,
-                    process: Mutex::new(None),
+                    process: Arc::new(Mutex::new(None)),
                     reaper_wake: Arc::new(tokio::sync::Notify::new()),
                 });
                 if let Some(timeout) = worker.idle_timeout {
@@ -4217,7 +4222,7 @@ mod tests {
                     threads: 1,
                     error_log_file: None,
                     error_log_format: "[%l] %M".to_owned(),
-                    process: tokio::sync::Mutex::new(None),
+                    process: Arc::new(tokio::sync::Mutex::new(None)),
                     reaper_wake: Arc::new(tokio::sync::Notify::new()),
                 })),
                 #[cfg(feature = "proxy")]

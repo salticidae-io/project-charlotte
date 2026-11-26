@@ -1,6 +1,7 @@
 //! Spawns, supervises, and forwards requests to workers for hosted virtual hosts.
 
 use std::{
+    collections::HashMap,
     error::Error,
     ffi::OsString,
     io,
@@ -9,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
-        Arc, Mutex as StdMutex, Weak,
+        Arc, Mutex as StdMutex, OnceLock, Weak,
         atomic::{AtomicUsize, Ordering},
     },
     thread,
@@ -17,7 +18,10 @@ use std::{
 };
 
 use bytes::Bytes;
-use http::{HeaderName, HeaderValue, Request, Response, StatusCode, Uri, Version, header::HOST};
+use http::{
+    HeaderName, HeaderValue, Request, Response, StatusCode, Uri, Version,
+    header::{HOST, RETRY_AFTER},
+};
 use http_body::Body;
 use http_body_util::{BodyExt, combinators::UnsyncBoxBody};
 use hyper::{body::Incoming, client::conn::http2::SendRequest};
@@ -48,6 +52,7 @@ const WORKER_READY_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a worker is given to shut down on its own before it is killed.
 const WORKER_SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 const WORKER_SHUTDOWN_POLL: Duration = Duration::from_millis(5);
+static WORKER_POOL: OnceLock<Arc<WorkerPool>> = OnceLock::new();
 
 type WorkerRequestBody = UnsyncBoxBody<Bytes, io::Error>;
 type WorkerSender = SendRequest<WorkerRequestBody>;
@@ -68,13 +73,175 @@ pub(super) struct Worker {
     pub(super) threads: usize,
     pub(super) error_log_file: Option<PathBuf>,
     pub(super) error_log_format: String,
-    pub(super) process: Mutex<Option<WorkerProcess>>,
+    pub(super) process: Arc<Mutex<Option<WorkerProcess>>>,
     pub(super) reaper_wake: Arc<Notify>,
 }
 
 pub(super) struct WorkerProcess {
     pub(super) sender: WorkerSender,
     pub(super) child: WorkerChild,
+    slot: Option<WorkerSlot>,
+}
+
+struct WorkerPool {
+    state: StdMutex<WorkerPoolState>,
+}
+
+struct WorkerPoolState {
+    limit: usize,
+    next_id: u64,
+    entries: HashMap<u64, WorkerEntry>,
+}
+
+struct WorkerEntry {
+    active: Arc<AtomicUsize>,
+    last_used: Arc<StdMutex<Instant>>,
+    process: Weak<Mutex<Option<WorkerProcess>>>,
+}
+
+struct WorkerSlot {
+    pool: Arc<WorkerPool>,
+    id: u64,
+}
+
+struct WorkerReservation {
+    slot: WorkerSlot,
+    evicted: Option<WorkerProcess>,
+}
+
+#[derive(Debug)]
+struct WorkerCapacityExhausted;
+
+impl std::fmt::Display for WorkerCapacityExhausted {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("the live worker limit is reached and no idle worker can be evicted")
+    }
+}
+
+impl Error for WorkerCapacityExhausted {}
+
+impl WorkerPool {
+    fn new(limit: usize) -> Self {
+        Self {
+            state: StdMutex::new(WorkerPoolState {
+                limit,
+                next_id: 0,
+                entries: HashMap::new(),
+            }),
+        }
+    }
+
+    fn set_limit(&self, limit: usize) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .limit = limit;
+    }
+
+    fn reserve(
+        self: &Arc<Self>,
+        worker: &Worker,
+    ) -> Result<WorkerReservation, WorkerCapacityExhausted> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.limit == 0 || state.entries.len() < state.limit {
+            let id = state.next_id();
+            state.entries.insert(id, WorkerEntry::new(worker));
+            return Ok(WorkerReservation {
+                slot: WorkerSlot {
+                    pool: Arc::clone(self),
+                    id,
+                },
+                evicted: None,
+            });
+        }
+
+        let mut candidates = state
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.active.load(Ordering::Acquire) == 0)
+            .map(|(id, entry)| {
+                let last_used = *entry
+                    .last_used
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                (*id, last_used)
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_unstable_by_key(|(id, last_used)| (*last_used, *id));
+
+        for (victim_id, _) in candidates {
+            let Some(process) = state
+                .entries
+                .get(&victim_id)
+                .and_then(|entry| entry.process.upgrade())
+            else {
+                continue;
+            };
+            let Ok(mut process_guard) = process.try_lock() else {
+                continue;
+            };
+            let Some(mut evicted) = process_guard.take() else {
+                continue;
+            };
+            let id = state.next_id();
+            let mut slot = evicted.slot.take().unwrap_or_else(|| WorkerSlot {
+                pool: Arc::clone(self),
+                id: victim_id,
+            });
+            slot.id = id;
+            state.entries.remove(&victim_id);
+            state.entries.insert(id, WorkerEntry::new(worker));
+            return Ok(WorkerReservation {
+                slot,
+                evicted: Some(evicted),
+            });
+        }
+
+        Err(WorkerCapacityExhausted)
+    }
+}
+
+impl WorkerPoolState {
+    fn next_id(&mut self) -> u64 {
+        loop {
+            self.next_id = self.next_id.wrapping_add(1);
+            if !self.entries.contains_key(&self.next_id) {
+                return self.next_id;
+            }
+        }
+    }
+}
+
+impl WorkerEntry {
+    fn new(worker: &Worker) -> Self {
+        Self {
+            active: Arc::clone(&worker.active),
+            last_used: Arc::clone(&worker.last_used),
+            process: Arc::downgrade(&worker.process),
+        }
+    }
+}
+
+impl Drop for WorkerSlot {
+    fn drop(&mut self) {
+        self.pool
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entries
+            .remove(&self.id);
+    }
+}
+
+fn worker_pool() -> &'static Arc<WorkerPool> {
+    WORKER_POOL.get_or_init(|| Arc::new(WorkerPool::new(0)))
+}
+
+pub(super) fn set_max_workers(limit: usize) {
+    worker_pool().set_limit(limit);
 }
 
 pub(super) enum WorkerChild {
@@ -201,8 +368,9 @@ impl Worker {
         self.process.lock().await.is_some()
     }
 
-    pub(super) async fn spawn_process(
+    async fn spawn_process(
         &self,
+        slot: WorkerSlot,
     ) -> Result<WorkerProcess, Box<dyn Error + Send + Sync>> {
         crate::log_debug!(
             "Spawning virtual-host worker for root {} as uid {} gid {}{}",
@@ -310,7 +478,11 @@ impl Worker {
                 crate::log_error!("virtual host worker connection closed: {error}");
             }
         });
-        Ok(WorkerProcess { sender, child })
+        Ok(WorkerProcess {
+            sender,
+            child,
+            slot: Some(slot),
+        })
     }
 
     fn startup_failure(&self, child: &mut WorkerChild, reason: &str) -> String {
@@ -366,6 +538,9 @@ impl Worker {
                 Response::from_parts(parts, body)
             }
             Err(error) => {
+                if error.downcast_ref::<WorkerCapacityExhausted>().is_some() {
+                    return worker_capacity_response();
+                }
                 crate::log_error!("virtual host worker failed: {error}");
                 response::error_response(StatusCode::BAD_GATEWAY, "Virtual host worker failed\n")
             }
@@ -386,8 +561,12 @@ impl Worker {
                 .is_none_or(|process| process.sender.is_closed())
             {
                 *process_guard = None;
+                let reservation = worker_pool().reserve(self)?;
+                if let Some(evicted) = reservation.evicted {
+                    tokio::task::spawn_blocking(move || drop(evicted));
+                }
                 let _spawn_timing = crate::logging::StageTimer::new(crate::logging::Stage::Spawn);
-                *process_guard = Some(self.spawn_process().await?);
+                *process_guard = Some(self.spawn_process(reservation.slot).await?);
                 self.reaper_wake.notify_one();
             }
             process_guard
@@ -413,6 +592,15 @@ impl Worker {
             }
         }
     }
+}
+
+fn worker_capacity_response() -> Response<ResponseBody> {
+    let mut response =
+        response::error_response(StatusCode::SERVICE_UNAVAILABLE, "Too many active workers\n");
+    response
+        .headers_mut()
+        .insert(RETRY_AFTER, HeaderValue::from_static("1"));
+    response
 }
 
 async fn wait_for_ready(stream: &mut UnixStream, ready_timeout: Duration) -> Result<(), String> {
@@ -704,11 +892,11 @@ fn version_name(version: Version) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActivityGuard, WORKER_SHUTDOWN_GRACE, Worker, WorkerChild, WorkerProcess,
-        stop_direct_worker, wait_for_ready,
+        ActivityGuard, WORKER_SHUTDOWN_GRACE, Worker, WorkerChild, WorkerPool, WorkerProcess,
+        stop_direct_worker, wait_for_ready, worker_capacity_response,
     };
     use bytes::Bytes;
-    use http::{Request, Response};
+    use http::{Request, Response, StatusCode, header::RETRY_AFTER};
     use http_body_util::{BodyExt, Full};
     use hyper::service::service_fn;
     use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -851,6 +1039,97 @@ mod tests {
         assert_eq!(worker.active.load(std::sync::atomic::Ordering::Acquire), 0);
     }
 
+    #[test]
+    fn worker_pool_reserves_up_to_the_limit_and_releases_capacity_on_drop() {
+        let pool = Arc::new(WorkerPool::new(2));
+        let first = pool_test_worker(Instant::now());
+        let second = pool_test_worker(Instant::now());
+        let third = pool_test_worker(Instant::now());
+        let first_slot = pool.reserve(&first).unwrap().slot;
+        let second_slot = pool.reserve(&second).unwrap().slot;
+
+        assert!(pool.reserve(&third).is_err());
+
+        drop(first_slot);
+        let third_slot = pool.reserve(&third).unwrap().slot;
+        drop((second_slot, third_slot));
+    }
+
+    #[tokio::test]
+    async fn worker_pool_evicts_the_least_recently_used_idle_process() {
+        let pool = Arc::new(WorkerPool::new(2));
+        let now = Instant::now();
+        let older =
+            Arc::new(test_worker(Duration::from_secs(60), now - Duration::from_secs(2)).await);
+        let newer =
+            Arc::new(test_worker(Duration::from_secs(60), now - Duration::from_secs(1)).await);
+        let requester = pool_test_worker(now);
+
+        let old_slot = pool.reserve(&older).unwrap().slot;
+        older.process.lock().await.as_mut().unwrap().slot = Some(old_slot);
+        let new_slot = pool.reserve(&newer).unwrap().slot;
+        newer.process.lock().await.as_mut().unwrap().slot = Some(new_slot);
+
+        let reservation = pool.reserve(&requester).unwrap();
+        assert!(reservation.evicted.is_some());
+        assert!(!older.process_is_running().await);
+        assert!(newer.process_is_running().await);
+        assert_eq!(pool.state.lock().unwrap().entries.len(), 2);
+
+        let evicted = reservation.evicted.unwrap();
+        assert!(evicted.slot.is_none());
+        tokio::task::spawn_blocking(move || drop(evicted))
+            .await
+            .unwrap();
+        drop(reservation.slot);
+    }
+
+    #[tokio::test]
+    async fn worker_pool_does_not_evict_busy_or_locked_workers() {
+        let pool = Arc::new(WorkerPool::new(1));
+        let worker = Arc::new(test_worker(Duration::from_secs(60), Instant::now()).await);
+        let requester = pool_test_worker(Instant::now());
+        let slot = pool.reserve(&worker).unwrap().slot;
+        worker.process.lock().await.as_mut().unwrap().slot = Some(slot);
+
+        worker.active.store(1, std::sync::atomic::Ordering::Release);
+        assert!(pool.reserve(&requester).is_err());
+
+        worker.active.store(0, std::sync::atomic::Ordering::Release);
+        let _process = worker.process.lock().await;
+        assert!(pool.reserve(&requester).is_err());
+    }
+
+    #[test]
+    fn worker_capacity_exhaustion_returns_retryable_service_unavailable() {
+        let response = worker_capacity_response();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers().get(RETRY_AFTER).unwrap(), "1");
+    }
+
+    fn pool_test_worker(last_used: Instant) -> Arc<Worker> {
+        Arc::new(Worker {
+            uid: 0,
+            gid: 0,
+            root: PathBuf::from("/tmp/test-worker"),
+            cgroup: None,
+            idle_timeout: None,
+            active: Arc::new(AtomicUsize::new(0)),
+            last_used: Arc::new(StdMutex::new(last_used)),
+            index: vec!["index.html".to_owned()],
+            listing: true,
+            try_files: Vec::new(),
+            fastcgi: Vec::new(),
+            fastcgi_timeout: Duration::from_secs(60),
+            threads: 1,
+            error_log_file: None,
+            error_log_format: String::new(),
+            process: Arc::new(Mutex::new(None)),
+            reaper_wake: Arc::new(tokio::sync::Notify::new()),
+        })
+    }
+
     async fn test_worker(timeout: Duration, last_used: Instant) -> Worker {
         let (client, peer) = tokio::io::duplex(64 * 1024);
         tokio::spawn(async move {
@@ -886,10 +1165,11 @@ mod tests {
             threads: 1,
             error_log_file: None,
             error_log_format: String::new(),
-            process: Mutex::new(Some(WorkerProcess {
+            process: Arc::new(Mutex::new(Some(WorkerProcess {
                 sender,
                 child: WorkerChild::Direct(child),
-            })),
+                slot: None,
+            }))),
             reaper_wake: Arc::new(tokio::sync::Notify::new()),
         }
     }

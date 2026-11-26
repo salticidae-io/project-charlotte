@@ -119,6 +119,7 @@ pub struct Config {
     pub threads: Option<usize>,
     pub worker_threads: usize,
     pub worker_idle_timeout: Duration,
+    pub max_workers: usize,
     #[cfg(feature = "hosting")]
     pub worker_cgroup: Option<CgroupSpec>,
     pub(crate) rate_limit: Option<RateLimit>,
@@ -276,6 +277,9 @@ struct Cli {
     /// Seconds a hosted worker is kept alive without requests; 0 disables reaping
     #[arg(long, value_name = "SECS", default_value = "300", hide = !HOSTING, allow_hyphen_values = true)]
     worker_idle_timeout: u64,
+    /// Maximum number of live hosted worker processes; 0 is unlimited
+    #[arg(long, value_name = "N", default_value = "0", hide = !HOSTING, allow_hyphen_values = true)]
+    max_workers: usize,
     /// Cgroup v2 path for hosted workers, relative to /sys/fs/cgroup
     #[arg(long, value_name = "PATH", hide = !HOSTING, allow_hyphen_values = true)]
     worker_cgroup: Option<String>,
@@ -454,6 +458,7 @@ const FEATURE_OPTIONS: &[(&str, bool, &[&str])] = &[
             "static_cache_ttl_ms",
             "worker_threads",
             "worker_idle_timeout",
+            "max_workers",
             "worker_cgroup",
             "worker_cgroup_memory_max",
             "worker_cgroup_cpu_max",
@@ -834,6 +839,7 @@ impl Config {
             threads,
             worker_threads,
             worker_idle_timeout,
+            max_workers,
             worker_cgroup,
             worker_cgroup_memory_max,
             worker_cgroup_cpu_max,
@@ -1111,6 +1117,7 @@ impl Config {
             threads,
             worker_threads,
             worker_idle_timeout: Duration::from_secs(worker_idle_timeout),
+            max_workers,
             #[cfg(feature = "hosting")]
             worker_cgroup,
             rate_limit,
@@ -2601,6 +2608,7 @@ mod tests {
         assert_eq!(defaults.threads, None);
         assert_eq!(defaults.worker_threads, 1);
         assert_eq!(defaults.worker_idle_timeout, Duration::from_secs(300));
+        assert_eq!(defaults.max_workers, 0);
 
         let parsed = Config::parse([
             "--threads".to_owned(),
@@ -2609,6 +2617,8 @@ mod tests {
             "3".to_owned(),
             "--worker-idle-timeout".to_owned(),
             "0".to_owned(),
+            "--max-workers".to_owned(),
+            "12".to_owned(),
         ])
         .unwrap();
         let ParseResult::Config(config) = parsed else {
@@ -2617,6 +2627,7 @@ mod tests {
         assert_eq!(config.threads, Some(8));
         assert_eq!(config.worker_threads, 3);
         assert_eq!(config.worker_idle_timeout, Duration::ZERO);
+        assert_eq!(config.max_workers, 12);
         for invalid in ["0", "-1", "abc", "1025"] {
             assert!(Config::parse(["--threads".to_owned(), invalid.to_owned()]).is_err());
             assert!(Config::parse(["--worker-threads".to_owned(), invalid.to_owned()]).is_err());
@@ -2644,7 +2655,7 @@ mod tests {
     #[test]
     fn parses_global_options_from_config_file_and_resolves_relative_paths() {
         let path = write_config_file(
-            "options:\n  bind: 127.0.0.1:8123\n  debug: true\n  https_redirect: true\n  index: [home.htm, index.html]\n  user: charlotte\n  threads: 4\n  access-log-file: logs/access.log\n  log-dir: [logs, audit]\n  tls-dir: certificates\n  worker_cgroup: charlotte/sites/{uid}/{name}\n  worker_cgroup_memory_max: 512M\n  worker_cgroup_cpu_max: 150%\n  worker_cgroup_pids_max: 64\n",
+            "options:\n  bind: 127.0.0.1:8123\n  debug: true\n  https_redirect: true\n  index: [home.htm, index.html]\n  user: charlotte\n  threads: 4\n  max_workers: 12\n  access-log-file: logs/access.log\n  log-dir: [logs, audit]\n  tls-dir: certificates\n  worker_cgroup: charlotte/sites/{uid}/{name}\n  worker_cgroup_memory_max: 512M\n  worker_cgroup_cpu_max: 150%\n  worker_cgroup_pids_max: 64\n",
         );
         let parsed =
             Config::parse(["--config".to_owned(), path.to_string_lossy().into_owned()]).unwrap();
@@ -2658,6 +2669,7 @@ mod tests {
         assert_eq!(config.index, ["home.htm", "index.html"]);
         assert_eq!(config.master_user.as_deref(), Some("charlotte"));
         assert_eq!(config.threads, Some(4));
+        assert_eq!(config.max_workers, 12);
         let cgroup = config.worker_cgroup.as_ref().unwrap();
         assert_eq!(cgroup.path, PathBuf::from("charlotte/sites/{uid}/{name}"));
         assert_eq!(cgroup.memory_max.as_deref(), Some("536870912"));

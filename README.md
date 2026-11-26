@@ -919,6 +919,13 @@ Workers use one runtime thread by default; set `--worker-threads N` or
 executable is installed, hosted sites use it instead of the full server binary;
 the master executable remains a fallback when it is absent. Release builds of
 the worker omit the unused ModSecurity runtime dependency.
+To bound worker processes globally, set `--max-workers N` or `max_workers: N`
+in the `options:` mapping; `0` (the default) means unlimited. When the limit is
+reached, Charlotte stops the least recently used idle worker before starting
+another. If every worker is handling a request, the new request receives `503`
+with `Retry-After: 1`. An evicted process can take up to 500 ms to shut down, so
+the process count may briefly exceed the configured limit during that grace
+period.
 
 Hosted workers can optionally be placed in a cgroup v2 group under
 `/sys/fs/cgroup`. Set `--worker-cgroup PATH` and any of

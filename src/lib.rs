@@ -266,6 +266,7 @@ pub fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     {
         fastcgi::set_keepalive_limit(config.fastcgi_keepalive);
         handler::set_static_cache_ttl(config.static_cache_ttl);
+        vhost::set_max_workers(config.max_workers);
     }
     #[cfg(not(feature = "hosting"))]
     let config = config;
@@ -378,6 +379,7 @@ pub fn run_worker() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     fastcgi::set_keepalive_limit(config.fastcgi_keepalive);
     handler::set_static_cache_ttl(config.static_cache_ttl);
+    vhost::set_max_workers(config.max_workers);
     logging::set_global_error_log(Arc::new(logging::ErrorLog::new(
         logging::LogTarget::stderr(),
         logging::ErrorFormat::parse(&config.error_log_format)?,
