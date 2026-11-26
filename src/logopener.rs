@@ -1,8 +1,12 @@
 //! Opens log files and reads TLS PEM sections in a small root helper when the master drops privileges.
 
+#[cfg(target_os = "linux")]
+use std::ffi::CString;
+#[cfg(target_os = "macos")]
+use std::os::fd::BorrowedFd;
 use std::{
     collections::{HashMap, HashSet},
-    ffi::{CString, OsString},
+    ffi::OsString,
     fs::{self, File},
     io::{self, IoSlice, IoSliceMut, Read},
     os::{
@@ -16,6 +20,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(target_os = "linux")]
 use caps::{CapSet, Capability, CapsHashSet};
 use nix::{
     errno::Errno,
@@ -31,6 +36,8 @@ use nix::{
     },
     unistd::{Pid, close, geteuid},
 };
+#[cfg(target_os = "macos")]
+use nix::{fcntl::openat, sys::stat::Mode};
 use rustls::pki_types::pem::{self, PemObject};
 
 use crate::pathctx::PathContext;
@@ -41,6 +48,62 @@ pub(crate) const HELPER_ARGUMENT: &str = "--internal-root-log-opener";
 const MAX_PACKET_SIZE: usize = 64 * 1024;
 const MAX_TLS_PEM_SIZE: usize = 1024 * 1024;
 const READY: u8 = 0xff;
+
+#[cfg(target_os = "linux")]
+const SOCKET_FLAGS: SockFlag = SockFlag::SOCK_CLOEXEC;
+#[cfg(target_os = "macos")]
+const SOCKET_FLAGS: SockFlag = SockFlag::empty();
+#[cfg(target_os = "linux")]
+const SOCKET_TYPE: SockType = SockType::SeqPacket;
+#[cfg(target_os = "macos")]
+const SOCKET_TYPE: SockType = SockType::Datagram;
+
+fn socketpair_cloexec() -> io::Result<(OwnedFd, OwnedFd)> {
+    let (first, second) = socketpair(AddressFamily::Unix, SOCKET_TYPE, None, SOCKET_FLAGS)
+        .map_err(io::Error::from)?;
+    set_cloexec(first.as_raw_fd())?;
+    set_cloexec(second.as_raw_fd())?;
+    #[cfg(target_os = "macos")]
+    {
+        set_nosigpipe(first.as_raw_fd())?;
+        set_nosigpipe(second.as_raw_fd())?;
+    }
+    Ok((first, second))
+}
+
+#[allow(unsafe_code)]
+fn set_cloexec(descriptor: RawFd) -> io::Result<()> {
+    // SAFETY: fcntl is called with a valid descriptor and integer commands.
+    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fcntl updates descriptor flags for the valid descriptor.
+    if unsafe { libc::fcntl(descriptor, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn set_nosigpipe(descriptor: RawFd) -> io::Result<()> {
+    let enabled: libc::c_int = 1;
+    // SAFETY: the option value is a valid integer and the socket descriptor is open.
+    if unsafe {
+        libc::setsockopt(
+            descriptor,
+            libc::SOL_SOCKET,
+            libc::SO_NOSIGPIPE,
+            (&enabled as *const libc::c_int).cast(),
+            std::mem::size_of_val(&enabled) as libc::socklen_t,
+        )
+    } < 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
 
 #[derive(Clone, Copy)]
 enum RequestKind {
@@ -85,12 +148,7 @@ pub(crate) fn start(config: &Config) -> Result<(), Box<dyn std::error::Error + S
     }
     let (log_dirs, tls_dirs) = crate::vhost::helper_directories(config)?;
     let configure = configure_packet(&log_dirs, &tls_dirs)?;
-    let (parent, child) = socketpair(
-        AddressFamily::Unix,
-        SockType::SeqPacket,
-        None,
-        SockFlag::SOCK_CLOEXEC,
-    )?;
+    let (parent, child) = socketpair_cloexec()?;
     let stderr = config
         .error_log_file
         .as_deref()
@@ -235,6 +293,7 @@ pub(crate) fn run_helper(socket: RawFd) -> Result<(), Box<dyn std::error::Error 
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn restrict_capabilities() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut retained = CapsHashSet::new();
     let dac_override = Capability::CAP_DAC_OVERRIDE;
@@ -258,9 +317,18 @@ fn restrict_capabilities() -> Result<(), Box<dyn std::error::Error + Send + Sync
     Ok(())
 }
 
+#[cfg(not(target_os = "linux"))]
+fn restrict_capabilities() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    Ok(())
+}
+
 fn close_inherited_fds(socket: RawFd) -> io::Result<()> {
     let mut descriptors = Vec::new();
-    for entry in fs::read_dir("/proc/self/fd")? {
+    #[cfg(target_os = "linux")]
+    let descriptor_directory = "/proc/self/fd";
+    #[cfg(not(target_os = "linux"))]
+    let descriptor_directory = "/dev/fd";
+    for entry in fs::read_dir(descriptor_directory)? {
         let entry = entry?;
         if let Some(descriptor) = entry
             .file_name()
@@ -302,7 +370,22 @@ fn serve_socket(socket: OwnedFd, send_ready: bool) -> io::Result<()> {
             Err(Errno::EINTR) => continue,
             Err(error) => return Err(error.into()),
         }
-        let (length, received_fds) = receive_packet(socket_fd, &mut packet)?;
+        #[cfg(target_os = "macos")]
+        let disconnected = poll_fds[0]
+            .revents()
+            .is_some_and(|events| events.intersects(PollFlags::POLLHUP | PollFlags::POLLERR));
+        #[cfg(not(target_os = "macos"))]
+        let disconnected = false;
+        let (length, received_fds) = if disconnected {
+            (0, Vec::new())
+        } else {
+            match receive_packet(socket_fd, &mut packet) {
+                Ok(packet) => packet,
+                #[cfg(target_os = "macos")]
+                Err(error) if error.raw_os_error() == Some(libc::ECONNRESET) => (0, Vec::new()),
+                Err(error) => return Err(error),
+            }
+        };
         if length == 0 {
             close_received_fds(&received_fds);
             for (_, mut child) in workers.drain() {
@@ -1140,9 +1223,12 @@ fn read_allowed_tls_pem(
     tls_pem_sections(contents.as_slice())
 }
 
+#[cfg(target_os = "linux")]
 const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+#[cfg(target_os = "linux")]
 const RESOLVE_BENEATH: u64 = 0x08;
 
+#[cfg(target_os = "linux")]
 #[repr(C)]
 struct OpenHow {
     flags: u64,
@@ -1197,7 +1283,57 @@ fn openat2_beneath(
     Ok(unsafe { OwnedFd::from_raw_fd(descriptor) })
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn openat2_beneath(
+    directory: RawFd,
+    relative: &Path,
+    flags: OFlag,
+    mode: u32,
+) -> io::Result<OwnedFd> {
+    let components = relative.components().collect::<Vec<_>>();
+    let mut parent: Option<OwnedFd> = None;
+    for (index, component) in components.iter().enumerate() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "root helper paths must contain only normal path components",
+            ));
+        };
+        let is_final = index + 1 == components.len();
+        let open_flags = if is_final {
+            flags
+        } else {
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC
+        };
+        let open_mode =
+            if is_final {
+                Mode::from_bits_truncate(u16::try_from(mode).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "invalid file mode")
+                })?)
+            } else {
+                Mode::empty()
+            };
+        let descriptor = if let Some(parent) = parent.as_ref() {
+            openat(parent, *name, open_flags, open_mode)
+        } else {
+            // SAFETY: the caller passes a live directory descriptor retained by the helper.
+            let directory = unsafe { BorrowedFd::borrow_raw(directory) };
+            openat(directory, *name, open_flags, open_mode)
+        }
+        .map_err(io::Error::from)?;
+        if is_final {
+            return Ok(descriptor);
+        }
+        parent = Some(descriptor);
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "root helper path must name a file",
+    ))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn openat2_beneath(
     _directory: RawFd,
     _relative: &Path,
@@ -1390,7 +1526,10 @@ fn send_error(socket: RawFd, message: &str) -> io::Result<()> {
 
 fn send_packet(socket: RawFd, packet: &[u8], descriptor: Option<RawFd>) -> io::Result<()> {
     let iov = [IoSlice::new(packet)];
+    #[cfg(target_os = "linux")]
     let flags = MsgFlags::MSG_NOSIGNAL;
+    #[cfg(target_os = "macos")]
+    let flags = MsgFlags::empty();
     let sent = if let Some(descriptor) = descriptor {
         let descriptors = [descriptor];
         let control = [ControlMessage::ScmRights(&descriptors)];
@@ -1411,13 +1550,12 @@ fn send_packet(socket: RawFd, packet: &[u8], descriptor: Option<RawFd>) -> io::R
 fn receive_packet(socket: RawFd, packet: &mut [u8]) -> io::Result<(usize, Vec<RawFd>)> {
     let mut iov = [IoSliceMut::new(packet)];
     let mut control = nix::cmsg_space!([RawFd; 8]);
-    let message = recvmsg::<()>(
-        socket,
-        &mut iov,
-        Some(&mut control),
-        MsgFlags::MSG_CMSG_CLOEXEC,
-    )
-    .map_err(io::Error::from)?;
+    #[cfg(target_os = "linux")]
+    let flags = MsgFlags::MSG_CMSG_CLOEXEC;
+    #[cfg(target_os = "macos")]
+    let flags = MsgFlags::empty();
+    let message =
+        recvmsg::<()>(socket, &mut iov, Some(&mut control), flags).map_err(io::Error::from)?;
     let length = message.bytes;
     let truncated = message
         .flags
@@ -1426,6 +1564,13 @@ fn receive_packet(socket: RawFd, packet: &mut [u8]) -> io::Result<(usize, Vec<Ra
     for control_message in message.cmsgs().map_err(io::Error::from)? {
         if let ControlMessageOwned::ScmRights(received) = control_message {
             descriptors.extend(received);
+        }
+    }
+    #[cfg(target_os = "macos")]
+    for descriptor in &descriptors {
+        if let Err(error) = set_cloexec(*descriptor) {
+            close_received_fds(&descriptors);
+            return Err(error);
         }
     }
     if truncated {
@@ -1461,8 +1606,6 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use nix::sys::socket::{AddressFamily, SockFlag, SockType, socketpair};
-
     use super::*;
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -1488,13 +1631,7 @@ mod tests {
         let regular = directory.join("access.log");
         let symlink_path = directory.join("symlink.log");
         let symlink_directory = directory.join("escape");
-        let (server, client) = socketpair(
-            AddressFamily::Unix,
-            SockType::SeqPacket,
-            None,
-            SockFlag::SOCK_CLOEXEC,
-        )
-        .unwrap();
+        let (server, client) = socketpair_cloexec().unwrap();
         let server_thread = thread::spawn(move || serve_socket(server, false));
         request_configure(
             client.as_raw_fd(),
@@ -1575,13 +1712,7 @@ mod tests {
     #[test]
     fn refuses_requests_before_directories_are_configured_and_the_root_directory() {
         let directory = temp_dir();
-        let (server, client) = socketpair(
-            AddressFamily::Unix,
-            SockType::SeqPacket,
-            None,
-            SockFlag::SOCK_CLOEXEC,
-        )
-        .unwrap();
+        let (server, client) = socketpair_cloexec().unwrap();
         let server_thread = thread::spawn(move || serve_socket(server, false));
 
         assert!(
@@ -1602,7 +1733,7 @@ mod tests {
         assert!(
             request_configure(
                 client.as_raw_fd(),
-                &configure_packet(&[directory.join("..").join("..").join("..")], &[]).unwrap(),
+                &configure_packet(&[PathBuf::from("/..")], &[]).unwrap(),
             )
             .is_err()
         );
@@ -1692,13 +1823,7 @@ mod tests {
     #[test]
     fn worker_spawn_requires_one_descriptor_and_other_requests_none() {
         let directory = temp_dir();
-        let (server, client) = socketpair(
-            AddressFamily::Unix,
-            SockType::SeqPacket,
-            None,
-            SockFlag::SOCK_CLOEXEC,
-        )
-        .unwrap();
+        let (server, client) = socketpair_cloexec().unwrap();
         let server_thread = thread::spawn(move || serve_socket(server, false));
         request_configure(
             client.as_raw_fd(),
@@ -1739,13 +1864,7 @@ mod tests {
         let pem_path = directory.join("cert-and-key.pem");
         let symlink_path = directory.join("symlink.pem");
         let text_path = directory.join("text.pem");
-        let (server, client) = socketpair(
-            AddressFamily::Unix,
-            SockType::SeqPacket,
-            None,
-            SockFlag::SOCK_CLOEXEC,
-        )
-        .unwrap();
+        let (server, client) = socketpair_cloexec().unwrap();
         let server_thread = thread::spawn(move || serve_socket(server, false));
         request_configure(
             client.as_raw_fd(),

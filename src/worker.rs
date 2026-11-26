@@ -10,9 +10,7 @@ use std::{
 use http::{Request, StatusCode, Uri, Version};
 use hyper::{server::conn::http2, service::service_fn};
 use hyper_util::rt::{TokioExecutor, TokioIo};
-use nix::unistd::{
-    Gid, Uid, User, getegid, geteuid, getgroups, initgroups, setgid, setgroups, setuid,
-};
+use nix::unistd::{Gid, Uid, User, getegid, geteuid, setgid, setuid};
 use tokio::{
     io::AsyncWriteExt,
     net::UnixStream,
@@ -29,16 +27,16 @@ pub(crate) fn drop_privileges(config: &Config) -> Result<(), Box<dyn Error + Sen
     if geteuid().is_root() {
         if let Some(user) = User::from_uid(uid)? {
             let user_name = std::ffi::CString::new(user.name)?;
-            initgroups(user_name.as_c_str(), gid)?;
+            privileges::initialize_groups(user_name.as_c_str(), gid)?;
         } else {
-            setgroups(&[])?;
+            privileges::set_groups(&[])?;
         }
         setgid(gid)?;
         setuid(uid)?;
     } else if geteuid() != uid || getegid() != gid {
         return Err("a non-root server can only run workers as its current uid and gid".into());
     } else {
-        let mut actual_groups = getgroups()?;
+        let mut actual_groups = privileges::get_groups()?;
         let mut expected_groups = privileges::supplementary_groups(uid, gid)?;
         actual_groups.sort_unstable_by_key(|group| group.as_raw());
         expected_groups.sort_unstable_by_key(|group| group.as_raw());

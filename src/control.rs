@@ -574,7 +574,7 @@ fn has_write_access(metadata: &fs::Metadata) -> bool {
         mode & 0o200 != 0
     } else {
         let group = nix::unistd::getegid().as_raw() == metadata.gid()
-            || nix::unistd::getgroups()
+            || crate::privileges::get_groups()
                 .is_ok_and(|groups| groups.iter().any(|group| group.as_raw() == metadata.gid()));
         if group {
             mode & 0o020 != 0

@@ -13,7 +13,9 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use nix::unistd::{Group, User, geteuid, getgroups};
+#[cfg(target_os = "linux")]
+use nix::unistd::getgroups;
+use nix::unistd::{Gid, Group, User, geteuid};
 
 #[cfg(all(target_os = "linux", feature = "hosting"))]
 use std::{
@@ -62,12 +64,31 @@ fn output_stderr(output: &Output) -> String {
 
 fn shared_supplementary_group() -> Option<Group> {
     let user = User::from_uid(geteuid()).ok()??;
-    getgroups()
-        .ok()?
+    current_groups()?
         .into_iter()
         .filter(|gid| *gid != user.gid && gid.as_raw() != 0)
         .filter_map(|gid| Group::from_gid(gid).ok().flatten())
         .find(|group| group.mem.iter().any(|member| member != &user.name))
+}
+
+fn current_groups() -> Option<Vec<Gid>> {
+    #[cfg(target_os = "linux")]
+    {
+        getgroups().ok()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let output = Command::new("id").arg("-G").output().ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        Some(
+            String::from_utf8_lossy(&output.stdout)
+                .split_whitespace()
+                .filter_map(|group| group.parse().ok().map(Gid::from_raw))
+                .collect(),
+        )
+    }
 }
 
 fn set_group(path: &Path, group: &Group) -> bool {

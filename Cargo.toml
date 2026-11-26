@@ -23,7 +23,6 @@ swarm = ["dep:redis"]
 axum = "0.8"
 base64 = "0.22"
 bytes = "1"
-caps = "0.5"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4", features = ["derive", "env"] }
 dns-lookup = "4.0.2"
@@ -34,13 +33,13 @@ h3-quinn = { version = "0.0.10", optional = true }
 http = "1"
 http-body = "1"
 http-body-util = "0.1"
+libc = "0.2"
 hyper = { version = "1", features = ["http1", "http2", "server"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "ring", "native-tokio", "tls12"], optional = true }
 hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio"] }
 instant-acme = { version = "0.8.5", default-features = false, features = ["ring", "hyper-rustls", "rcgen"], optional = true }
 libmodsecurity3-rs = { version = "0.1.1" }
 nix = { version = "0.31.3", features = ["fs", "hostname", "poll", "process", "signal", "socket", "uio", "user"] }
-notify = { version = "8", default-features = false }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"], optional = true }
 redis = { version = "0.29", default-features = false, features = ["aio", "tokio-comp", "connection-manager"], optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
@@ -54,6 +53,15 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 tower-service = { version = "0.3", optional = true }
 url = "2"
 x509-parser = { version = "0.18.1", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+caps = "0.5"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+notify = { version = "8", default-features = false, features = ["macos_kqueue"] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+notify = { version = "8", default-features = false }
 
 [dev-dependencies]
 gungraun = "=0.20.0"

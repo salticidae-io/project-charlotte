@@ -1,5 +1,7 @@
 //! Loads and validates virtual hosts, matches hosts, and dispatches requests.
 
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 #[cfg(any(feature = "hosting", feature = "proxy"))]
 use std::time::Duration;
 use std::{
@@ -8,7 +10,6 @@ use std::{
     fs::{File, OpenOptions},
     io::{self, Read, Write},
     net::SocketAddr,
-    os::fd::AsRawFd,
     path::{Path, PathBuf},
     sync::{
         Arc, RwLock,
@@ -277,16 +278,25 @@ impl ClientLimit {
                 Ordering::AcqRel,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => return Some(ClientSlot(Arc::clone(self))),
+                Ok(_) => {
+                    return Some(ClientSlot {
+                        _guard: Arc::new(ClientSlotGuard(Arc::clone(self))),
+                    });
+                }
                 Err(current) => active = current,
             }
         }
     }
 }
 
-struct ClientSlot(Arc<ClientLimit>);
+#[derive(Clone)]
+struct ClientSlot {
+    _guard: Arc<ClientSlotGuard>,
+}
 
-impl Drop for ClientSlot {
+struct ClientSlotGuard(Arc<ClientLimit>);
+
+impl Drop for ClientSlotGuard {
     fn drop(&mut self) {
         self.0.active.fetch_sub(1, Ordering::Release);
     }
@@ -2285,14 +2295,17 @@ fn trusted_write_mode(mode: u32, allow_group_write: bool) -> bool {
 fn private_group_write_allowed(metadata: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::MetadataExt;
 
+    #[cfg(target_os = "linux")]
     use caps::{CapSet, Capability};
     use nix::unistd::{Gid, Group, Uid, User};
 
     let uid = nix::unistd::geteuid();
-    if uid.is_root()
-        || crate::logopener::is_active()
-        || caps::has_cap(None, CapSet::Effective, Capability::CAP_SETUID).unwrap_or(true)
-    {
+    #[cfg(target_os = "linux")]
+    let has_setuid_cap =
+        caps::has_cap(None, CapSet::Effective, Capability::CAP_SETUID).unwrap_or(true);
+    #[cfg(not(target_os = "linux"))]
+    let has_setuid_cap = false;
+    if uid.is_root() || crate::logopener::is_active() || has_setuid_cap {
         return false;
     }
     let Ok(Some(user)) = User::from_uid(Uid::from_raw(metadata.uid())) else {
@@ -2500,11 +2513,17 @@ fn scan_vhost_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
             .path_context("inspect virtual-host directory", dir)?,
         dir,
     )?;
-    let fd_path = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
-    for entry in std::fs::read_dir(&fd_path).path_context("read virtual-host directory", dir)? {
+    #[cfg(target_os = "linux")]
+    let scan_dir = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
+    #[cfg(not(target_os = "linux"))]
+    let scan_dir = dir.to_path_buf();
+    for entry in std::fs::read_dir(&scan_dir).path_context("read virtual-host directory", dir)? {
         let entry = entry.path_context("read virtual-host directory entry", dir)?;
         let name = entry.file_name();
-        let path = fd_path.join(&name);
+        #[cfg(target_os = "linux")]
+        let path = scan_dir.join(&name);
+        #[cfg(not(target_os = "linux"))]
+        let path = dir.join(&name);
         if !name.to_string_lossy().starts_with('.')
             && path
                 .extension()

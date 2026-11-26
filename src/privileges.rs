@@ -4,17 +4,20 @@
 use std::io;
 #[cfg(feature = "acme")]
 use std::path::Path;
-use std::{error::Error, ffi::CString};
+use std::{
+    error::Error,
+    ffi::{CStr, CString},
+};
 #[cfg(feature = "hosting")]
 use std::{os::unix::process::CommandExt, process::Command};
 
+#[cfg(target_os = "linux")]
 use caps::{CapSet, Capability, CapsHashSet};
-#[cfg(feature = "hosting")]
+#[cfg(target_os = "linux")]
+use nix::sys::prctl::set_keepcaps;
+#[cfg(target_os = "linux")]
 use nix::unistd::setgroups;
-use nix::{
-    sys::prctl::set_keepcaps,
-    unistd::{Group, User, geteuid, initgroups, setgid, setuid},
-};
+use nix::unistd::{Group, User, geteuid, setgid, setuid};
 
 #[cfg(feature = "acme")]
 use nix::unistd::{FchownatFlags, Gid, Uid, fchownat};
@@ -23,12 +26,13 @@ use crate::config::Config;
 #[cfg(feature = "acme")]
 use crate::pathctx::PathContext;
 
-#[cfg(feature = "hosting")]
+#[cfg(all(feature = "hosting", target_os = "linux"))]
 const SETUID: Capability = Capability::CAP_SETUID;
-#[cfg(feature = "hosting")]
+#[cfg(all(feature = "hosting", target_os = "linux"))]
 const SETGID: Capability = Capability::CAP_SETGID;
-#[cfg(feature = "hosting")]
+#[cfg(all(feature = "hosting", target_os = "linux"))]
 const KILL: Capability = Capability::CAP_KILL;
+#[cfg(target_os = "linux")]
 const NET_BIND_SERVICE: Capability = Capability::CAP_NET_BIND_SERVICE;
 
 pub(crate) fn drop_master(config: &Config) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -63,16 +67,19 @@ pub(crate) fn drop_master(config: &Config) -> Result<(), Box<dyn Error + Send + 
                 Some((user.uid.as_raw(), gid.as_raw())),
             )?;
         }
+        #[cfg(target_os = "linux")]
         let keep_net_bind_service = caps::has_cap(None, CapSet::Permitted, NET_BIND_SERVICE)?;
-
+        #[cfg(target_os = "linux")]
         set_keepcaps(true)?;
-        initgroups(user_name_c.as_c_str(), gid)?;
+        initialize_groups(user_name_c.as_c_str(), gid)?;
         crate::log_debug!(
             "Initialized {group_count} supplementary groups for master user {user_name}"
         );
         setgid(gid)?;
         setuid(user.uid)?;
+        #[cfg(target_os = "linux")]
         set_keepcaps(false)?;
+        #[cfg(target_os = "linux")]
         retain_master_capabilities(keep_net_bind_service, false)?;
         crate::log_debug!(
             "Master privileges dropped to uid {} and gid {}",
@@ -82,7 +89,7 @@ pub(crate) fn drop_master(config: &Config) -> Result<(), Box<dyn Error + Send + 
     }
     // Only a build that hosts sites starts workers under other accounts, so
     // only it has a use for the identity-changing capabilities.
-    #[cfg(feature = "hosting")]
+    #[cfg(all(feature = "hosting", target_os = "linux"))]
     if config.master_user.is_none() && !geteuid().is_root() {
         let permitted = caps::read(None, CapSet::Permitted)?;
         if permitted.contains(&SETUID) && permitted.contains(&SETGID) {
@@ -112,7 +119,114 @@ pub(crate) fn supplementary_groups(
         return Ok(vec![gid]);
     };
     let user_name = CString::new(user.name)?;
-    Ok(nix::unistd::getgrouplist(user_name.as_c_str(), gid)?)
+    groups_for_user(user_name.as_c_str(), gid)
+}
+
+#[cfg(target_os = "linux")]
+fn groups_for_user(
+    user_name: &CStr,
+    gid: nix::unistd::Gid,
+) -> Result<Vec<nix::unistd::Gid>, Box<dyn Error + Send + Sync>> {
+    Ok(nix::unistd::getgrouplist(user_name, gid)?)
+}
+
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn groups_for_user(
+    user_name: &CStr,
+    gid: nix::unistd::Gid,
+) -> Result<Vec<nix::unistd::Gid>, Box<dyn Error + Send + Sync>> {
+    let mut capacity = 16_usize;
+    loop {
+        let mut groups = vec![0 as libc::c_int; capacity];
+        let mut count = capacity as libc::c_int;
+        // SAFETY: the C string is NUL-terminated and the group array has `count` slots.
+        let result = unsafe {
+            libc::getgrouplist(
+                user_name.as_ptr(),
+                gid.as_raw() as libc::c_int,
+                groups.as_mut_ptr(),
+                &mut count,
+            )
+        };
+        if result >= 0 {
+            groups.truncate(count as usize);
+            let mut groups = groups
+                .into_iter()
+                .map(|group| nix::unistd::Gid::from_raw(group as libc::gid_t))
+                .collect::<Vec<_>>();
+            if !groups.contains(&gid) {
+                groups.push(gid);
+            }
+            return Ok(groups);
+        }
+        if capacity >= 65_536 {
+            return Err(io::Error::last_os_error().into());
+        }
+        capacity *= 2;
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn initialize_groups(user_name: &CStr, gid: nix::unistd::Gid) -> io::Result<()> {
+    nix::unistd::initgroups(user_name, gid).map_err(io::Error::from)
+}
+
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+pub(crate) fn initialize_groups(user_name: &CStr, gid: nix::unistd::Gid) -> io::Result<()> {
+    // SAFETY: the C string is NUL-terminated and the group ID is valid for this process.
+    if unsafe { libc::initgroups(user_name.as_ptr(), gid.as_raw() as libc::c_int) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn set_groups(groups: &[nix::unistd::Gid]) -> io::Result<()> {
+    nix::unistd::setgroups(groups).map_err(io::Error::from)
+}
+
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+pub(crate) fn set_groups(groups: &[nix::unistd::Gid]) -> io::Result<()> {
+    let groups = groups
+        .iter()
+        .map(|group| group.as_raw() as libc::gid_t)
+        .collect::<Vec<_>>();
+    let count = libc::c_int::try_from(groups.len()).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidInput, "too many supplementary groups")
+    })?;
+    // SAFETY: the group array is valid for `count` elements for the duration of the call.
+    if unsafe { libc::setgroups(count, groups.as_ptr()) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn get_groups() -> io::Result<Vec<nix::unistd::Gid>> {
+    nix::unistd::getgroups().map_err(io::Error::from)
+}
+
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+pub(crate) fn get_groups() -> io::Result<Vec<nix::unistd::Gid>> {
+    // SAFETY: a null pointer is permitted when querying the number of group IDs.
+    let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+    if count < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut groups = vec![0 as libc::gid_t; count as usize];
+    // SAFETY: the vector has space for the group count reported by the preceding call.
+    let actual = unsafe { libc::getgroups(count, groups.as_mut_ptr()) };
+    if actual < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    groups.truncate(actual as usize);
+    Ok(groups.into_iter().map(nix::unistd::Gid::from_raw).collect())
 }
 
 #[cfg(feature = "acme")]
@@ -186,6 +300,7 @@ fn prepare_acme_cache(path: &Path, uid: Uid, gid: Gid) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn retain_master_capabilities(
     keep_net_bind_service: bool,
     keep_worker_capabilities: bool,
@@ -219,7 +334,7 @@ pub(crate) fn apply_identity(
     uid: u32,
     gid: u32,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    use nix::unistd::{Gid, Uid, setgid, setgroups, setuid};
+    use nix::unistd::{Gid, Uid, setgid, setuid};
 
     let uid = Uid::from_raw(uid);
     let gid = Gid::from_raw(gid);
@@ -227,7 +342,7 @@ pub(crate) fn apply_identity(
     // SAFETY: the callback performs only credential syscalls using values prepared before fork.
     unsafe {
         command.pre_exec(move || {
-            setgroups(&groups).map_err(io::Error::from)?;
+            set_groups(&groups)?;
             setgid(gid).map_err(io::Error::from)?;
             setuid(uid).map_err(io::Error::from)?;
             Ok(())
@@ -236,7 +351,7 @@ pub(crate) fn apply_identity(
     Ok(())
 }
 
-#[cfg(feature = "hosting")]
+#[cfg(all(feature = "hosting", target_os = "linux"))]
 pub(crate) fn clear_all() -> Result<(), Box<dyn Error + Send + Sync>> {
     caps::clear(None, CapSet::Ambient)?;
     caps::clear(None, CapSet::Effective)?;
@@ -245,13 +360,23 @@ pub(crate) fn clear_all() -> Result<(), Box<dyn Error + Send + Sync>> {
     Ok(())
 }
 
-#[cfg(feature = "hosting")]
+#[cfg(all(feature = "hosting", not(target_os = "linux")))]
+pub(crate) fn clear_all() -> Result<(), Box<dyn Error + Send + Sync>> {
+    Ok(())
+}
+
+#[cfg(all(feature = "hosting", target_os = "linux"))]
 pub(crate) fn can_set_ids() -> Result<bool, Box<dyn Error + Send + Sync>> {
     if geteuid().is_root() {
         return Ok(true);
     }
     Ok(caps::has_cap(None, CapSet::Effective, SETUID)?
         && caps::has_cap(None, CapSet::Effective, SETGID)?)
+}
+
+#[cfg(all(feature = "hosting", not(target_os = "linux")))]
+pub(crate) fn can_set_ids() -> Result<bool, Box<dyn Error + Send + Sync>> {
+    Ok(geteuid().is_root())
 }
 
 #[cfg(all(test, feature = "acme"))]
