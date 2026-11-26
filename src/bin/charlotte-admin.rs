@@ -580,33 +580,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-const UI: &str = r#"<!doctype html><meta charset="utf-8"><title>Charlotte admin</title>
-<h1>Charlotte admin</h1><div id="login"><input id="password" type="password" placeholder="Password"><button onclick="login()">Sign in</button> <a id="google" href="oauth/start">Sign in with Google</a></div>
-<style>body{font-family:sans-serif;margin:1em 2em}canvas{border:1px solid #ddd;display:block;margin:.3em 0 1em;max-width:100%}.charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(460px,1fr));gap:0 2em}h3{margin:.2em 0}</style>
-<div id="admin" hidden><button onclick="load()">Refresh</button> <button onclick="logout()">Sign out</button>
-<h2>Server traffic</h2><div class="charts"><div><h3>Requests</h3><canvas id="serverRequests" width="560" height="200"></canvas></div><div><h3>Bandwidth</h3><canvas id="serverBytes" width="560" height="200"></canvas></div></div>
-<h2>Virtual host traffic <select id="vhost" onchange="draw()"></select></h2><div class="charts"><div><h3>Requests</h3><canvas id="vhostRequests" width="560" height="200"></canvas></div><div><h3>Bandwidth</h3><canvas id="vhostBytes" width="560" height="200"></canvas></div></div>
-<h2>Status</h2><pre id="status"></pre><h2>Virtual hosts</h2><pre id="hosts"></pre><input id="name" placeholder="Host name"><button onclick="readHost()">Get</button><button onclick="save('POST')">Create</button><button onclick="save('PUT')">Replace</button><button onclick="save('DELETE')">Delete</button><p><textarea id="config" rows="18" cols="80" placeholder="YAML or JSON configuration"></textarea></p></div><pre id="message"></pre>
-<script>
-let token=''; let samples=[]; let timer=null; const $=id=>document.getElementById(id); const root=location.pathname.replace(/\/$/,'')+'/'; $('google').href=root+'oauth/start';
-async function request(url,options={}) { let r=await fetch(root+url,options); let text=await r.text(); if(!r.ok) throw Error(r.status+' '+text); return text; }
-function show(e){$('message').textContent=String(e)}
-const KEYS=['requests','client_errors','server_errors','bytes_in','bytes_out'];
-const REQUESTS=[{key:'requests',label:'requests',color:'#1f6feb'},{key:'client_errors',label:'4xx',color:'#d29922'},{key:'server_errors',label:'5xx',color:'#cf222e'}];
-const BYTES=[{key:'bytes_in',label:'in',color:'#2da44e'},{key:'bytes_out',label:'out',color:'#8250df'}];
-function rates(pick){let out=[];for(let i=1;i<samples.length;i++){const a=samples[i-1],b=samples[i],dt=b.time-a.time,cur=pick(b);if(!cur||dt<=0)continue;const reset=b.uptime_seconds<a.uptime_seconds,prev=reset?{}:(pick(a)||{});const r={t:b.time};for(const k of KEYS)r[k]=Math.max(0,(cur[k]||0)-(prev[k]||0))/dt;out.push(r)}return out}
-function fmt(v,bytes){const u=bytes?['B/s','KiB/s','MiB/s','GiB/s']:['req/s'];let i=0;if(bytes)while(v>=1024&&i<3){v/=1024;i++}return v.toFixed(v<10?2:0)+' '+u[i]}
-function chart(id,data,series,bytes){const c=$(id),g=c.getContext('2d'),W=c.width,H=c.height,L=70,B=18,T=18;g.clearRect(0,0,W,H);g.font='11px sans-serif';let max=0;for(const d of data)for(const s of series)max=Math.max(max,d[s.key]);max=max||1;g.strokeStyle='#bbb';g.beginPath();g.moveTo(L,T);g.lineTo(L,H-B);g.lineTo(W,H-B);g.stroke();g.fillStyle='#444';g.fillText(fmt(max,bytes),2,T+8);g.fillText(fmt(0,bytes),2,H-B);series.forEach((s,i)=>{g.fillStyle=s.color;g.fillText('\u25A0 '+s.label,L+8+i*80,12)});if(data.length<2){g.fillStyle='#888';g.fillText('Collecting samples\u2026',L+10,H/2);return}const t0=data[0].t,t1=data[data.length-1].t,x=t=>L+(t-t0)/(t1-t0)*(W-L-4),y=v=>(H-B)-v/max*(H-B-T);g.fillStyle='#444';g.fillText(new Date(t0*1000).toLocaleTimeString(),L,H-4);const e=new Date(t1*1000).toLocaleTimeString();g.fillText(e,W-g.measureText(e).width-2,H-4);for(const s of series){g.strokeStyle=s.color;g.lineWidth=1.5;g.beginPath();data.forEach((d,j)=>j?g.lineTo(x(d.t),y(d[s.key])):g.moveTo(x(d.t),y(d[s.key])));g.stroke()}}
-function draw(){const server=rates(s=>s.traffic.total);chart('serverRequests',server,REQUESTS,false);chart('serverBytes',server,BYTES,true);const sel=$('vhost'),names=samples.length?Object.keys(samples[samples.length-1].traffic.vhosts).sort():[],current=sel.value;if(names.join('\n')!==Array.from(sel.options,o=>o.value).join('\n')){sel.replaceChildren(...names.map(n=>{const o=document.createElement('option');o.value=n;o.textContent=n;return o}));if(names.includes(current))sel.value=current}const name=sel.value,vhost=name?rates(s=>s.traffic.vhosts[name]):[];chart('vhostRequests',vhost,REQUESTS,false);chart('vhostBytes',vhost,BYTES,true)}
-async function graphs(){try{const h=JSON.parse(await request('history'));samples=h.samples;draw();clearTimeout(timer);timer=setTimeout(graphs,h.interval*1000)}catch(e){show(e)}}
-async function refresh(){try { token=JSON.parse(await request('csrf')).csrf; $('login').hidden=true; $('admin').hidden=false; await load(); await graphs(); } catch(e){clearTimeout(timer); $('login').hidden=false; $('admin').hidden=true;} }
-async function login(){try{await request('login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:$('password').value})}); $('password').value=''; show(''); await refresh()}catch(e){show(e)}}
-async function load(){try{$('status').textContent=await request('api/status'); $('hosts').textContent=await request('api/vhosts')}catch(e){show(e)}}
-function host(){return 'api/vhosts/'+encodeURIComponent($('name').value)}
-async function readHost(){try{$('config').value=await request(host())}catch(e){show(e)}}
-async function save(method){try{if(method==='DELETE'&&!confirm('Delete this host?'))return; $('message').textContent=await request(host(),{method,headers:{'X-CSRF-Token':token},body:method==='DELETE'?undefined:$('config').value}); await load()}catch(e){show(e)}}
-async function logout(){try{await request('logout',{method:'POST',headers:{'X-CSRF-Token':token}}); await refresh()}catch(e){show(e)}} refresh();
-</script>"#;
+const UI: &str = include_str!("charlotte-admin-ui.html");
 
 #[cfg(test)]
 mod tests {

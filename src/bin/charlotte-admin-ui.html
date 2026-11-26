@@ -1,0 +1,581 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Charlotte administration</title>
+  <style>
+    :root{font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#1f2937;background:#f4f6f9;font-synthesis:none}
+    *{box-sizing:border-box}
+    body{margin:0}
+    button,input,select,textarea{font:inherit}
+    button{border:1px solid #cbd5e1;border-radius:6px;background:#fff;color:#1f2937;padding:.52rem .8rem;cursor:pointer}
+    button:hover{background:#f1f5f9}
+    button.primary{background:#1769aa;border-color:#1769aa;color:#fff}
+    button.primary:hover{background:#12578f}
+    button.danger{color:#b42318}
+    button:disabled{cursor:not-allowed;opacity:.6}
+    input,select,textarea{border:1px solid #cbd5e1;border-radius:6px;padding:.55rem .65rem;background:#fff;color:#1f2937}
+    a{color:#1769aa}
+    .shell{max-width:1440px;margin:0 auto;padding:1.5rem 2rem 3rem}
+    .topbar{display:flex;align-items:center;justify-content:space-between;gap:1rem;margin-bottom:1.5rem}
+    .brand{margin:0;font-size:1.45rem;color:#153a5b}
+    .toolbar{display:flex;gap:.55rem;align-items:center}
+    .panel{background:#fff;border:1px solid #e1e7ef;border-radius:10px;padding:1.2rem 1.35rem;margin:1rem 0;box-shadow:0 1px 2px #0f172a0b}
+    h2{font-size:1.15rem;margin:0 0 1rem;color:#193b5a}
+    h3{font-size:.95rem;margin:.1rem 0 .45rem;color:#334155}
+    .login-card{max-width:430px;margin:9vh auto;padding:2rem}
+    .login-card h1{margin-top:0;color:#153a5b}
+    .login-row{display:flex;gap:.6rem;flex-wrap:wrap}
+    .login-row input{flex:1;min-width:180px}
+    .login-card a{display:inline-block;margin-top:1rem}
+    #message{display:none;margin:0 auto 1rem;max-width:1440px;padding:.75rem 1rem;border-radius:7px;background:#e8f4fd;color:#164e78;border:1px solid #b9dafa}
+    #message.error{display:block;background:#fff0ef;color:#9b1c13;border-color:#f3c1bc}
+    #message.success{display:block}
+    .summary-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:.75rem}
+    .metric{min-height:84px;border:1px solid #e4eaf1;border-radius:8px;padding:.8rem .9rem;background:#fbfcfe}
+    .metric-label{color:#64748b;font-size:.78rem;text-transform:uppercase;letter-spacing:.045em}
+    .metric-value{font-size:1.2rem;font-weight:650;margin-top:.4rem;color:#152f47;overflow-wrap:anywhere}
+    .metric.updated .metric-value{font-size:.9rem;font-weight:500;line-height:1.4}
+    .charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,440px),1fr));gap:1.4rem}
+    .chart-card{min-width:0}
+    canvas{display:block;width:100%;height:auto;margin:.2rem 0 0;border:1px solid #e7ebf0;border-radius:6px;background:#fff}
+    .traffic-heading{display:flex;align-items:center;justify-content:space-between;gap:1rem;flex-wrap:wrap}
+    #vhost{min-width:220px}
+    .table-controls{display:flex;gap:.65rem;align-items:center;justify-content:space-between;flex-wrap:wrap;margin-bottom:.8rem}
+    #host-filter{min-width:min(100%,280px)}
+    .table-wrap{overflow-x:auto;border:1px solid #e3e8ef;border-radius:7px}
+    table{width:100%;border-collapse:collapse;min-width:900px}
+    th,td{text-align:left;padding:.68rem .72rem;border-bottom:1px solid #e8edf2;vertical-align:middle}
+    th{font-size:.75rem;text-transform:uppercase;letter-spacing:.04em;color:#64748b;background:#f8fafc;white-space:nowrap}
+    tbody tr:last-child td{border-bottom:0}
+    tbody tr:hover{background:#fafcff}
+    .host-name{font-weight:600;color:#193b5a}
+    .host-aliases,.muted{color:#64748b;font-size:.84rem}
+    .file-name{max-width:260px;overflow-wrap:anywhere;color:#475569;font-size:.82rem}
+    .badge{display:inline-block;border-radius:999px;background:#edf4fb;color:#315b7d;padding:.24rem .55rem;font-size:.75rem;white-space:nowrap}
+    .actions{display:flex;gap:.35rem;white-space:nowrap}
+    .actions button{padding:.35rem .55rem;font-size:.8rem}
+    .empty{color:#64748b;text-align:center;padding:1.4rem}
+    #editor[hidden]{display:none}
+    .editor-grid{display:grid;gap:.9rem}
+    .editor-grid label{display:grid;gap:.4rem;font-weight:600;font-size:.9rem}
+    #name{max-width:520px}
+    #config{width:100%;min-height:300px;resize:vertical;font:13px ui-monospace,SFMono-Regular,Menlo,monospace;line-height:1.5}
+    .editor-actions{display:flex;gap:.55rem;justify-content:flex-end}
+    @media(max-width:650px){.shell{padding:1rem}.panel{padding:1rem}.topbar{align-items:flex-start}.brand{font-size:1.2rem}.metric-value{font-size:1.05rem}}
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <section id="login" class="panel login-card">
+      <h1>Charlotte administration</h1>
+      <div class="login-row">
+        <input id="password" type="password" placeholder="Password" aria-label="Password" autocomplete="current-password">
+        <button class="primary" type="button" onclick="login()">Sign in</button>
+      </div>
+      <a id="google" href="oauth/start">Sign in with Google</a>
+    </section>
+
+    <main id="admin" hidden>
+      <header class="topbar">
+        <h1 class="brand">Charlotte administration</h1>
+        <div class="toolbar">
+          <button type="button" onclick="refreshData()">Refresh</button>
+          <button type="button" onclick="logout()">Sign out</button>
+        </div>
+      </header>
+
+      <section class="panel">
+        <h2>Server status</h2>
+        <div id="status" class="summary-grid" aria-live="polite"></div>
+      </section>
+
+      <section class="panel">
+        <h2>Server traffic</h2>
+        <div class="charts">
+          <div class="chart-card"><h3>Requests and errors</h3><canvas id="serverRequests" width="560" height="200"></canvas></div>
+          <div class="chart-card"><h3>Bandwidth</h3><canvas id="serverBytes" width="560" height="200"></canvas></div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="traffic-heading">
+          <h2>Virtual host traffic</h2>
+          <label class="muted" for="vhost">Selected host&nbsp;
+            <select id="vhost" onchange="draw()" aria-label="Select a virtual host"></select>
+          </label>
+        </div>
+        <div class="charts">
+          <div class="chart-card"><h3>Requests and errors</h3><canvas id="vhostRequests" width="560" height="200"></canvas></div>
+          <div class="chart-card"><h3>Bandwidth</h3><canvas id="vhostBytes" width="560" height="200"></canvas></div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>Virtual hosts</h2>
+        <div class="table-controls">
+          <input id="host-filter" type="search" placeholder="Filter by name, server name or file" aria-label="Filter virtual hosts" oninput="renderHosts()">
+          <button id="new-host" class="primary" type="button" onclick="openNewHost()">New virtual host</button>
+        </div>
+        <div id="hosts" class="table-wrap" aria-live="polite"></div>
+      </section>
+
+      <section id="editor" class="panel" hidden>
+        <h2 id="editor-title">New virtual host</h2>
+        <div class="editor-grid">
+          <label for="name">Control name
+            <input id="name" placeholder="example.com" autocomplete="off">
+          </label>
+          <label for="config">Virtual host configuration (JSON)
+            <textarea id="config" rows="16" spellcheck="false" placeholder="{&#10;  &quot;server_names&quot;: [&quot;example.com&quot;],&#10;  &quot;root&quot;: &quot;/srv/www/example&quot;&#10;}"></textarea>
+          </label>
+          <div class="editor-actions">
+            <button type="button" onclick="closeEditor()">Close</button>
+            <button id="save-host" class="primary" type="button" onclick="saveHost()">Create</button>
+          </div>
+        </div>
+      </section>
+    </main>
+    <div id="message" role="status" aria-live="polite"></div>
+  </div>
+
+  <script>
+    let token = '';
+    let samples = [];
+    let timer = null;
+    let hostList = [];
+    let latestStatus = null;
+    let editingName = null;
+    const $ = id => document.getElementById(id);
+    const root = location.pathname.replace(/\/$/, '') + '/';
+    $('google').href = root + 'oauth/start';
+
+    async function request(url, options = {}) {
+      const response = await fetch(root + url, options);
+      const text = await response.text();
+      if (!response.ok) throw Error(response.status + (text ? ' ' + text : ''));
+      return text;
+    }
+
+    function show(message, type = 'success') {
+      const banner = $('message');
+      banner.textContent = String(message || '');
+      banner.className = message ? type : '';
+      banner.style.display = message ? 'block' : 'none';
+    }
+
+    function number(value) {
+      return new Intl.NumberFormat().format(Number(value) || 0);
+    }
+
+    function duration(value) {
+      let seconds = Math.max(0, Math.floor(Number(value) || 0));
+      const days = Math.floor(seconds / 86400);
+      seconds %= 86400;
+      const hours = Math.floor(seconds / 3600);
+      seconds %= 3600;
+      const minutes = Math.floor(seconds / 60);
+      seconds %= 60;
+      return [days && `${days}d`, hours && `${hours}h`, minutes && `${minutes}m`, `${seconds}s`].filter(Boolean).join(' ');
+    }
+
+    function byteSize(value) {
+      let size = Number(value) || 0;
+      const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+      let unit = 0;
+      while (size >= 1024 && unit < units.length - 1) {
+        size /= 1024;
+        unit++;
+      }
+      return `${size.toFixed(unit === 0 || size >= 10 ? 0 : 1)} ${units[unit]}`;
+    }
+
+    function renderStatus(status) {
+      latestStatus = status;
+      const total = status.traffic?.total || {};
+      const entries = [
+        ['Version', status.version || '—'],
+        ['Uptime', duration(status.uptime_seconds)],
+        ['Virtual hosts', number(status.vhosts)],
+        ['Total requests', number(total.requests)],
+        ['Client errors (4xx)', number(total.client_errors)],
+        ['Server errors (5xx)', number(total.server_errors)],
+        ['Data received', byteSize(total.bytes_in)],
+        ['Data sent', byteSize(total.bytes_out)],
+        ['Last updated', new Date().toLocaleString()]
+      ];
+      const cards = entries.map(([label, value], index) => {
+        const card = document.createElement('div');
+        card.className = 'metric' + (index === entries.length - 1 ? ' updated' : '');
+        const title = document.createElement('div');
+        title.className = 'metric-label';
+        title.textContent = label;
+        const content = document.createElement('div');
+        content.className = 'metric-value';
+        content.textContent = value;
+        card.append(title, content);
+        return card;
+      });
+      $('status').replaceChildren(...cards);
+    }
+
+    function primaryName(host) {
+      return host.server_names?.[0] || host.name || '';
+    }
+
+    function hostTraffic(host) {
+      const traffic = latestStatus?.traffic?.vhosts || {};
+      for (const name of [...(host.server_names || []), host.name]) {
+        if (name && traffic[name]) return traffic[name];
+      }
+      return {};
+    }
+
+    function cell(text, className = '') {
+      const node = document.createElement('td');
+      node.textContent = text;
+      if (className) node.className = className;
+      return node;
+    }
+
+    function action(label, callback, className = '') {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.textContent = label;
+      if (className) button.className = className;
+      button.addEventListener('click', callback);
+      return button;
+    }
+
+    function renderHosts() {
+      const query = $('host-filter').value.trim().toLowerCase();
+      const visible = hostList.filter(host => [host.name, ...(host.server_names || []), host.file]
+        .some(value => String(value || '').toLowerCase().includes(query)));
+      const table = document.createElement('table');
+      const head = document.createElement('thead');
+      const headerRow = document.createElement('tr');
+      for (const label of ['Name / server names', 'Source', 'Configuration file', 'Requests', '4xx', '5xx', 'In', 'Out', 'Actions']) {
+        const th = document.createElement('th');
+        th.textContent = label;
+        headerRow.append(th);
+      }
+      head.append(headerRow);
+      table.append(head);
+      const body = document.createElement('tbody');
+      if (!visible.length) {
+        const row = document.createElement('tr');
+        const empty = document.createElement('td');
+        empty.colSpan = 9;
+        empty.className = 'empty';
+        empty.textContent = hostList.length ? 'No virtual hosts match this filter.' : 'No virtual hosts are configured.';
+        row.append(empty);
+        body.append(row);
+      }
+      for (const host of visible) {
+        const row = document.createElement('tr');
+        const names = document.createElement('td');
+        const primary = document.createElement('div');
+        primary.className = 'host-name';
+        primary.textContent = host.name || primaryName(host) || 'Unnamed';
+        const aliases = document.createElement('div');
+        aliases.className = 'host-aliases';
+        aliases.textContent = (host.server_names || []).join(', ');
+        names.append(primary, aliases);
+        row.append(names);
+        const source = document.createElement('td');
+        const badge = document.createElement('span');
+        badge.className = 'badge';
+        badge.textContent = host.source === 'vhost_dir' ? 'vhost directory' : 'main config';
+        source.append(badge);
+        row.append(source, cell(host.file || '—', 'file-name'));
+        const stats = hostTraffic(host);
+        row.append(
+          cell(number(stats.requests)),
+          cell(number(stats.client_errors)),
+          cell(number(stats.server_errors)),
+          cell(byteSize(stats.bytes_in)),
+          cell(byteSize(stats.bytes_out))
+        );
+        const actions = document.createElement('td');
+        actions.className = 'actions';
+        actions.append(action('Graph', () => selectHostGraph(primaryName(host))));
+        actions.append(action(host.read_only ? 'View' : 'Edit', () => openHost(host)));
+        if (!host.read_only) actions.append(action('Delete', () => deleteHost(host), 'danger'));
+        row.append(actions);
+        body.append(row);
+      }
+      table.append(body);
+      const wrapper = document.createElement('div');
+      wrapper.className = 'table-wrap';
+      wrapper.append(table);
+      $('hosts').replaceWith(wrapper);
+      wrapper.id = 'hosts';
+      wrapper.setAttribute('aria-live', 'polite');
+    }
+
+    const KEYS = ['requests', 'client_errors', 'server_errors', 'bytes_in', 'bytes_out'];
+    const REQUESTS = [
+      {key: 'requests', label: 'requests', color: '#1f6feb'},
+      {key: 'client_errors', label: '4xx', color: '#d29922'},
+      {key: 'server_errors', label: '5xx', color: '#cf222e'}
+    ];
+    const BYTES = [
+      {key: 'bytes_in', label: 'in', color: '#2da44e'},
+      {key: 'bytes_out', label: 'out', color: '#8250df'}
+    ];
+
+    function rates(pick) {
+      const output = [];
+      for (let index = 1; index < samples.length; index++) {
+        const previous = samples[index - 1];
+        const current = samples[index];
+        const elapsed = current.time - previous.time;
+        const counters = pick(current);
+        if (!counters || elapsed <= 0) continue;
+        const reset = current.uptime_seconds < previous.uptime_seconds;
+        const old = reset ? {} : (pick(previous) || {});
+        const rate = {t: current.time};
+        for (const key of KEYS) rate[key] = Math.max(0, (counters[key] || 0) - (old[key] || 0)) / elapsed;
+        output.push(rate);
+      }
+      return output;
+    }
+
+    function fmt(value, bytes) {
+      const units = bytes ? ['B/s', 'KiB/s', 'MiB/s', 'GiB/s'] : ['req/s'];
+      let amount = value;
+      let unit = 0;
+      if (bytes) while (amount >= 1024 && unit < 3) { amount /= 1024; unit++; }
+      return `${amount.toFixed(amount < 10 ? 2 : 0)} ${units[unit]}`;
+    }
+
+    function chart(id, data, series, bytes) {
+      const canvas = $(id);
+      const context = canvas.getContext('2d');
+      const width = canvas.width;
+      const height = canvas.height;
+      const left = 70;
+      const bottom = 18;
+      const top = 18;
+      context.clearRect(0, 0, width, height);
+      context.font = '11px sans-serif';
+      let max = 0;
+      for (const point of data) for (const item of series) max = Math.max(max, point[item.key]);
+      max = max || 1;
+      context.strokeStyle = '#b7c1cc';
+      context.beginPath();
+      context.moveTo(left, top);
+      context.lineTo(left, height - bottom);
+      context.lineTo(width, height - bottom);
+      context.stroke();
+      context.fillStyle = '#475569';
+      context.fillText(fmt(max, bytes), 2, top + 8);
+      context.fillText(fmt(0, bytes), 2, height - bottom);
+      series.forEach((item, index) => {
+        context.fillStyle = item.color;
+        context.fillText('\u25A0 ' + item.label, left + 8 + index * 80, 12);
+      });
+      if (data.length < 2) {
+        context.fillStyle = '#64748b';
+        context.fillText('Collecting samples…', left + 10, height / 2);
+        return;
+      }
+      const start = data[0].t;
+      const end = data[data.length - 1].t;
+      const x = time => left + (time - start) / (end - start) * (width - left - 4);
+      const y = value => height - bottom - value / max * (height - bottom - top);
+      context.fillStyle = '#475569';
+      context.fillText(new Date(start * 1000).toLocaleTimeString(), left, height - 4);
+      const endLabel = new Date(end * 1000).toLocaleTimeString();
+      context.fillText(endLabel, width - context.measureText(endLabel).width - 2, height - 4);
+      for (const item of series) {
+        context.strokeStyle = item.color;
+        context.lineWidth = 1.5;
+        context.beginPath();
+        data.forEach((point, index) => index
+          ? context.lineTo(x(point.t), y(point[item.key]))
+          : context.moveTo(x(point.t), y(point[item.key])));
+        context.stroke();
+      }
+    }
+
+    function draw() {
+      const server = rates(sample => sample.traffic.total);
+      chart('serverRequests', server, REQUESTS, false);
+      chart('serverBytes', server, BYTES, true);
+      const select = $('vhost');
+      const names = new Set(hostList.map(primaryName).filter(Boolean));
+      if (samples.length) for (const name of Object.keys(samples[samples.length - 1].traffic.vhosts || {})) names.add(name);
+      const sorted = [...names].sort();
+      const current = select.value;
+      if (sorted.join('\n') !== [...select.options].map(option => option.value).join('\n')) {
+        select.replaceChildren(...sorted.map(name => {
+          const option = document.createElement('option');
+          option.value = name;
+          option.textContent = name;
+          return option;
+        }));
+        if (sorted.includes(current)) select.value = current;
+      }
+      const name = select.value;
+      const vhost = name ? rates(sample => sample.traffic.vhosts[name]) : [];
+      chart('vhostRequests', vhost, REQUESTS, false);
+      chart('vhostBytes', vhost, BYTES, true);
+    }
+
+    function selectHostGraph(name) {
+      if (!name) return;
+      const select = $('vhost');
+      if (![...select.options].some(option => option.value === name)) {
+        const option = document.createElement('option');
+        option.value = name;
+        option.textContent = name;
+        select.append(option);
+      }
+      select.value = name;
+      draw();
+      $('vhostRequests').scrollIntoView({behavior: 'smooth', block: 'center'});
+    }
+
+    async function load() {
+      const [statusText, hostsText] = await Promise.all([request('api/status'), request('api/vhosts')]);
+      renderStatus(JSON.parse(statusText));
+      hostList = JSON.parse(hostsText);
+      renderHosts();
+      draw();
+    }
+
+    async function graphs() {
+      try {
+        await load();
+        const history = JSON.parse(await request('history'));
+        samples = history.samples;
+        draw();
+        clearTimeout(timer);
+        timer = setTimeout(graphs, history.interval * 1000);
+      } catch (error) {
+        show(error.message, 'error');
+      }
+    }
+
+    async function refreshData() {
+      await graphs();
+    }
+
+    async function refresh() {
+      try {
+        token = JSON.parse(await request('csrf')).csrf;
+        $('login').hidden = true;
+        $('admin').hidden = false;
+        await graphs();
+      } catch (error) {
+        clearTimeout(timer);
+        $('login').hidden = false;
+        $('admin').hidden = true;
+      }
+    }
+
+    async function login() {
+      try {
+        await request('login', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({password: $('password').value})
+        });
+        $('password').value = '';
+        show('');
+        await refresh();
+      } catch (error) {
+        show(error.message, 'error');
+      }
+    }
+
+    function openNewHost() {
+      editingName = null;
+      $('editor-title').textContent = 'New virtual host';
+      $('name').value = '';
+      $('name').disabled = false;
+      $('config').value = '{\n  "server_names": ["example.com"],\n  "root": "/srv/www/example"\n}';
+      $('config').readOnly = false;
+      $('save-host').hidden = false;
+      $('save-host').textContent = 'Create';
+      $('editor').hidden = false;
+      $('name').focus();
+    }
+
+    async function openHost(host) {
+      try {
+        const detail = JSON.parse(await request('api/vhosts/' + encodeURIComponent(host.name)));
+        editingName = detail.name || host.name;
+        const readOnly = Boolean(detail.read_only);
+        $('editor-title').textContent = readOnly ? 'View virtual host' : 'Edit virtual host';
+        $('name').value = editingName;
+        $('name').disabled = true;
+        $('config').value = JSON.stringify(detail.vhost?.[0] || {}, null, 2);
+        $('config').readOnly = readOnly;
+        $('save-host').hidden = readOnly;
+        $('save-host').textContent = 'Save changes';
+        $('editor').hidden = false;
+        $('editor').scrollIntoView({behavior: 'smooth', block: 'start'});
+      } catch (error) {
+        show(error.message, 'error');
+      }
+    }
+
+    function closeEditor() {
+      $('editor').hidden = true;
+      editingName = null;
+    }
+
+    async function saveHost() {
+      try {
+        const name = editingName || $('name').value.trim();
+        if (!name) throw Error('Enter a control name for the virtual host.');
+        let config;
+        try { config = JSON.parse($('config').value); }
+        catch (error) { throw Error('Configuration must be valid JSON: ' + error.message); }
+        if (!config || Array.isArray(config) || typeof config !== 'object') throw Error('Configuration must be a JSON object.');
+        const isEdit = Boolean(editingName);
+        await request('api/vhosts/' + encodeURIComponent(name), {
+          method: isEdit ? 'PUT' : 'POST',
+          headers: {'Content-Type': 'application/json', 'X-CSRF-Token': token},
+          body: JSON.stringify(config)
+        });
+        closeEditor();
+        show(isEdit ? 'Virtual host updated.' : 'Virtual host created.');
+        await load();
+      } catch (error) {
+        show(error.message, 'error');
+      }
+    }
+
+    async function deleteHost(host) {
+      if (!confirm(`Delete virtual host “${host.name}”?`)) return;
+      try {
+        await request('api/vhosts/' + encodeURIComponent(host.name), {
+          method: 'DELETE',
+          headers: {'X-CSRF-Token': token}
+        });
+        if (editingName === host.name) closeEditor();
+        show('Virtual host deleted.');
+        await load();
+      } catch (error) {
+        show(error.message, 'error');
+      }
+    }
+
+    async function logout() {
+      try {
+        await request('logout', {method: 'POST', headers: {'X-CSRF-Token': token}});
+        await refresh();
+      } catch (error) {
+        show(error.message, 'error');
+      }
+    }
+
+    $('host-filter').addEventListener('input', renderHosts);
+    refresh();
+  </script>
+</body>
+</html>

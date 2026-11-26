@@ -467,8 +467,9 @@ storage `503`.
 
 `charlotte-admin` is a separate process that serves a browser UI on top of the
 control socket: server and per-vhost traffic graphs (requests, 4xx and 5xx per
-second, and inbound/outbound bandwidth), the raw status, and vhost
-list/get/create/replace/delete. It needs read/write access to the control
+second, and inbound/outbound bandwidth), a status summary, and a searchable
+virtual-host table with per-host traffic and view/edit/delete actions. It also
+supports vhost creation. It needs read/write access to the control
 socket, so run it as the server's account or a member of its group.
 
 ```sh
