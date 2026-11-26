@@ -7,6 +7,7 @@
   <style>
     :root{font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#1f2937;background:#f4f6f9;font-synthesis:none}
     *{box-sizing:border-box}
+    [hidden]{display:none!important}
     body{margin:0}
     button,input,select,textarea{font:inherit}
     button{border:1px solid #cbd5e1;border-radius:6px;background:#fff;color:#1f2937;padding:.52rem .8rem;cursor:pointer}
@@ -42,6 +43,16 @@
     canvas{display:block;width:100%;height:auto;margin:.2rem 0 0;border:1px solid #e7ebf0;border-radius:6px;background:#fff}
     .traffic-heading{display:flex;align-items:center;justify-content:space-between;gap:1rem;flex-wrap:wrap}
     #vhost{min-width:220px}
+    .detail-heading{display:flex;align-items:center;justify-content:space-between;gap:1rem;flex-wrap:wrap;margin-bottom:1rem}
+    .detail-title{display:flex;align-items:center;gap:.8rem;flex-wrap:wrap}
+    .detail-title h2{margin:0}
+    #detail-meta{display:flex;gap:.5rem 1rem;flex-wrap:wrap;margin-bottom:.9rem}
+    .back-button{color:#1769aa}
+    .host-link{color:#193b5a;text-decoration:none}
+    .host-link:hover{text-decoration:underline}
+    tr[data-host]{cursor:pointer}
+    tr[data-host]:focus{outline:2px solid #1769aa;outline-offset:-2px}
+    #host-count{color:#64748b;font-size:.84rem}
     .table-controls{display:flex;gap:.65rem;align-items:center;justify-content:space-between;flex-wrap:wrap;margin-bottom:.8rem}
     #host-filter{min-width:min(100%,280px)}
     .table-wrap{overflow-x:auto;border:1px solid #e3e8ef;border-radius:7px}
@@ -59,10 +70,36 @@
     .empty{color:#64748b;text-align:center;padding:1.4rem}
     #editor[hidden]{display:none}
     .editor-grid{display:grid;gap:.9rem}
-    .editor-grid label{display:grid;gap:.4rem;font-weight:600;font-size:.9rem}
+    .editor-grid label,.field{display:grid;gap:.4rem;font-weight:600;font-size:.9rem}
+    .editor-section{border:1px solid #e3e8ef;border-radius:8px;padding:.9rem 1rem}
+    .editor-section h3{margin:0 0 .8rem}
+    .field-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,260px),1fr));gap:.8rem;align-items:start}
+    .field{align-content:start}
+    .field input[type=checkbox]{justify-self:start;width:1.1rem;height:1.1rem;margin:.3rem 0}
+    .field.wide{grid-column:1/-1}
+    .list-editor>button,.repeat-list>button{justify-self:start}
+    .field-help{font-weight:400;color:#64748b;font-size:.78rem}
+    .list-editor,.repeat-list{display:grid;gap:.45rem}
+    .list-row{display:flex;gap:.4rem}
+    .list-row input{min-width:0;flex:1}
+    .list-row button,.repeat-card button{padding:.35rem .55rem}
+    .repeat-card{border:1px solid #e3e8ef;border-radius:7px;padding:.75rem;display:grid;gap:.7rem}
+    .repeat-card-head{display:flex;align-items:center;justify-content:space-between;gap:.5rem}
+    .repeat-card-head strong{color:#193b5a}
+    .repeat-card .field-grid{width:100%}
+    .env-row{display:grid;grid-template-columns:1fr 1fr auto;gap:.4rem}
+    .advanced{border-top:1px solid #e3e8ef;padding-top:.7rem}
+    .advanced summary{cursor:pointer;color:#315b7d;font-weight:600}
+    #config{width:100%;min-height:300px;resize:vertical;font:13px ui-monospace,SFMono-Regular,Menlo,monospace;line-height:1.5;margin-top:.7rem}
     #name{max-width:520px}
-    #config{width:100%;min-height:300px;resize:vertical;font:13px ui-monospace,SFMono-Regular,Menlo,monospace;line-height:1.5}
     .editor-actions{display:flex;gap:.55rem;justify-content:flex-end}
+    .notice{border:1px solid #f3d28b;border-radius:7px;background:#fff8e6;color:#805b12;padding:.75rem .9rem;margin:.75rem 0}
+    .readonly{border:1px solid #f3c1bc;border-radius:7px;background:#fff0ef;color:#9b1c13;padding:.75rem .9rem;margin:.75rem 0}
+    .option-list{display:grid;gap:.45rem}
+    .option-list-row{display:flex;gap:.4rem}
+    .option-list-row input{min-width:0;flex:1}
+    .option-list button{justify-self:start;padding:.35rem .55rem}
+    .option-name{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
     @media(max-width:650px){.shell{padding:1rem}.panel{padding:1rem}.topbar{align-items:flex-start}.brand{font-size:1.2rem}.metric-value{font-size:1.05rem}}
   </style>
 </head>
@@ -71,54 +108,85 @@
     <section id="login" class="panel login-card">
       <h1>Charlotte administration</h1>
       <div class="login-row">
-        <input id="password" type="password" placeholder="Password" aria-label="Password" autocomplete="current-password">
-        <button class="primary" type="button" onclick="login()">Sign in</button>
+        <input id="password" type="password" placeholder="Password" aria-label="Password" autocomplete="current-password" hidden>
+        <button id="password-login" class="primary" type="button" onclick="login()" hidden>Sign in</button>
       </div>
-      <a id="google" href="oauth/start">Sign in with Google</a>
+      <a id="google" href="oauth/start" hidden>Sign in with Google</a>
     </section>
 
     <main id="admin" hidden>
       <header class="topbar">
         <h1 class="brand">Charlotte administration</h1>
         <div class="toolbar">
+          <button type="button" onclick="navigateOptions()">Server options</button>
           <button type="button" onclick="refreshData()">Refresh</button>
           <button type="button" onclick="logout()">Sign out</button>
         </div>
       </header>
 
-      <section class="panel">
-        <h2>Server status</h2>
-        <div id="status" class="summary-grid" aria-live="polite"></div>
-      </section>
+      <div id="overview">
+        <section class="panel">
+          <h2>Server status</h2>
+          <div id="status" class="summary-grid" aria-live="polite"></div>
+        </section>
 
-      <section class="panel">
-        <h2>Server traffic</h2>
-        <div class="charts">
-          <div class="chart-card"><h3>Requests and errors</h3><canvas id="serverRequests" width="560" height="200"></canvas></div>
-          <div class="chart-card"><h3>Bandwidth</h3><canvas id="serverBytes" width="560" height="200"></canvas></div>
-        </div>
-      </section>
+        <section class="panel">
+          <h2>Server traffic</h2>
+          <div class="charts">
+            <div class="chart-card"><h3>Requests and errors</h3><canvas id="serverRequests" width="560" height="200"></canvas></div>
+            <div class="chart-card"><h3>Bandwidth</h3><canvas id="serverBytes" width="560" height="200"></canvas></div>
+          </div>
+        </section>
 
-      <section class="panel">
-        <div class="traffic-heading">
-          <h2>Virtual host traffic</h2>
-          <label class="muted" for="vhost">Selected host&nbsp;
-            <select id="vhost" onchange="draw()" aria-label="Select a virtual host"></select>
+        <section class="panel">
+          <h2>Virtual hosts</h2>
+          <div class="table-controls">
+            <input id="host-filter" type="search" placeholder="Filter by name, server name, file or source" aria-label="Filter virtual hosts" oninput="renderHosts()">
+            <span id="host-count" aria-live="polite"></span>
+            <button id="new-host" class="primary" type="button" onclick="openNewHost()">New virtual host</button>
+          </div>
+          <div id="hosts" class="table-wrap" aria-live="polite"></div>
+        </section>
+      </div>
+
+      <section id="detail" class="panel" hidden>
+        <div class="detail-heading">
+          <button class="back-button" type="button" onclick="navigateOverview()">← All virtual hosts</button>
+          <label class="muted" for="vhost">Virtual host
+            <select id="vhost" onchange="selectDetailHost()" aria-label="Select a virtual host"></select>
           </label>
         </div>
-        <div class="charts">
-          <div class="chart-card"><h3>Requests and errors</h3><canvas id="vhostRequests" width="560" height="200"></canvas></div>
-          <div class="chart-card"><h3>Bandwidth</h3><canvas id="vhostBytes" width="560" height="200"></canvas></div>
+        <div id="detail-not-found" class="empty" hidden></div>
+        <div id="detail-content">
+          <div class="detail-heading">
+            <div class="detail-title">
+              <h2 id="detail-title">Virtual host</h2>
+              <button type="button" onclick="editDetailHost()">View / Edit configuration</button>
+            </div>
+          </div>
+          <div id="detail-meta" class="muted"></div>
+          <div id="detail-stats" class="summary-grid" aria-live="polite"></div>
+          <div class="charts">
+            <div class="chart-card"><h3>Requests and errors</h3><canvas id="vhostRequests" width="560" height="200"></canvas></div>
+            <div class="chart-card"><h3>Bandwidth</h3><canvas id="vhostBytes" width="560" height="200"></canvas></div>
+          </div>
         </div>
       </section>
 
-      <section class="panel">
-        <h2>Virtual hosts</h2>
-        <div class="table-controls">
-          <input id="host-filter" type="search" placeholder="Filter by name, server name or file" aria-label="Filter virtual hosts" oninput="renderHosts()">
-          <button id="new-host" class="primary" type="button" onclick="openNewHost()">New virtual host</button>
+      <section id="server-options" class="panel" hidden>
+        <div class="detail-heading">
+          <button class="back-button" type="button" onclick="navigateOverview()">← Dashboard</button>
+          <h2>Server-wide options</h2>
         </div>
-        <div id="hosts" class="table-wrap" aria-live="polite"></div>
+        <p id="options-file" class="muted"></p>
+        <div id="options-restart" class="notice" role="status" hidden>Server options have changed on disk. Restart Charlotte for these changes to take effect; live application of global options is not supported.</div>
+        <div id="options-readonly" class="readonly" hidden></div>
+        <p class="muted">The form preserves unrecognized keys. Saving rewrites the YAML file and may remove comments and formatting.</p>
+        <div id="options-form" class="editor-grid"></div>
+        <div class="editor-actions">
+          <button type="button" onclick="loadServerOptions()">Reload</button>
+          <button id="save-options" class="primary" type="button" onclick="saveServerOptions()">Save options</button>
+        </div>
       </section>
 
       <section id="editor" class="panel" hidden>
@@ -127,9 +195,13 @@
           <label for="name">Control name
             <input id="name" placeholder="example.com" autocomplete="off">
           </label>
-          <label for="config">Virtual host configuration (JSON)
-            <textarea id="config" rows="16" spellcheck="false" placeholder="{&#10;  &quot;server_names&quot;: [&quot;example.com&quot;],&#10;  &quot;root&quot;: &quot;/srv/www/example&quot;&#10;}"></textarea>
-          </label>
+          <div id="vhost-form" class="editor-grid"></div>
+          <details id="advanced-json" class="advanced">
+            <summary>Advanced (JSON)</summary>
+            <label for="config">Raw vhost configuration
+              <textarea id="config" rows="16" spellcheck="false"></textarea>
+            </label>
+          </details>
           <div class="editor-actions">
             <button type="button" onclick="closeEditor()">Close</button>
             <button id="save-host" class="primary" type="button" onclick="saveHost()">Create</button>
@@ -147,9 +219,745 @@
     let hostList = [];
     let latestStatus = null;
     let editingName = null;
+    let activeView = null;
+    let optionsModel = null;
     const $ = id => document.getElementById(id);
     const root = location.pathname.replace(/\/$/, '') + '/';
     $('google').href = root + 'oauth/start';
+    let originalConfig = {};
+
+    const FORM_SECTIONS = [
+      {title: 'General', fields: [
+        {key: 'server_names', label: 'Server names', type: 'list', required: true},
+        {key: 'default', label: 'Default virtual host', type: 'bool'},
+        {key: 'user', label: 'Worker user', type: 'text', help: 'Required unless an upstream URL is configured.'},
+        {key: 'group', label: 'Worker group', type: 'text'}
+      ]},
+      {title: 'Static files', fields: [
+        {key: 'root', label: 'Document root', type: 'text'},
+        {key: 'index', label: 'Index files', type: 'list'},
+        {key: 'listing', label: 'Directory listing', type: 'tri'},
+        {key: 'try_files', label: 'Try files', type: 'list'},
+        {key: 'https_redirect', label: 'Redirect HTTP to HTTPS', type: 'tri'},
+        {key: 'acme', label: 'ACME certificate handling', type: 'tri'}
+      ]},
+      {title: 'FastCGI / CGI', fields: [
+        {key: 'fastcgi', label: 'FastCGI extensions', type: 'list'},
+        {key: 'cgi', label: 'CGI extensions', type: 'list'},
+        {key: 'fastcgi_timeout', label: 'FastCGI timeout (seconds)', type: 'number', min: 0},
+        {key: 'fastcgi_app', label: 'Managed FastCGI applications', type: 'apps'}
+      ]},
+      {title: 'Worker and cgroup', fields: [
+        {key: 'worker_threads', label: 'Worker threads', type: 'number', min: 1},
+        {key: 'worker_idle_timeout', label: 'Worker idle timeout (seconds)', type: 'number', min: 0},
+        {key: 'cgroup', label: 'Cgroup', type: 'text'},
+        {key: 'cgroup_memory_max', label: 'Memory limit', type: 'text'},
+        {key: 'cgroup_cpu_max', label: 'CPU limit', type: 'text'},
+        {key: 'cgroup_pids_max', label: 'Process limit', type: 'text'}
+      ]},
+      {title: 'Reverse proxy', fields: [
+        {key: 'proxy_pass', label: 'Upstream URL', type: 'url'},
+        {key: 'proxy_preserve_host', label: 'Preserve Host header', type: 'tri'},
+        {key: 'proxy_http2', label: 'Use HTTP/2 upstream', type: 'tri'},
+        {key: 'proxy_timeout', label: 'Proxy timeout (seconds)', type: 'number', min: 0},
+        {key: 'proxy_ca_root', label: 'Upstream CA certificate path', type: 'text'},
+        {key: 'swarm', label: 'Swarm access checks', type: 'tri'}
+      ]},
+      {title: 'TLS', fields: [
+        {key: 'tls_cert', label: 'Certificate path', type: 'text'},
+        {key: 'tls_key', label: 'Private key path', type: 'text'},
+        {key: 'tls_chain', label: 'Certificate chain path', type: 'text'}
+      ]},
+      {title: 'Rate limit', fields: [
+        {key: 'rate_limit', label: 'Request rate', type: 'rate'},
+        {key: 'rate_limit_burst', label: 'Burst capacity', type: 'number', min: 1}
+      ]},
+      {title: 'Bot protection', fields: [
+        {key: 'bot', label: 'Bot policy', type: 'bot'}
+      ]},
+      {title: 'ModSecurity', fields: [
+        {key: 'modsecurity_disable_rules', label: 'Disabled rule IDs or ranges', type: 'rules'},
+        {key: 'modsecurity_block_status', label: 'Block status code', type: 'number', min: 100, max: 599},
+        {key: 'modsecurity_response_body', label: 'Include response body', type: 'tri'}
+      ]},
+      {title: 'Logging', fields: [
+        {key: 'access_log', label: 'Access log path', type: 'text'},
+        {key: 'access_log_format', label: 'Access log format', type: 'text'},
+        {key: 'error_log', label: 'Error log path', type: 'text'},
+        {key: 'error_log_format', label: 'Error log format', type: 'text'}
+      ]}
+    ];
+    const BOT_DEFAULTS = {
+      mode: 'enforce', challenge_threshold: 40, block_threshold: 80, challenge: true,
+      challenge_difficulty: 16, challenge_ttl: 3600, allow_ips: [], deny_ips: [],
+      allow_user_agents: [], deny_user_agents: [], builtin_rules: true,
+      honeypot_paths: [], honeypot_ban: 3600, exempt_paths: [], verify_crawlers: true,
+      ja4_allow: [], ja4_deny: [], busy_threshold: '', busy_window: 10, busy_cooldown: 300
+    };
+    const BOT_FIELDS = [
+      {key: 'mode', label: 'Policy mode', type: 'choice', values: ['enforce', 'log', 'off']},
+      {key: 'challenge_threshold', label: 'Challenge threshold', type: 'number', min: 0, max: 1000},
+      {key: 'block_threshold', label: 'Block threshold', type: 'number', min: 0, max: 1000},
+      {key: 'challenge', label: 'Enable challenges', type: 'bool'},
+      {key: 'challenge_difficulty', label: 'Challenge difficulty', type: 'number', min: 1, max: 255},
+      {key: 'challenge_ttl', label: 'Challenge lifetime (seconds)', type: 'number', min: 1},
+      {key: 'allow_ips', label: 'Allowed IPs', type: 'list'},
+      {key: 'deny_ips', label: 'Denied IPs', type: 'list'},
+      {key: 'allow_user_agents', label: 'Allowed user-agent fragments', type: 'list'},
+      {key: 'deny_user_agents', label: 'Denied user-agent fragments', type: 'list'},
+      {key: 'builtin_rules', label: 'Built-in detection rules', type: 'bool'},
+      {key: 'honeypot_paths', label: 'Honeypot paths', type: 'list'},
+      {key: 'honeypot_ban', label: 'Honeypot ban (seconds)', type: 'number', min: 1},
+      {key: 'exempt_paths', label: 'Exempt path prefixes', type: 'list'},
+      {key: 'verify_crawlers', label: 'Verify search crawlers', type: 'bool'},
+      {key: 'ja4_allow', label: 'Allowed JA4 fingerprints', type: 'list'},
+      {key: 'ja4_deny', label: 'Denied JA4 fingerprints', type: 'list'},
+      {key: 'busy_threshold', label: 'Busy traffic threshold', type: 'text'},
+      {key: 'busy_window', label: 'Busy traffic window (seconds)', type: 'number', min: 1, max: 60},
+      {key: 'busy_cooldown', label: 'Busy traffic cooldown (seconds)', type: 'number', min: 1, max: 86400}
+    ];
+
+    function optionSelect(options, placeholder) {
+      const select = document.createElement('select');
+      const first = document.createElement('option');
+      first.value = '';
+      first.textContent = placeholder;
+      select.append(first);
+      for (const [value, label] of options) {
+        const option = document.createElement('option');
+        option.value = value;
+        option.textContent = label;
+        select.append(option);
+      }
+      return select;
+    }
+
+    function listRow(list, value = '', env = false) {
+      const row = document.createElement('div');
+      row.className = env ? 'env-row' : 'list-row';
+      if (env) {
+        const key = document.createElement('input');
+        key.type = 'text';
+        key.placeholder = 'Environment key';
+        key.dataset.envKey = '';
+        key.value = value[0] || '';
+        const content = document.createElement('input');
+        content.type = 'text';
+        content.placeholder = 'Value';
+        content.dataset.envValue = '';
+        content.value = value[1] || '';
+        row.append(key, content);
+      } else {
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.dataset.listValue = '';
+        input.value = value;
+        list.append(row);
+        row.append(input);
+      }
+      const remove = document.createElement('button');
+      remove.type = 'button';
+      remove.textContent = 'Remove';
+      remove.setAttribute('aria-label', 'Remove value');
+      remove.dataset.removeRow = '';
+      row.append(remove);
+      if (env) list.append(row);
+      return row;
+    }
+
+    function listEditor(key, values = [], rules = false) {
+      const wrapper = document.createElement('div');
+      wrapper.className = 'list-editor';
+      wrapper.dataset.key = key;
+      wrapper.dataset.type = rules ? 'rules' : 'list';
+      for (const value of values || []) listRow(wrapper, String(value));
+      const add = document.createElement('button');
+      add.type = 'button';
+      add.textContent = 'Add value';
+      add.dataset.addList = '';
+      wrapper.append(add);
+      return wrapper;
+    }
+
+    function fastCgiApps(values = []) {
+      const wrapper = document.createElement('div');
+      wrapper.className = 'repeat-list';
+      wrapper.dataset.key = 'fastcgi_app';
+      wrapper.dataset.type = 'apps';
+      for (const value of values || []) wrapper.append(fastCgiAppCard(value));
+      const add = document.createElement('button');
+      add.type = 'button';
+      add.textContent = 'Add FastCGI application';
+      add.dataset.addApp = '';
+      wrapper.append(add);
+      return wrapper;
+    }
+
+    function fieldContainer(label, composite) {
+      const field = document.createElement(composite ? 'div' : 'label');
+      if (composite) {
+        field.setAttribute('role', 'group');
+        field.setAttribute('aria-label', label);
+      }
+      return field;
+    }
+
+    function appField(parent, label, key, type, value, options = {}) {
+      const field = fieldContainer(label, type === 'list');
+      field.className = 'field';
+      field.append(document.createTextNode(label));
+      let control;
+      if (type === 'list') {
+        control = listEditor('command', value || []);
+        control.dataset.appKey = key;
+      } else if (type === 'bool') {
+        control = document.createElement('input');
+        control.type = 'checkbox';
+        control.checked = value === true;
+        control.dataset.appKey = key;
+      } else if (type === 'tri') {
+        control = optionSelect([['true', 'Yes'], ['false', 'No']], 'Inherit');
+        if (typeof value === 'boolean') control.value = String(value);
+        control.dataset.appKey = key;
+      } else if (type === 'choice') {
+        control = optionSelect(options.values.map(item => [item, item.toUpperCase()]), 'Default (CGI)');
+        control.value = value || '';
+        control.dataset.appKey = key;
+      } else {
+        control = document.createElement('input');
+        control.type = type === 'number' ? 'number' : 'text';
+        if (type === 'number') {
+          control.min = options.min ?? 0;
+          if (options.max !== undefined) control.max = options.max;
+        }
+        control.value = value ?? '';
+        control.dataset.appKey = key;
+      }
+      field.append(control);
+      parent.append(field);
+      return control;
+    }
+
+    function fastCgiAppCard(value = {}) {
+      const card = document.createElement('div');
+      card.className = 'repeat-card';
+      const head = document.createElement('div');
+      head.className = 'repeat-card-head';
+      const title = document.createElement('strong');
+      title.textContent = value.extension ? `.${value.extension} application` : 'New application';
+      const remove = document.createElement('button');
+      remove.type = 'button';
+      remove.textContent = 'Remove application';
+      remove.dataset.removeApp = '';
+      head.append(title, remove);
+      card.append(head);
+      const grid = document.createElement('div');
+      grid.className = 'field-grid';
+      appField(grid, 'Extension', 'extension', 'text', value.extension);
+      appField(grid, 'Command arguments', 'command', 'list', value.command || []);
+      appField(grid, 'Mode', 'mode', 'choice', value.mode, {values: ['cgi', 'fpm']});
+      appField(grid, 'PHP defaults', 'php_defaults', 'tri', value.php_defaults);
+      appField(grid, 'Minimum workers', 'min_workers', 'number', value.min_workers, {min: 0});
+      appField(grid, 'Maximum workers', 'max_workers', 'number', value.max_workers ?? value.workers, {min: 1});
+      appField(grid, 'Idle timeout (seconds)', 'idle_timeout', 'number', value.idle_timeout, {min: 0});
+      card.append(grid);
+      const envField = document.createElement('div');
+      envField.className = 'field';
+      envField.append(document.createTextNode('Environment variables'));
+      const envList = document.createElement('div');
+      envList.className = 'list-editor env-list';
+      envList.dataset.appKey = 'env';
+      for (const entry of Object.entries(value.env || {})) listRow(envList, entry, true);
+      const addEnv = document.createElement('button');
+      addEnv.type = 'button';
+      addEnv.textContent = 'Add environment variable';
+      addEnv.dataset.addEnv = '';
+      envList.append(addEnv);
+      envField.append(envList);
+      card.append(envField);
+      return card;
+    }
+
+    function botPolicyEditor(value = {}) {
+      const wrapper = document.createElement('div');
+      wrapper.className = 'repeat-list bot-policy';
+      wrapper.hidden = true;
+      const grid = document.createElement('div');
+      grid.className = 'field-grid';
+      for (const descriptor of BOT_FIELDS) {
+        const field = fieldContainer(descriptor.label, descriptor.type === 'list');
+        field.className = 'field';
+        field.append(document.createTextNode(descriptor.label));
+        let control;
+        if (descriptor.type === 'list') {
+          control = listEditor(descriptor.key, value[descriptor.key] || []);
+        } else if (descriptor.type === 'bool') {
+          control = document.createElement('input');
+          control.type = 'checkbox';
+          control.checked = value[descriptor.key] ?? BOT_DEFAULTS[descriptor.key];
+        } else if (descriptor.type === 'choice') {
+          control = optionSelect(descriptor.values.map(item => [item, item]), 'Default (enforce)');
+          control.value = value[descriptor.key] ?? BOT_DEFAULTS[descriptor.key] ?? '';
+        } else {
+          control = document.createElement('input');
+          control.type = descriptor.type;
+          if (descriptor.min !== undefined) control.min = descriptor.min;
+          if (descriptor.max !== undefined) control.max = descriptor.max;
+          control.value = value[descriptor.key] ?? '';
+        }
+        control.dataset.policyKey = descriptor.key;
+        field.append(control);
+        grid.append(field);
+      }
+      wrapper.append(grid);
+      return wrapper;
+    }
+
+    function makeField(descriptor, value) {
+      const field = fieldContainer(descriptor.label, ['list', 'rules', 'apps', 'rate', 'bot'].includes(descriptor.type));
+      field.className = ['apps', 'bot'].includes(descriptor.type) ? 'field wide' : 'field';
+      field.append(document.createTextNode(descriptor.label));
+      let control;
+      if (descriptor.type === 'list' || descriptor.type === 'rules') {
+        control = listEditor(descriptor.key, value || [], descriptor.type === 'rules');
+      } else if (descriptor.type === 'apps') {
+        control = fastCgiApps(value || []);
+      } else if (descriptor.type === 'bool') {
+        control = document.createElement('input');
+        control.type = 'checkbox';
+        control.checked = value === true;
+        control.dataset.key = descriptor.key;
+      } else if (descriptor.type === 'tri') {
+        control = optionSelect([['true', 'Yes'], ['false', 'No']], 'Inherit');
+        if (typeof value === 'boolean') control.value = String(value);
+        control.dataset.key = descriptor.key;
+      } else if (descriptor.type === 'rate') {
+        control = document.createElement('div');
+        control.className = 'field-grid';
+        const selector = optionSelect([['off', 'Off'], ['custom', 'Custom rate']], 'Inherit global rate');
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.placeholder = 'e.g. 20/s';
+        input.dataset.rateValue = '';
+        input.hidden = true;
+        if (value === 'off') selector.value = 'off';
+        else if (typeof value === 'string') {
+          selector.value = 'custom';
+          input.value = value;
+          input.hidden = false;
+        }
+        selector.dataset.rateMode = '';
+        control.append(selector, input);
+        control.dataset.key = descriptor.key;
+        control.dataset.type = 'rate';
+      } else if (descriptor.type === 'bot') {
+        control = document.createElement('div');
+        control.className = 'repeat-list';
+        const selector = optionSelect([['off', 'Off'], ['custom', 'Custom policy']], 'Inherit global policy');
+        const policy = value && typeof value === 'object' ? value : {};
+        if (value === 'off') selector.value = 'off';
+        else if (value && typeof value === 'object') selector.value = 'custom';
+        selector.dataset.botMode = '';
+        const editor = botPolicyEditor(policy);
+        editor.hidden = selector.value !== 'custom';
+        control.append(selector, editor);
+        control.dataset.key = descriptor.key;
+        control.dataset.type = 'bot';
+      } else {
+        control = document.createElement('input');
+        control.type = descriptor.type;
+        if (descriptor.min !== undefined) control.min = descriptor.min;
+        if (descriptor.max !== undefined) control.max = descriptor.max;
+        if (descriptor.required) control.required = true;
+        control.value = value ?? '';
+        control.dataset.key = descriptor.key;
+      }
+      field.append(control);
+      if (descriptor.help) {
+        const help = document.createElement('span');
+        help.className = 'field-help';
+        help.textContent = descriptor.help;
+        field.append(help);
+      }
+      return field;
+    }
+
+    function buildVhostForm(config = {}) {
+      const form = $('vhost-form');
+      form.replaceChildren();
+      for (const section of FORM_SECTIONS) {
+        const panel = document.createElement('section');
+        panel.className = 'editor-section';
+        const heading = document.createElement('h3');
+        heading.textContent = section.title;
+        panel.append(heading);
+        const grid = document.createElement('div');
+        grid.className = 'field-grid';
+        for (const descriptor of section.fields) {
+          grid.append(makeField(descriptor, config[descriptor.key]));
+        }
+        panel.append(grid);
+        form.append(panel);
+      }
+    }
+
+    function populateVhostForm(config) {
+      originalConfig = JSON.parse(JSON.stringify(config || {}));
+      buildVhostForm(originalConfig);
+      $('config').value = JSON.stringify(originalConfig, null, 2);
+      $('config').readOnly = false;
+      $('vhost-form').querySelectorAll('[data-key]').forEach(control => {
+        const value = originalConfig[control.dataset.key];
+        if (control.dataset.type === 'rate') {
+          const selector = control.querySelector('[data-rate-mode]');
+          const input = control.querySelector('[data-rate-value]');
+          input.hidden = selector.value !== 'custom';
+        }
+        if (control.dataset.type === 'bot') {
+          const selector = control.querySelector('[data-bot-mode]');
+          control.querySelector('.bot-policy').hidden = selector.value !== 'custom';
+        }
+      });
+      syncFormDisabledState();
+    }
+
+    function syncFormDisabledState() {
+      const disabled = $('config').readOnly;
+      $('vhost-form').querySelectorAll('input,select,textarea,button').forEach(control => {
+        control.disabled = disabled;
+      });
+      $('config').disabled = disabled;
+      $('advanced-json').querySelector('summary').setAttribute('aria-disabled', String(disabled));
+    }
+
+    function setValue(object, key, value, present = value !== undefined && value !== null && value !== '') {
+      if (present) object[key] = value;
+      else delete object[key];
+    }
+
+    function valueFromList(wrapper) {
+      return [...wrapper.querySelectorAll('[data-list-value]')].map(input => input.value.trim()).filter(Boolean);
+    }
+
+    function policyFromEditor(editor) {
+      const policy = {};
+      for (const descriptor of BOT_FIELDS) {
+        const control = editor.querySelector(`[data-policy-key="${descriptor.key}"]`);
+        let value;
+        if (descriptor.type === 'list') value = valueFromList(control);
+        else if (descriptor.type === 'bool') value = control.checked;
+        else if (descriptor.type === 'number') value = control.value === '' ? undefined : Number(control.value);
+        else value = control.value || undefined;
+        const baseline = BOT_DEFAULTS[descriptor.key];
+        if (Array.isArray(value) ? value.length : value !== undefined && value !== baseline) {
+          if (Array.isArray(value) && value.length === 0) continue;
+          policy[descriptor.key] = value;
+        }
+      }
+      return policy;
+    }
+
+    function appsFromEditor(wrapper) {
+      return [...wrapper.querySelectorAll(':scope > .repeat-card')].map(card => {
+        const app = {};
+        for (const control of card.querySelectorAll('[data-app-key]')) {
+          const key = control.dataset.appKey;
+          if (key === 'command') app.command = valueFromList(control);
+          else if (key === 'env') {
+            app.env = {};
+            control.querySelectorAll('.env-row').forEach(row => {
+              const name = row.querySelector('[data-env-key]').value.trim();
+              const value = row.querySelector('[data-env-value]').value;
+              if (name) app.env[name] = value;
+            });
+          } else if (control.type === 'checkbox') {
+            if (control.checked) app[key] = true;
+          } else if (control.tagName === 'SELECT') {
+            if (control.value !== '') app[key] = control.value === 'true' ? true : control.value === 'false' ? false : control.value;
+          } else if (control.value !== '') {
+            app[key] = control.type === 'number' ? Number(control.value) : control.value;
+          }
+        }
+        if (!app.extension || !app.command?.length) throw Error('Each FastCGI application needs an extension and at least one command argument.');
+        return app;
+      });
+    }
+
+    function configFromForm() {
+      const config = JSON.parse(JSON.stringify(originalConfig));
+      for (const section of FORM_SECTIONS) for (const descriptor of section.fields) {
+        const control = [...$('vhost-form').querySelectorAll('[data-key]')].find(item => item.dataset.key === descriptor.key);
+        if (!control) continue;
+        let value;
+        let present = true;
+        if (descriptor.type === 'bool') value = control.checked;
+        else if (descriptor.type === 'tri') {
+          value = control.value === '' ? undefined : control.value === 'true';
+          present = value !== undefined;
+        } else if (descriptor.type === 'list' || descriptor.type === 'rules') {
+          value = valueFromList(control);
+          if (descriptor.type === 'rules') value = value.map(rule => /^\d+$/.test(rule) ? Number(rule) : rule);
+          present = value.length > 0;
+        } else if (descriptor.type === 'apps') {
+          value = appsFromEditor(control);
+          present = value.length > 0;
+        } else if (descriptor.type === 'rate') {
+          const mode = control.querySelector('[data-rate-mode]').value;
+          value = mode === 'off' ? 'off' : mode === 'custom' ? control.querySelector('[data-rate-value]').value.trim() : undefined;
+          present = value !== undefined && value !== '';
+        } else if (descriptor.type === 'bot') {
+          const mode = control.querySelector('[data-bot-mode]').value;
+          value = mode === 'off' ? 'off' : mode === 'custom' ? policyFromEditor(control.querySelector('.bot-policy')) : undefined;
+          present = value !== undefined;
+        } else {
+          value = control.value.trim();
+          if (descriptor.type === 'number' && value !== '') value = Number(value);
+          present = value !== '';
+        }
+        setValue(config, descriptor.key, value, present);
+      }
+      return config;
+    }
+
+    function syncJsonFromForm() {
+      try {
+        $('config').value = JSON.stringify(configFromForm(), null, 2);
+        show('');
+      } catch (error) {
+        show(error.message, 'error');
+      }
+    }
+
+    function loadJsonIntoForm() {
+      let config;
+      try { config = JSON.parse($('config').value); }
+      catch (error) { throw Error('Configuration must be valid JSON: ' + error.message); }
+      if (!config || Array.isArray(config) || typeof config !== 'object') throw Error('Configuration must be a JSON object.');
+      originalConfig = config;
+      buildVhostForm(config);
+      syncFormDisabledState();
+    }
+
+    function setupEditor() {
+      $('vhost-form').addEventListener('input', syncJsonFromForm);
+      $('vhost-form').addEventListener('change', event => {
+        const control = event.target;
+        if (control.matches('[data-rate-mode]')) control.parentElement.querySelector('[data-rate-value]').hidden = control.value !== 'custom';
+        if (control.matches('[data-bot-mode]')) control.parentElement.querySelector('.bot-policy').hidden = control.value !== 'custom';
+        syncJsonFromForm();
+      });
+      $('vhost-form').addEventListener('click', event => {
+        const target = event.target;
+        if (target.matches('[data-add-list]')) listRow(target.parentElement);
+        else if (target.matches('[data-remove-row]')) target.closest('.list-row,.env-row').remove();
+        else if (target.matches('[data-add-app]')) target.parentElement.insertBefore(fastCgiAppCard(), target);
+        else if (target.matches('[data-remove-app]')) target.closest('.repeat-card').remove();
+        else if (target.matches('[data-add-env]')) listRow(target.parentElement, ['', ''], true);
+        else return;
+        syncJsonFromForm();
+      });
+      $('config').addEventListener('input', () => {
+        if (!$('advanced-json').open) return;
+        try { originalConfig = JSON.parse($('config').value); }
+        catch (_) { return; }
+      });
+      $('advanced-json').addEventListener('toggle', () => {
+        if ($('advanced-json').open) return;
+        try {
+          loadJsonIntoForm();
+          $('config').value = JSON.stringify(originalConfig, null, 2);
+          show('');
+        } catch (error) {
+          $('advanced-json').open = true;
+          show(error.message, 'error');
+        }
+      });
+    }
+
+    async function setupAuthMethods() {
+      try {
+        const methods = JSON.parse(await request('auth'));
+        $('password').hidden = !methods.password;
+        $('password-login').hidden = !methods.password;
+        $('google').hidden = !methods.google;
+      } catch (error) {
+        show(error.message, 'error');
+      }
+    }
+
+    function optionGroup(name) {
+      if (['bind', 'tls_bind', 'http3_bind', 'plain_http', 'https_redirect', 'max_connections', 'header_read_timeout', 'tls_handshake_timeout'].includes(name)) return 'Listeners';
+      if (['threads', 'user', 'group'].includes(name)) return 'Process';
+      if (/^(root|index|listing|try_files|fastcgi|cgi|static_)/.test(name)) return 'Static / FastCGI';
+      if (/^worker_/.test(name)) return 'Workers';
+      if (/^(rate_limit|trusted_proxy)/.test(name)) return 'Rate limits / proxies';
+      if (/^swarm_/.test(name)) return 'Swarm';
+      if (/^(access_log|error_log|log_)/.test(name)) return 'Logging';
+      if (/^bot_/.test(name)) return 'Bot protection';
+      if (/^modsecurity_/.test(name)) return 'ModSecurity';
+      if (/^(config|vhost_dir|control_socket|tls_|acme_)/.test(name)) return 'Config / TLS / ACME';
+      return 'Other';
+    }
+
+    function numericOption(option) {
+      return /^(N|SECS?|MS|CODE|BYTES|FRACTION|PCT|PORT|COUNT|THREADS|TTL|SECONDS?|MILLISECONDS?)\b/i.test(option.value_name || '')
+        || /_(count|threads|timeout|ttl|limit|size|max|min|threshold|pct|percent|status)$/.test(option.name);
+    }
+
+    function optionListRow(list, value, disabled) {
+      const row = document.createElement('div');
+      row.className = 'option-list-row';
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.value = value;
+      input.disabled = disabled;
+      input.setAttribute('aria-label', 'Option list value');
+      const remove = document.createElement('button');
+      remove.type = 'button';
+      remove.textContent = 'Remove';
+      remove.disabled = disabled;
+      remove.addEventListener('click', () => row.remove());
+      row.append(input, remove);
+      list.append(row);
+    }
+
+    function renderServerOptions() {
+      if (!optionsModel) return;
+      $('options-file').textContent = 'Configuration file: ' + (optionsModel.file || '—');
+      $('options-restart').hidden = !optionsModel.restart_required;
+      $('options-readonly').hidden = Boolean(optionsModel.writable);
+      $('options-readonly').textContent = optionsModel.reason || 'This configuration file is read-only.';
+      $('save-options').disabled = !optionsModel.writable;
+      const commandLine = new Set(optionsModel.command_line || []);
+      const groups = new Map();
+      for (const option of optionsModel.schema || []) {
+        const group = optionGroup(option.name);
+        if (!groups.has(group)) groups.set(group, []);
+        groups.get(group).push(option);
+      }
+      const sections = [];
+      for (const [title, options] of groups) {
+        const section = document.createElement('section');
+        section.className = 'editor-section';
+        const heading = document.createElement('h3');
+        heading.textContent = title;
+        const grid = document.createElement('div');
+        grid.className = 'field-grid';
+        for (const option of options) {
+          const field = document.createElement('label');
+          field.className = 'field';
+          field.dataset.option = option.name;
+          const title = document.createElement('span');
+          title.className = 'option-name';
+          title.textContent = option.name.replaceAll('_', '-');
+          field.append(title);
+          const locked = !optionsModel.writable || commandLine.has(option.name);
+          const value = optionsModel.options?.[option.name];
+          if (commandLine.has(option.name)) {
+            const badge = document.createElement('span');
+            badge.className = 'badge';
+            badge.textContent = 'Set on command line';
+            field.append(badge);
+          }
+          if (option.kind === 'flag') {
+            const input = document.createElement('input');
+            input.type = 'checkbox';
+            input.dataset.optionValue = '';
+            input.checked = value === true;
+            input.disabled = locked;
+            field.append(input);
+          } else if (option.kind === 'list') {
+            const list = document.createElement('div');
+            list.className = 'option-list';
+            list.dataset.optionList = '';
+            const values = Array.isArray(value) ? value : value === undefined ? [] : [value];
+            for (const item of values) optionListRow(list, String(item), locked);
+            const add = document.createElement('button');
+            add.type = 'button';
+            add.textContent = 'Add value';
+            add.disabled = locked;
+            add.addEventListener('click', () => optionListRow(list, '', locked));
+            list.append(add);
+            field.append(list);
+          } else {
+            const input = document.createElement('input');
+            input.type = numericOption(option) ? 'number' : 'text';
+            if (input.type === 'number') {
+              input.step = 'any';
+              if (option.min !== null && option.min !== undefined) input.min = String(option.min);
+              if (option.max !== null && option.max !== undefined) input.max = String(option.max);
+            }
+            input.dataset.optionValue = '';
+            input.value = value === undefined || value === null ? '' : String(value);
+            input.placeholder = option.default || '';
+            input.disabled = locked;
+            field.append(input);
+          }
+          if (option.help) {
+            const help = document.createElement('span');
+            help.className = 'field-help';
+            help.textContent = option.help;
+            field.append(help);
+          }
+          grid.append(field);
+        }
+        section.append(heading, grid);
+        sections.push(section);
+      }
+      $('options-form').replaceChildren(...sections);
+    }
+
+    async function loadServerOptions() {
+      try {
+        optionsModel = JSON.parse(await request('api/options'));
+        renderServerOptions();
+      } catch (error) {
+        show(error.message, 'error');
+      }
+    }
+
+    function serverOptionsFromForm() {
+      const options = {...(optionsModel?.options || {})};
+      const commandLine = new Set(optionsModel?.command_line || []);
+      for (const option of optionsModel?.schema || []) {
+        if (commandLine.has(option.name)) continue;
+        const field = [...$('options-form').querySelectorAll('[data-option]')]
+          .find(item => item.dataset.option === option.name);
+        if (!field) continue;
+        if (option.kind === 'flag') {
+          if (field.querySelector('[data-option-value]').checked) options[option.name] = true;
+          else delete options[option.name];
+        } else if (option.kind === 'list') {
+          const values = [...field.querySelectorAll('.option-list-row input')]
+            .map(input => input.value.trim()).filter(Boolean);
+          if (values.length) options[option.name] = values;
+          else delete options[option.name];
+        } else {
+          const input = field.querySelector('[data-option-value]');
+          const value = input.value.trim();
+          if (!value) delete options[option.name];
+          else options[option.name] = input.type === 'number' ? Number(value) : value;
+        }
+      }
+      return options;
+    }
+
+    async function saveServerOptions() {
+      try {
+        const options = serverOptionsFromForm();
+        const result = JSON.parse(await request('api/options', {
+          method: 'PUT',
+          headers: {'Content-Type': 'application/json', 'X-CSRF-Token': token},
+          body: JSON.stringify(options)
+        }));
+        optionsModel.options = result.options;
+        optionsModel.restart_required = result.restart_required;
+        renderServerOptions();
+        show('Server options saved. Restart the server for changes to take effect.');
+      } catch (error) {
+        show(error.message, 'error');
+      }
+    }
 
     async function request(url, options = {}) {
       const response = await fetch(root + url, options);
@@ -224,12 +1032,29 @@
       return host.server_names?.[0] || host.name || '';
     }
 
+    function controlName(host) {
+      return host.name || primaryName(host);
+    }
+
+    function hasOwn(object, key) {
+      return Object.prototype.hasOwnProperty.call(object, key);
+    }
+
+    function trafficKey(host) {
+      const candidates = [...(host.server_names || []), host.name].filter(Boolean);
+      const statusTraffic = latestStatus?.traffic?.vhosts || {};
+      const historyTraffic = samples.length ? samples[samples.length - 1].traffic.vhosts || {} : {};
+      return candidates.find(name => hasOwn(statusTraffic, name))
+        || candidates.find(name => hasOwn(historyTraffic, name))
+        || candidates[0]
+        || '';
+    }
+
     function hostTraffic(host) {
-      const traffic = latestStatus?.traffic?.vhosts || {};
-      for (const name of [...(host.server_names || []), host.name]) {
-        if (name && traffic[name]) return traffic[name];
-      }
-      return {};
+      const key = trafficKey(host);
+      const statusTraffic = latestStatus?.traffic?.vhosts || {};
+      const historyTraffic = samples.length ? samples[samples.length - 1].traffic.vhosts || {} : {};
+      return statusTraffic[key] || historyTraffic[key] || {};
     }
 
     function cell(text, className = '') {
@@ -249,9 +1074,13 @@
     }
 
     function renderHosts() {
-      const query = $('host-filter').value.trim().toLowerCase();
-      const visible = hostList.filter(host => [host.name, ...(host.server_names || []), host.file]
-        .some(value => String(value || '').toLowerCase().includes(query)));
+      const terms = $('host-filter').value.trim().toLowerCase().split(/\s+/).filter(Boolean);
+      const visible = hostList.filter(host => {
+        const searchable = [host.name, ...(host.server_names || []), host.file, host.source]
+          .map(value => String(value || '').toLowerCase());
+        return terms.every(term => searchable.some(value => value.includes(term)));
+      });
+      $('host-count').textContent = `${visible.length} of ${hostList.length}`;
       const table = document.createElement('table');
       const head = document.createElement('thead');
       const headerRow = document.createElement('tr');
@@ -273,11 +1102,27 @@
         body.append(row);
       }
       for (const host of visible) {
+        const name = controlName(host);
         const row = document.createElement('tr');
+        row.dataset.host = name;
+        row.tabIndex = 0;
+        row.setAttribute('role', 'link');
+        row.setAttribute('aria-label', `View statistics for ${name}`);
+        row.addEventListener('click', event => {
+          if (!event.target.closest('button, a, input, select, textarea')) navigateHost(name);
+        });
+        row.addEventListener('keydown', event => {
+          if (event.target === row && (event.key === 'Enter' || event.key === ' ')) {
+            event.preventDefault();
+            navigateHost(name);
+          }
+        });
         const names = document.createElement('td');
-        const primary = document.createElement('div');
+        const primary = document.createElement('a');
+        primary.href = hostHash(name);
         primary.className = 'host-name';
-        primary.textContent = host.name || primaryName(host) || 'Unnamed';
+        primary.classList.add('host-link');
+        primary.textContent = name || 'Unnamed';
         const aliases = document.createElement('div');
         aliases.className = 'host-aliases';
         aliases.textContent = (host.server_names || []).join(', ');
@@ -299,19 +1144,14 @@
         );
         const actions = document.createElement('td');
         actions.className = 'actions';
-        actions.append(action('Graph', () => selectHostGraph(primaryName(host))));
+        actions.append(action('Stats', () => navigateHost(name)));
         actions.append(action(host.read_only ? 'View' : 'Edit', () => openHost(host)));
         if (!host.read_only) actions.append(action('Delete', () => deleteHost(host), 'danger'));
         row.append(actions);
         body.append(row);
       }
       table.append(body);
-      const wrapper = document.createElement('div');
-      wrapper.className = 'table-wrap';
-      wrapper.append(table);
-      $('hosts').replaceWith(wrapper);
-      wrapper.id = 'hosts';
-      wrapper.setAttribute('aria-live', 'polite');
+      $('hosts').replaceChildren(table);
     }
 
     const KEYS = ['requests', 'client_errors', 'server_errors', 'bytes_in', 'bytes_out'];
@@ -400,42 +1240,146 @@
       }
     }
 
+    function hostHash(name) {
+      return '#/vhost/' + encodeURIComponent(name);
+    }
+
+    function routedHostName() {
+      const match = location.hash.match(/^#\/vhost\/(.+)$/);
+      if (!match) return null;
+      try { return decodeURIComponent(match[1]); }
+      catch (_) { return match[1]; }
+    }
+
+    function navigateHost(name) {
+      if (!name) return;
+      location.hash = hostHash(name);
+      renderRoute();
+    }
+
+    function navigateOverview() {
+      location.hash = '#/';
+      renderRoute();
+    }
+
+    function navigateOptions() {
+      location.hash = '#/options';
+      renderRoute();
+    }
+
+    function selectDetailHost() {
+      navigateHost($('vhost').value);
+    }
+
+    function editDetailHost() {
+      const name = routedHostName();
+      const host = hostList.find(item => controlName(item) === name);
+      if (host) openHost(host);
+    }
+
+    function renderMetricGrid(target, entries) {
+      target.replaceChildren(...entries.map(([label, value]) => {
+        const card = document.createElement('div');
+        card.className = 'metric';
+        const title = document.createElement('div');
+        title.className = 'metric-label';
+        title.textContent = label;
+        const content = document.createElement('div');
+        content.className = 'metric-value';
+        content.textContent = value;
+        card.append(title, content);
+        return card;
+      }));
+    }
+
+    function renderDetail(name) {
+      const host = hostList.find(item => controlName(item) === name);
+      const missing = $('detail-not-found');
+      const content = $('detail-content');
+      if (!host) {
+        $('detail-title').textContent = 'Virtual host not found';
+        missing.textContent = `Virtual host “${name}” was not found. It may have been removed or its control name is invalid.`;
+        missing.hidden = false;
+        content.hidden = true;
+        $('vhostRequests').getContext('2d').clearRect(0, 0, $('vhostRequests').width, $('vhostRequests').height);
+        $('vhostBytes').getContext('2d').clearRect(0, 0, $('vhostBytes').width, $('vhostBytes').height);
+        return;
+      }
+
+      missing.hidden = true;
+      content.hidden = false;
+      $('detail-title').textContent = controlName(host);
+      const metadata = [
+        `Source: ${host.source === 'vhost_dir' ? 'vhost directory' : 'main config'}`,
+        `Control name: ${host.name || controlName(host)}`,
+        `Server names: ${(host.server_names || []).join(', ') || '—'}`,
+        `Configuration file: ${host.file || '—'}`
+      ];
+      $('detail-meta').replaceChildren(...metadata.map(value => {
+        const item = document.createElement('span');
+        item.textContent = value;
+        return item;
+      }));
+
+      const key = trafficKey(host);
+      const counters = hostTraffic(host);
+      const requests = Number(counters.requests) || 0;
+      const clientErrors = Number(counters.client_errors) || 0;
+      const serverErrors = Number(counters.server_errors) || 0;
+      const currentRates = rates(sample => sample.traffic.vhosts[key]);
+      const current = currentRates[currentRates.length - 1] || {};
+      const errorRate = requests ? ((clientErrors + serverErrors) / requests * 100).toFixed(2) + '%' : '0%';
+      renderMetricGrid($('detail-stats'), [
+        ['Total requests', number(requests)],
+        ['4xx errors', number(clientErrors)],
+        ['5xx errors', number(serverErrors)],
+        ['Error rate', errorRate],
+        ['Data received', byteSize(counters.bytes_in)],
+        ['Data sent', byteSize(counters.bytes_out)],
+        ['Current request rate', fmt(current.requests || 0, false)],
+        ['Current inbound bandwidth', fmt(current.bytes_in || 0, true)],
+        ['Current outbound bandwidth', fmt(current.bytes_out || 0, true)]
+      ]);
+      const hostRates = rates(sample => sample.traffic.vhosts[key]);
+      chart('vhostRequests', hostRates, REQUESTS, false);
+      chart('vhostBytes', hostRates, BYTES, true);
+    }
+
     function draw() {
       const server = rates(sample => sample.traffic.total);
       chart('serverRequests', server, REQUESTS, false);
       chart('serverBytes', server, BYTES, true);
       const select = $('vhost');
-      const names = new Set(hostList.map(primaryName).filter(Boolean));
-      if (samples.length) for (const name of Object.keys(samples[samples.length - 1].traffic.vhosts || {})) names.add(name);
-      const sorted = [...names].sort();
-      const current = select.value;
-      if (sorted.join('\n') !== [...select.options].map(option => option.value).join('\n')) {
-        select.replaceChildren(...sorted.map(name => {
+      const names = hostList.map(controlName).filter(Boolean).sort();
+      const current = routedHostName() || select.value;
+      if (names.join('\n') !== [...select.options].map(option => option.value).join('\n')) {
+        select.replaceChildren(...names.map(name => {
           const option = document.createElement('option');
           option.value = name;
           option.textContent = name;
           return option;
         }));
-        if (sorted.includes(current)) select.value = current;
       }
-      const name = select.value;
-      const vhost = name ? rates(sample => sample.traffic.vhosts[name]) : [];
-      chart('vhostRequests', vhost, REQUESTS, false);
-      chart('vhostBytes', vhost, BYTES, true);
+      select.value = names.includes(current) ? current : '';
+      const route = routedHostName();
+      if (route) renderDetail(route);
     }
 
-    function selectHostGraph(name) {
-      if (!name) return;
-      const select = $('vhost');
-      if (![...select.options].some(option => option.value === name)) {
-        const option = document.createElement('option');
-        option.value = name;
-        option.textContent = name;
-        select.append(option);
+    function renderRoute() {
+      if ($('admin').hidden) return;
+      const name = routedHostName();
+      const options = location.hash === '#/options';
+      const view = options ? 'options' : name ? 'vhost:' + name : 'overview';
+      const entering = activeView !== view;
+      activeView = view;
+      $('overview').hidden = options || Boolean(name);
+      $('detail').hidden = options || !name;
+      $('server-options').hidden = !options;
+      if (options && entering) loadServerOptions();
+      if (name) {
+        draw();
+        if (entering) $('detail').scrollIntoView({behavior: 'smooth', block: 'start'});
       }
-      select.value = name;
-      draw();
-      $('vhostRequests').scrollIntoView({behavior: 'smooth', block: 'center'});
     }
 
     async function load() {
@@ -443,6 +1387,7 @@
       renderStatus(JSON.parse(statusText));
       hostList = JSON.parse(hostsText);
       renderHosts();
+      renderRoute();
       draw();
     }
 
@@ -496,8 +1441,9 @@
       $('editor-title').textContent = 'New virtual host';
       $('name').value = '';
       $('name').disabled = false;
-      $('config').value = '{\n  "server_names": ["example.com"],\n  "root": "/srv/www/example"\n}';
       $('config').readOnly = false;
+      $('advanced-json').open = false;
+      populateVhostForm({server_names: ['example.com'], root: '/srv/www/example'});
       $('save-host').hidden = false;
       $('save-host').textContent = 'Create';
       $('editor').hidden = false;
@@ -512,8 +1458,10 @@
         $('editor-title').textContent = readOnly ? 'View virtual host' : 'Edit virtual host';
         $('name').value = editingName;
         $('name').disabled = true;
-        $('config').value = JSON.stringify(detail.vhost?.[0] || {}, null, 2);
+        $('advanced-json').open = false;
+        populateVhostForm(detail.vhost?.[0] || {});
         $('config').readOnly = readOnly;
+        syncFormDisabledState();
         $('save-host').hidden = readOnly;
         $('save-host').textContent = 'Save changes';
         $('editor').hidden = false;
@@ -532,10 +1480,11 @@
       try {
         const name = editingName || $('name').value.trim();
         if (!name) throw Error('Enter a control name for the virtual host.');
-        let config;
-        try { config = JSON.parse($('config').value); }
-        catch (error) { throw Error('Configuration must be valid JSON: ' + error.message); }
+        let config = $('advanced-json').open ? JSON.parse($('config').value) : configFromForm();
         if (!config || Array.isArray(config) || typeof config !== 'object') throw Error('Configuration must be a JSON object.');
+        if (!Array.isArray(config.server_names) || config.server_names.length === 0) throw Error('Add at least one server name.');
+        if (!config.proxy_pass && !config.user) throw Error('Set a worker user unless an upstream URL is configured.');
+        $('config').value = JSON.stringify(config, null, 2);
         const isEdit = Boolean(editingName);
         await request('api/vhosts/' + encodeURIComponent(name), {
           method: isEdit ? 'PUT' : 'POST',
@@ -575,6 +1524,12 @@
     }
 
     $('host-filter').addEventListener('input', renderHosts);
+    window.addEventListener('hashchange', renderRoute);
+    $('password').addEventListener('keydown', event => {
+      if (event.key === 'Enter') login();
+    });
+    setupEditor();
+    setupAuthMethods();
     refresh();
   </script>
 </body>

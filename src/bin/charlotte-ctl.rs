@@ -42,6 +42,10 @@ struct Cli {
 enum Action {
     /// Show server status
     Status,
+    /// Show server-wide configuration options
+    Options,
+    /// Replace server-wide configuration options from a YAML or JSON file (or stdin)
+    SetOptions { file: Option<PathBuf> },
     /// List virtual hosts
     List,
     /// Show a virtual host's configuration
@@ -80,6 +84,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
     let (method, path, body) = match cli.action {
         Action::Status => ("GET", "/status".to_owned(), Vec::new()),
+        Action::Options => ("GET", "/options".to_owned(), Vec::new()),
+        Action::SetOptions { file } => ("PUT", "/options".to_owned(), read_body(file)?),
         Action::List => ("GET", "/vhosts".to_owned(), Vec::new()),
         Action::Get { name } => ("GET", vhost_path(&name), Vec::new()),
         Action::Create { name, file } => ("POST", vhost_path(&name), read_body(file)?),

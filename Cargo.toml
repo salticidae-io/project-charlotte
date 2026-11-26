@@ -36,7 +36,7 @@ http-body = "1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["http1", "http2", "server"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "ring", "native-tokio", "tls12"], optional = true }
-hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
+hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio"] }
 instant-acme = { version = "0.8.5", default-features = false, features = ["ring", "hyper-rustls", "rcgen"], optional = true }
 libmodsecurity3-rs = { version = "0.1.1" }
 nix = { version = "0.31.3", features = ["fs", "hostname", "poll", "process", "signal", "socket", "uio", "user"] }

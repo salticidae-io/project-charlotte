@@ -1297,9 +1297,11 @@ impl Router {
             .and_then(|host| Self::select_vhost(&table, host))
             .or(table.default);
         let vhost = selected.map(|index| &table.vhosts[index]);
-        let traffic = self
-            .traffic
-            .start(vhost.and_then(|vhost| vhost.names.first()).map(String::as_str));
+        let traffic = self.traffic.start(
+            vhost
+                .and_then(|vhost| vhost.names.first())
+                .map(String::as_str),
+        );
         let server_name = vhost
             .and_then(|vhost| vhost.names.first())
             .cloned()

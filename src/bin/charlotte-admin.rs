@@ -1,12 +1,13 @@
 //! Standalone control-socket UI. Run `charlotte-admin --help` for configuration.
-//! Terminate TLS at a trusted reverse proxy; this process serves HTTP only. The
-//! proxy must strip external forwarding headers. IP checks always use the TCP
-//! peer, never forwarding headers, so a proxy cannot convey client IPs here.
+//! TLS can be served directly with `--tls-cert` and `--tls-key`, or terminated
+//! at a trusted reverse proxy. The proxy must strip external forwarding headers.
+//! IP checks always use the TCP peer, never forwarding headers, so a proxy
+//! cannot convey client IPs here.
 //! Sessions and OAuth attempts are in memory and disappear on restart.
 //! Example: `CHARLOTTE_ADMIN_PASSWORD=... charlotte-admin --base-url
 //! http://localhost:8080 --socket /run/charlotte/control.sock`. For Google,
-//! register `<base-url>/oauth/callback` and configure the client ID, secret and
-//! at least one `--google-email`. Protect the listener and control socket from
+//! register `<base-url>/oauth/callback` and configure the client ID, secret,
+//! and `--google-domain`. Protect the listener and control socket from
 //! untrusted local users. There is no built-in login rate limiting or audit log.
 //! Traffic graphs are built by sampling the control socket's `/status` counters
 //! every `--sample-interval` seconds; the last `--history` samples are kept in
@@ -15,13 +16,13 @@
 use std::{
     collections::{HashMap, VecDeque},
     net::{IpAddr, SocketAddr},
-    path::PathBuf,
+    path::{Path as FsPath, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     body::Bytes,
     extract::{ConnectInfo, DefaultBodyLimit, Path, Request, State},
     http::{HeaderMap, Method, StatusCode, header},
@@ -35,7 +36,9 @@ use ring::{
     hmac,
     rand::{SecureRandom, SystemRandom},
 };
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use serde::Deserialize;
+use tokio::io::{AsyncRead, AsyncWrite};
 use url::Url;
 
 #[derive(Parser)]
@@ -43,7 +46,7 @@ use url::Url;
 struct Config {
     #[arg(long, default_value = "127.0.0.1:8080")]
     bind: SocketAddr,
-    /// Public URL, including any path prefix; HTTPS required except on loopback.
+    /// Public URL, including any path prefix; use HTTPS in production.
     #[arg(long, env = "CHARLOTTE_ADMIN_BASE_URL")]
     base_url: String,
     #[arg(
@@ -59,9 +62,18 @@ struct Config {
     google_client_id: Option<String>,
     #[arg(long, env = "CHARLOTTE_GOOGLE_CLIENT_SECRET", hide_env_values = true)]
     google_client_secret: Option<String>,
-    /// Allowed Google email address; repeat for multiple users.
+    /// Google Workspace domain allowed to sign in (required with Google OAuth).
+    #[arg(long, env = "CHARLOTTE_GOOGLE_DOMAIN")]
+    google_domain: Option<String>,
+    /// Optional additional Google email allowlist; repeat for multiple users.
     #[arg(long)]
     google_email: Vec<String>,
+    /// PEM certificate chain for HTTPS. Must be used with --tls-key.
+    #[arg(long)]
+    tls_cert: Option<PathBuf>,
+    /// PEM private key for HTTPS. Must be used with --tls-cert.
+    #[arg(long, hide_env_values = true)]
+    tls_key: Option<PathBuf>,
     /// Allowed TCP peer IP address; repeat for multiple addresses. Default: loopback only.
     #[arg(long)]
     allow_ip: Vec<IpAddr>,
@@ -188,6 +200,12 @@ async fn guard(
     h.insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
     h.insert(header::X_CONTENT_TYPE_OPTIONS, "nosniff".parse().unwrap());
     h.insert(header::X_FRAME_OPTIONS, "DENY".parse().unwrap());
+    if app.config.tls_cert.is_some() {
+        h.insert(
+            "strict-transport-security",
+            "max-age=31536000".parse().unwrap(),
+        );
+    }
     h.insert(header::CONTENT_SECURITY_POLICY, "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'".parse().unwrap());
     h.insert(header::REFERRER_POLICY, "no-referrer".parse().unwrap());
     response
@@ -195,6 +213,12 @@ async fn guard(
 
 async fn index() -> Html<&'static str> {
     Html(UI)
+}
+async fn auth_methods(State(app): State<Shared>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "password": app.config.password.is_some(),
+        "google": app.config.google_client_id.is_some(),
+    }))
 }
 #[derive(Deserialize)]
 struct Login {
@@ -279,6 +303,10 @@ async fn oauth_start(State(app): State<Shared>) -> Response {
         )
         .append_pair("response_type", "code")
         .append_pair("scope", "openid email")
+        .append_pair(
+            "hd",
+            app.config.google_domain.as_deref().unwrap_or_default(),
+        )
         .append_pair("state", &state);
     let mut response = Redirect::to(url.as_str()).into_response();
     response.headers_mut().insert(
@@ -303,6 +331,27 @@ struct Identity {
     email: String,
     email_verified: bool,
     sub: String,
+    hd: Option<String>,
+}
+
+fn google_allowed(
+    email: &str,
+    verified: bool,
+    subject: &str,
+    hosted_domain: Option<&str>,
+    domain: &str,
+    allowlist: &[String],
+) -> bool {
+    verified
+        && !subject.is_empty()
+        && hosted_domain.is_some_and(|hosted| hosted.eq_ignore_ascii_case(domain))
+        && email
+            .to_ascii_lowercase()
+            .ends_with(&format!("@{}", domain.to_ascii_lowercase()))
+        && (allowlist.is_empty()
+            || allowlist
+                .iter()
+                .any(|entry| entry.eq_ignore_ascii_case(email)))
 }
 async fn oauth_callback(
     State(app): State<Shared>,
@@ -359,14 +408,17 @@ async fn oauth_callback(
     let Ok(identity) = identity.json::<Identity>().await else {
         return StatusCode::BAD_GATEWAY.into_response();
     };
-    if !identity.email_verified
-        || identity.sub.is_empty()
-        || !app
-            .config
-            .google_email
-            .iter()
-            .any(|e| e.eq_ignore_ascii_case(&identity.email))
-    {
+    let Some(domain) = app.config.google_domain.as_deref() else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    if !google_allowed(
+        &identity.email,
+        identity.email_verified,
+        &identity.sub,
+        identity.hd.as_deref(),
+        domain,
+        &app.config.google_email,
+    ) {
         return StatusCode::FORBIDDEN.into_response();
     }
     let session = issue_session(&app);
@@ -401,6 +453,7 @@ async fn proxy(
     }
     let valid = match route.as_str() {
         "status" | "vhosts" => method == Method::GET,
+        "options" => matches!(method, Method::GET | Method::PUT),
         _ => route.strip_prefix("vhosts/").is_some_and(|name| {
             !name.is_empty()
                 && name
@@ -480,6 +533,21 @@ async fn history(State(app): State<Shared>, headers: HeaderMap) -> Response {
         .into_response()
 }
 
+fn valid_domain(domain: &str) -> bool {
+    !domain.is_empty()
+        && domain.len() <= 253
+        && domain.split('.').count() >= 2
+        && domain.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label.as_bytes()[0].is_ascii_alphanumeric()
+                && label.as_bytes()[label.len() - 1].is_ascii_alphanumeric()
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+}
+
 fn validate(config: &Config) -> Result<(Url, String), String> {
     let base = Url::parse(&config.base_url).map_err(|e| e.to_string())?;
     if base.username() != ""
@@ -512,20 +580,67 @@ fn validate(config: &Config) -> Result<(Url, String), String> {
     if config.password.as_ref().is_some_and(|p| p.is_empty()) {
         return Err("password must not be empty".into());
     }
+    if config.tls_cert.is_some() != config.tls_key.is_some() {
+        return Err("TLS requires both --tls-cert and --tls-key".into());
+    }
+    if config.tls_cert.is_some() && base.scheme() != "https" {
+        return Err("base URL must use HTTPS when TLS is enabled".into());
+    }
+    if config
+        .google_domain
+        .as_deref()
+        .is_some_and(|domain| !valid_domain(domain))
+    {
+        return Err("Google domain must be a valid DNS domain name".into());
+    }
     let google = config.google_client_id.is_some()
         && config.google_client_secret.is_some()
-        && !config.google_email.is_empty();
+        && config.google_domain.is_some();
     if (config.google_client_id.is_some()
         || config.google_client_secret.is_some()
+        || config.google_domain.is_some()
         || !config.google_email.is_empty())
         && !google
     {
-        return Err("Google login requires client ID, secret and an email allowlist".into());
+        return Err("Google login requires client ID, secret and --google-domain".into());
     }
     if config.password.is_none() && !google {
         return Err("configure at least one authentication method".into());
     }
     Ok((base, prefix))
+}
+
+fn load_tls_config(
+    cert_path: &FsPath,
+    key_path: &FsPath,
+) -> Result<rustls::ServerConfig, Box<dyn std::error::Error + Send + Sync>> {
+    let certs = CertificateDer::pem_file_iter(cert_path)?.collect::<Result<Vec<_>, _>>()?;
+    if certs.is_empty() {
+        return Err("TLS certificate file contains no certificates".into());
+    }
+    let key: PrivateKeyDer<'static> = PrivateKeyDer::from_pem_file(key_path)?;
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut tls = rustls::ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])?
+        .with_no_client_auth()
+        .with_single_cert(certs, key)?;
+    tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(tls)
+}
+
+async fn serve<S>(stream: S, router: Router, peer: SocketAddr)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let service = router.layer(Extension(ConnectInfo(peer))).into_service();
+    let service = hyper_util::service::TowerToHyperService::new(service);
+    let builder =
+        hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+    let connection =
+        builder.serve_connection_with_upgrades(hyper_util::rt::TokioIo::new(stream), service);
+    if let Err(error) = connection.await {
+        eprintln!("admin HTTP connection from {peer} failed: {error}");
+    }
 }
 
 #[tokio::main]
@@ -556,6 +671,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(sampler(app.clone()));
     let routes = Router::new()
         .route("/", get(index))
+        .route("/auth", get(auth_methods))
         .route("/login", post(login))
         .route("/logout", post(logout))
         .route("/csrf", get(csrf))
@@ -570,14 +686,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     .layer(DefaultBodyLimit::max(1024 * 1024))
     .layer(middleware::from_fn_with_state(app.clone(), guard))
-    .with_state(app);
+    .with_state(app.clone());
+    let tls = match (&app.config.tls_cert, &app.config.tls_key) {
+        (Some(cert), Some(key)) => Some(tokio_rustls::TlsAcceptor::from(Arc::new(
+            load_tls_config(cert, key).map_err(|error| std::io::Error::other(error.to_string()))?,
+        ))),
+        _ => None,
+    };
     let listener = tokio::net::TcpListener::bind(bind).await?;
-    axum::serve(
-        listener,
-        router.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await?;
-    Ok(())
+    loop {
+        let (stream, peer) = listener.accept().await?;
+        let router = router.clone();
+        if let Some(acceptor) = tls.clone() {
+            tokio::spawn(async move {
+                match tokio::time::timeout(Duration::from_secs(10), acceptor.accept(stream)).await {
+                    Ok(Ok(stream)) => serve(stream, router, peer).await,
+                    Ok(Err(error)) => eprintln!("admin TLS handshake from {peer} failed: {error}"),
+                    Err(_) => eprintln!("admin TLS handshake from {peer} timed out"),
+                }
+            });
+        } else {
+            tokio::spawn(serve(stream, router, peer));
+        }
+    }
 }
 
 const UI: &str = include_str!("charlotte-admin-ui.html");
@@ -594,7 +725,10 @@ mod tests {
             password: Some("secret".into()),
             google_client_id: None,
             google_client_secret: None,
+            google_domain: None,
             google_email: vec![],
+            tls_cert: None,
+            tls_key: None,
             allow_ip: vec![],
             sample_interval: 10,
             history: 3,
@@ -657,12 +791,100 @@ mod tests {
         assert!(validate(&c).is_err());
         c.google_client_id = Some("id".into());
         assert!(validate(&c).is_err());
+        c.google_client_secret = Some("secret".into());
+        c.google_domain = Some("example.com".into());
+        assert!(validate(&c).is_ok());
         c.password = Some("secret".into());
         c.google_client_id = None;
+        c.google_client_secret = None;
+        c.google_domain = None;
+        c.google_email.clear();
         c.base_url = "http://example.com".into();
         assert!(validate(&c).is_err());
         c.base_url = "https://example.com/admin".into();
         assert!(validate(&c).is_ok());
+        c.tls_cert = Some("cert.pem".into());
+        assert!(validate(&c).is_err());
+        c.tls_key = Some("key.pem".into());
+        assert!(validate(&c).is_ok());
+        c.base_url = "http://localhost:8080/admin".into();
+        assert!(validate(&c).is_err());
+        c.tls_cert = None;
+        c.tls_key = None;
+        c.google_client_id = Some("id".into());
+        c.google_client_secret = Some("secret".into());
+        assert!(validate(&c).is_err());
+        c.google_domain = Some("example.com".into());
+        assert!(validate(&c).is_ok());
+    }
+    #[test]
+    fn google_login_requires_verified_identity_in_exact_workspace_domain() {
+        let allowed = ["admin@example.com".to_owned()];
+        assert!(google_allowed(
+            "admin@example.com",
+            true,
+            "subject",
+            Some("example.com"),
+            "example.com",
+            &allowed
+        ));
+        assert!(!google_allowed(
+            "admin@example.com",
+            true,
+            "subject",
+            None,
+            "example.com",
+            &allowed
+        ));
+        assert!(!google_allowed(
+            "admin@example.com",
+            true,
+            "subject",
+            Some("other.com"),
+            "example.com",
+            &allowed
+        ));
+        assert!(!google_allowed(
+            "admin@notexample.com",
+            true,
+            "subject",
+            Some("example.com"),
+            "example.com",
+            &[]
+        ));
+        assert!(!google_allowed(
+            "admin@example.com",
+            false,
+            "subject",
+            Some("example.com"),
+            "example.com",
+            &[]
+        ));
+        assert!(!google_allowed(
+            "other@example.com",
+            true,
+            "subject",
+            Some("example.com"),
+            "example.com",
+            &allowed
+        ));
+        assert!(google_allowed(
+            "admin@EXAMPLE.COM",
+            true,
+            "subject",
+            Some("EXAMPLE.COM"),
+            "example.com",
+            &[]
+        ));
+    }
+    #[test]
+    fn google_domain_must_be_a_dns_domain() {
+        assert!(valid_domain("example.com"));
+        assert!(valid_domain("sub.example.co.uk"));
+        assert!(!valid_domain("example"));
+        assert!(!valid_domain("-example.com"));
+        assert!(!valid_domain("example.com."));
+        assert!(!valid_domain("example.com@evil.test"));
     }
     #[tokio::test]
     async fn sessions_require_origin_and_csrf_for_writes() {
@@ -765,5 +987,67 @@ mod tests {
         assert_eq!(result.status(), StatusCode::OK);
         server.await.unwrap();
         std::fs::remove_file(socket).unwrap();
+    }
+
+    #[tokio::test]
+    async fn tls_listener_serves_https_with_hsts() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let directory = std::env::temp_dir().join(format!("charlotte-admin-tls-{}", random()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let generated = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert_path = directory.join("cert.pem");
+        let key_path = directory.join("key.pem");
+        std::fs::write(&cert_path, generated.cert.pem()).unwrap();
+        std::fs::write(&key_path, generated.signing_key.serialize_pem()).unwrap();
+        let tls = load_tls_config(&cert_path, &key_path).unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let mut app = app();
+        let state = Arc::get_mut(&mut app).unwrap();
+        state.config.tls_cert = Some(cert_path.clone());
+        state.config.tls_key = Some(key_path.clone());
+        let router = Router::new()
+            .route("/", get(index))
+            .route("/auth", get(auth_methods))
+            .layer(middleware::from_fn_with_state(app.clone(), guard))
+            .with_state(app.clone());
+        let server = tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.unwrap();
+            let stream = acceptor.accept(stream).await.unwrap();
+            serve(stream, router, peer).await;
+        });
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(generated.cert.der().clone()).unwrap();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let client_tls = rustls::ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_tls));
+        let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let server_name = rustls::pki_types::ServerName::try_from("localhost")
+            .unwrap()
+            .to_owned();
+        let mut stream = connector.connect(server_name, stream).await.unwrap();
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(
+            response
+                .to_ascii_lowercase()
+                .contains("strict-transport-security: max-age=31536000")
+        );
+        server.await.unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }
