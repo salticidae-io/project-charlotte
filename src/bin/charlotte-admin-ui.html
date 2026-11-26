@@ -111,7 +111,6 @@
         <input id="password" type="password" placeholder="Password" aria-label="Password" autocomplete="current-password" hidden>
         <button id="password-login" class="primary" type="button" onclick="login()" hidden>Sign in</button>
       </div>
-      <a id="google" href="oauth/start" hidden>Sign in with Google</a>
     </section>
 
     <main id="admin" hidden>
@@ -223,7 +222,6 @@
     let optionsModel = null;
     const $ = id => document.getElementById(id);
     const root = location.pathname.replace(/\/$/, '') + '/';
-    $('google').href = root + 'oauth/start';
     let originalConfig = {};
 
     const FORM_SECTIONS = [
@@ -779,7 +777,6 @@
         const methods = JSON.parse(await request('auth'));
         $('password').hidden = !methods.password;
         $('password-login').hidden = !methods.password;
-        $('google').hidden = !methods.google;
       } catch (error) {
         show(error.message, 'error');
       }

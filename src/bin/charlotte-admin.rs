@@ -3,12 +3,11 @@
 //! at a trusted reverse proxy. The proxy must strip external forwarding headers.
 //! IP checks always use the TCP peer, never forwarding headers, so a proxy
 //! cannot convey client IPs here.
-//! Sessions and OAuth attempts are in memory and disappear on restart.
+//! Sessions are in memory and disappear on restart.
 //! Example: `CHARLOTTE_ADMIN_PASSWORD=... charlotte-admin --base-url
-//! http://localhost:8080 --socket /run/charlotte/control.sock`. For Google,
-//! register `<base-url>/oauth/callback` and configure the client ID, secret,
-//! and `--google-domain`. Protect the listener and control socket from
-//! untrusted local users. Per-peer request and login rate limits are configurable;
+//! http://localhost:8080 --socket /run/charlotte/control.sock`. Protect the
+//! listener and control socket from untrusted local users. Per-peer request
+//! and login rate limits are configurable;
 //! lockouts and counters are in memory and are not an audit log.
 //! Traffic graphs are built by sampling the control socket's `/status` counters
 //! every `--sample-interval` seconds; the last `--history` samples are kept in
@@ -28,7 +27,7 @@ use axum::{
     extract::{ConnectInfo, DefaultBodyLimit, Path, Request, State},
     http::{HeaderMap, Method, StatusCode, header},
     middleware::{self, Next},
-    response::{Html, IntoResponse, Redirect, Response},
+    response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -59,16 +58,6 @@ struct Config {
     /// Static password (prefer environment variable over command line).
     #[arg(long, env = "CHARLOTTE_ADMIN_PASSWORD", hide_env_values = true)]
     password: Option<String>,
-    #[arg(long, env = "CHARLOTTE_GOOGLE_CLIENT_ID")]
-    google_client_id: Option<String>,
-    #[arg(long, env = "CHARLOTTE_GOOGLE_CLIENT_SECRET", hide_env_values = true)]
-    google_client_secret: Option<String>,
-    /// Google Workspace domain allowed to sign in (required with Google OAuth).
-    #[arg(long, env = "CHARLOTTE_GOOGLE_DOMAIN")]
-    google_domain: Option<String>,
-    /// Optional additional Google email allowlist; repeat for multiple users.
-    #[arg(long)]
-    google_email: Vec<String>,
     /// PEM certificate chain for HTTPS. Must be used with --tls-key.
     #[arg(long)]
     tls_cert: Option<PathBuf>,
@@ -100,10 +89,6 @@ struct Config {
 
 struct Session {
     csrf: String,
-    expires: Instant,
-}
-struct Attempt {
-    browser: String,
     expires: Instant,
 }
 struct ClientLimits {
@@ -279,9 +264,7 @@ struct App {
     base: Url,
     prefix: String,
     control: reqwest::Client,
-    google: reqwest::Client,
     sessions: Mutex<HashMap<String, Session>>,
-    attempts: Mutex<HashMap<String, Attempt>>,
     limiter: Limiter,
     history: Mutex<VecDeque<serde_json::Value>>,
 }
@@ -322,9 +305,6 @@ fn cookie_value(app: &App, name: &str, value: &str, age: u64) -> String {
             ""
         }
     )
-}
-fn path(app: &App, suffix: &str) -> String {
-    format!("{}{}", app.prefix, suffix)
 }
 fn origin(app: &App) -> String {
     app.base.origin().ascii_serialization()
@@ -412,11 +392,8 @@ fn too_many_requests(wait: Duration) -> Response {
 async fn index() -> Html<&'static str> {
     Html(UI)
 }
-async fn auth_methods(State(app): State<Shared>) -> Json<serde_json::Value> {
-    Json(serde_json::json!({
-        "password": app.config.password.is_some(),
-        "google": app.config.google_client_id.is_some(),
-    }))
+async fn auth_methods() -> Json<serde_json::Value> {
+    Json(serde_json::json!({"password": true}))
 }
 #[derive(Deserialize)]
 struct Login {
@@ -483,182 +460,6 @@ async fn logout(State(app): State<Shared>, headers: HeaderMap) -> Response {
     response.headers_mut().insert(
         header::SET_COOKIE,
         cookie_value(&app, "charlotte_session", "", 0)
-            .parse()
-            .unwrap(),
-    );
-    response
-}
-
-async fn oauth_start(
-    State(app): State<Shared>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-) -> Response {
-    let Some(client) = &app.config.google_client_id else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    if let Some(wait) = app.limiter.login_attempt(peer.ip(), Instant::now()) {
-        return too_many_requests(wait);
-    }
-    let state = random();
-    let browser = random();
-    let mut attempts = app.attempts.lock().unwrap();
-    attempts.retain(|_, a| a.expires > Instant::now());
-    if attempts.len() >= 1024 {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    }
-    attempts.insert(
-        state.clone(),
-        Attempt {
-            browser: browser.clone(),
-            expires: Instant::now() + Duration::from_secs(300),
-        },
-    );
-    let mut url = Url::parse("https://accounts.google.com/o/oauth2/v2/auth").unwrap();
-    url.query_pairs_mut()
-        .append_pair("client_id", client)
-        .append_pair(
-            "redirect_uri",
-            &format!("{}{}", origin(&app), path(&app, "/oauth/callback")),
-        )
-        .append_pair("response_type", "code")
-        .append_pair("scope", "openid email")
-        .append_pair(
-            "hd",
-            app.config.google_domain.as_deref().unwrap_or_default(),
-        )
-        .append_pair("state", &state);
-    let mut response = Redirect::to(url.as_str()).into_response();
-    response.headers_mut().insert(
-        header::SET_COOKIE,
-        cookie_value(&app, "charlotte_oauth", &browser, 300)
-            .parse()
-            .unwrap(),
-    );
-    response
-}
-#[derive(Deserialize)]
-struct Callback {
-    state: String,
-    code: String,
-}
-#[derive(Deserialize)]
-struct Token {
-    access_token: String,
-}
-#[derive(Deserialize)]
-struct Identity {
-    email: String,
-    email_verified: bool,
-    sub: String,
-    hd: Option<String>,
-}
-
-fn google_allowed(
-    email: &str,
-    verified: bool,
-    subject: &str,
-    hosted_domain: Option<&str>,
-    domain: &str,
-    allowlist: &[String],
-) -> bool {
-    verified
-        && !subject.is_empty()
-        && hosted_domain.is_some_and(|hosted| hosted.eq_ignore_ascii_case(domain))
-        && email
-            .to_ascii_lowercase()
-            .ends_with(&format!("@{}", domain.to_ascii_lowercase()))
-        && (allowlist.is_empty()
-            || allowlist
-                .iter()
-                .any(|entry| entry.eq_ignore_ascii_case(email)))
-}
-async fn oauth_callback(
-    State(app): State<Shared>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    axum::extract::Query(query): axum::extract::Query<Callback>,
-) -> Response {
-    if let Some(wait) = app.limiter.login_attempt(peer.ip(), Instant::now()) {
-        return too_many_requests(wait);
-    }
-    let attempt = app.attempts.lock().unwrap().remove(&query.state);
-    if !attempt.is_some_and(|a| {
-        a.expires > Instant::now()
-            && cookie(&headers, "charlotte_oauth").is_some_and(|v| equal(&v, &a.browser))
-    }) {
-        return StatusCode::FORBIDDEN.into_response();
-    }
-    let (Some(client), Some(secret)) = (
-        &app.config.google_client_id,
-        &app.config.google_client_secret,
-    ) else {
-        return StatusCode::FORBIDDEN.into_response();
-    };
-    let redirect = format!("{}{}", origin(&app), path(&app, "/oauth/callback"));
-    let token = app
-        .google
-        .post("https://oauth2.googleapis.com/token")
-        .form(&[
-            ("code", query.code.as_str()),
-            ("client_id", client),
-            ("client_secret", secret),
-            ("redirect_uri", &redirect),
-            ("grant_type", "authorization_code"),
-        ])
-        .send()
-        .await;
-    let Ok(token) = token else {
-        return StatusCode::BAD_GATEWAY.into_response();
-    };
-    let Ok(token) = token.error_for_status() else {
-        return StatusCode::UNAUTHORIZED.into_response();
-    };
-    let Ok(token) = token.json::<Token>().await else {
-        return StatusCode::BAD_GATEWAY.into_response();
-    };
-    let identity = app
-        .google
-        .get("https://openidconnect.googleapis.com/v1/userinfo")
-        .bearer_auth(token.access_token)
-        .send()
-        .await;
-    let Ok(identity) = identity else {
-        return StatusCode::BAD_GATEWAY.into_response();
-    };
-    let Ok(identity) = identity.error_for_status() else {
-        return StatusCode::UNAUTHORIZED.into_response();
-    };
-    let Ok(identity) = identity.json::<Identity>().await else {
-        return StatusCode::BAD_GATEWAY.into_response();
-    };
-    let Some(domain) = app.config.google_domain.as_deref() else {
-        return StatusCode::FORBIDDEN.into_response();
-    };
-    if !google_allowed(
-        &identity.email,
-        identity.email_verified,
-        &identity.sub,
-        identity.hd.as_deref(),
-        domain,
-        &app.config.google_email,
-    ) {
-        app.limiter.failure(peer.ip(), Instant::now());
-        return StatusCode::FORBIDDEN.into_response();
-    }
-    app.limiter.success(peer.ip());
-    let session = issue_session(&app);
-    if session.status() != StatusCode::NO_CONTENT {
-        return session;
-    }
-    let mut response = Redirect::to(&path(&app, "/")).into_response();
-    if let Some(cookie) = session.headers().get(header::SET_COOKIE) {
-        response
-            .headers_mut()
-            .append(header::SET_COOKIE, cookie.clone());
-    }
-    response.headers_mut().append(
-        header::SET_COOKIE,
-        cookie_value(&app, "charlotte_oauth", "", 0)
             .parse()
             .unwrap(),
     );
@@ -758,21 +559,6 @@ async fn history(State(app): State<Shared>, headers: HeaderMap) -> Response {
         .into_response()
 }
 
-fn valid_domain(domain: &str) -> bool {
-    !domain.is_empty()
-        && domain.len() <= 253
-        && domain.split('.').count() >= 2
-        && domain.split('.').all(|label| {
-            !label.is_empty()
-                && label.len() <= 63
-                && label.as_bytes()[0].is_ascii_alphanumeric()
-                && label.as_bytes()[label.len() - 1].is_ascii_alphanumeric()
-                && label
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-        })
-}
-
 fn validate(config: &Config) -> Result<(Url, String), String> {
     let base = Url::parse(&config.base_url).map_err(|e| e.to_string())?;
     if base.username() != ""
@@ -814,26 +600,8 @@ fn validate(config: &Config) -> Result<(Url, String), String> {
     if config.tls_cert.is_some() && base.scheme() != "https" {
         return Err("base URL must use HTTPS when TLS is enabled".into());
     }
-    if config
-        .google_domain
-        .as_deref()
-        .is_some_and(|domain| !valid_domain(domain))
-    {
-        return Err("Google domain must be a valid DNS domain name".into());
-    }
-    let google = config.google_client_id.is_some()
-        && config.google_client_secret.is_some()
-        && config.google_domain.is_some();
-    if (config.google_client_id.is_some()
-        || config.google_client_secret.is_some()
-        || config.google_domain.is_some()
-        || !config.google_email.is_empty())
-        && !google
-    {
-        return Err("Google login requires client ID, secret and --google-domain".into());
-    }
-    if config.password.is_none() && !google {
-        return Err("configure at least one authentication method".into());
+    if config.password.is_none() {
+        return Err("configure --password or CHARLOTTE_ADMIN_PASSWORD".into());
     }
     Ok((base, prefix))
 }
@@ -881,10 +649,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .timeout(Duration::from_secs(10))
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
-    let google = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()?;
     let bind = config.bind;
     let limiter = Limiter::new(&config);
     let app = Arc::new(App {
@@ -892,9 +656,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         base,
         prefix: prefix.clone(),
         control,
-        google,
         sessions: Mutex::new(HashMap::new()),
-        attempts: Mutex::new(HashMap::new()),
         limiter,
         history: Mutex::new(VecDeque::new()),
     });
@@ -906,8 +668,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/logout", post(logout))
         .route("/csrf", get(csrf))
         .route("/history", get(history))
-        .route("/oauth/start", get(oauth_start))
-        .route("/oauth/callback", get(oauth_callback))
         .route("/api/{*route}", axum::routing::any(proxy));
     let router = if prefix.is_empty() {
         routes
@@ -953,10 +713,6 @@ mod tests {
             base_url: "http://localhost:8080/admin".into(),
             socket: "/tmp/control.sock".into(),
             password: Some("secret".into()),
-            google_client_id: None,
-            google_client_secret: None,
-            google_domain: None,
-            google_email: vec![],
             tls_cert: None,
             tls_key: None,
             allow_ip: vec![],
@@ -989,9 +745,7 @@ mod tests {
             base,
             prefix,
             control: reqwest::Client::new(),
-            google: reqwest::Client::new(),
             sessions: Mutex::new(HashMap::new()),
-            attempts: Mutex::new(HashMap::new()),
             limiter,
             history: Mutex::new(VecDeque::new()),
         })
@@ -1212,16 +966,7 @@ mod tests {
         c.lockout_seconds = 900;
         c.password = None;
         assert!(validate(&c).is_err());
-        c.google_client_id = Some("id".into());
-        assert!(validate(&c).is_err());
-        c.google_client_secret = Some("secret".into());
-        c.google_domain = Some("example.com".into());
-        assert!(validate(&c).is_ok());
         c.password = Some("secret".into());
-        c.google_client_id = None;
-        c.google_client_secret = None;
-        c.google_domain = None;
-        c.google_email.clear();
         c.base_url = "http://example.com".into();
         assert!(validate(&c).is_err());
         c.base_url = "https://example.com/admin".into();
@@ -1234,80 +979,6 @@ mod tests {
         assert!(validate(&c).is_err());
         c.tls_cert = None;
         c.tls_key = None;
-        c.google_client_id = Some("id".into());
-        c.google_client_secret = Some("secret".into());
-        assert!(validate(&c).is_err());
-        c.google_domain = Some("example.com".into());
-        assert!(validate(&c).is_ok());
-    }
-    #[test]
-    fn google_login_requires_verified_identity_in_exact_workspace_domain() {
-        let allowed = ["admin@example.com".to_owned()];
-        assert!(google_allowed(
-            "admin@example.com",
-            true,
-            "subject",
-            Some("example.com"),
-            "example.com",
-            &allowed
-        ));
-        assert!(!google_allowed(
-            "admin@example.com",
-            true,
-            "subject",
-            None,
-            "example.com",
-            &allowed
-        ));
-        assert!(!google_allowed(
-            "admin@example.com",
-            true,
-            "subject",
-            Some("other.com"),
-            "example.com",
-            &allowed
-        ));
-        assert!(!google_allowed(
-            "admin@notexample.com",
-            true,
-            "subject",
-            Some("example.com"),
-            "example.com",
-            &[]
-        ));
-        assert!(!google_allowed(
-            "admin@example.com",
-            false,
-            "subject",
-            Some("example.com"),
-            "example.com",
-            &[]
-        ));
-        assert!(!google_allowed(
-            "other@example.com",
-            true,
-            "subject",
-            Some("example.com"),
-            "example.com",
-            &allowed
-        ));
-        assert!(google_allowed(
-            "admin@EXAMPLE.COM",
-            true,
-            "subject",
-            Some("EXAMPLE.COM"),
-            "example.com",
-            &[]
-        ));
-    }
-    #[test]
-    fn google_domain_must_be_a_dns_domain() {
-        assert!(valid_domain("example.com"));
-        assert!(valid_domain("sub.example.co.uk"));
-        assert!(!valid_domain("example"));
-        assert!(!valid_domain("-example.com"));
-        assert!(!valid_domain("example.com."));
-        assert!(!valid_domain("example.com@evil.test"));
     }
     #[tokio::test]
     async fn sessions_require_origin_and_csrf_for_writes() {
@@ -1338,29 +1009,6 @@ mod tests {
             StatusCode::NO_CONTENT
         );
         assert!(!authorized(&app, &headers, false));
-    }
-    #[tokio::test]
-    async fn oauth_state_is_browser_bound_and_one_use() {
-        let app = app();
-        app.attempts.lock().unwrap().insert(
-            "state".into(),
-            Attempt {
-                browser: "browser".into(),
-                expires: Instant::now() + Duration::from_secs(30),
-            },
-        );
-        let result = oauth_callback(
-            State(app.clone()),
-            ConnectInfo("192.0.2.30:12345".parse().unwrap()),
-            HeaderMap::new(),
-            axum::extract::Query(Callback {
-                state: "state".into(),
-                code: "code".into(),
-            }),
-        )
-        .await;
-        assert_eq!(result.status(), StatusCode::FORBIDDEN);
-        assert!(app.attempts.lock().unwrap().is_empty());
     }
     #[tokio::test]
     async fn bridge_forwards_authenticated_request_to_unix_socket() {

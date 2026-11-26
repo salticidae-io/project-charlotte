@@ -507,14 +507,8 @@ CHARLOTTE_ADMIN_PASSWORD='long random secret' charlotte-admin \
   HTTP; terminate TLS at a reverse proxy. To serve HTTPS directly, supply both
   `--tls-cert CERT.pem` and `--tls-key KEY.pem`; in that mode `--base-url` must
   use `https://`. The certificate file may contain the full PEM chain.
-- Authentication: a static password (`--password` or, preferably,
-  `CHARLOTTE_ADMIN_PASSWORD`), Google OAuth (`--google-client-id`,
-  `--google-client-secret` or the `CHARLOTTE_GOOGLE_CLIENT_*` variables, and a
-  `--google-domain` Workspace domain; register `<base-url>/oauth/callback` as
-  the redirect URI. Google sign-in requires a verified email and matching
-  hosted domain and email domain. Repeat `--google-email` to optionally narrow
-  access to specific accounts within that domain. Startup fails if neither
-  password nor a complete Google configuration is available.
+- Authentication uses a static password (`--password` or, preferably,
+  `CHARLOTTE_ADMIN_PASSWORD`); startup fails if neither is configured.
 - The vhost editor uses typed controls for the vhost options, including
   repeatable lists and FastCGI app settings. Use **Advanced (JSON)** for fields
   not represented by the form; unknown fields are preserved when editing.
@@ -524,12 +518,12 @@ CHARLOTTE_ADMIN_PASSWORD='long random secret' charlotte-admin \
   restrictions must also be enforced at the proxy.
 - `charlotte-admin --rate-limit` limits all admin HTTP requests to 600 per
   minute per peer IP by default; `0` disables it. `--login-rate-limit`
-  separately limits requests to the password and Google sign-in endpoints to
+  separately limits password sign-in attempts to
   10 per minute per peer IP;
   `0` disables that limit. The dashboard's background polling is below the
   default general limit.
-- `--max-login-failures` locks a peer IP after 5 failed passwords or rejected
-  Google identities; `0` disables lockouts. `--lockout-seconds` controls both
+- `--max-login-failures` locks a peer IP after 5 failed passwords; `0` disables
+  lockouts. `--lockout-seconds` controls both
   the lockout duration and the time window for counting failures (default
   900 seconds, minimum 1). A correct password is refused during lockout, while
   existing sessions remain active.
