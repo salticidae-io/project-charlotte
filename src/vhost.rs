@@ -265,6 +265,8 @@ struct ClientLimit {
 }
 
 impl ClientLimit {
+    // Only hosted and proxied vhosts are constructed with a client limit.
+    #[cfg_attr(not(any(feature = "hosting", feature = "proxy")), allow(dead_code))]
     fn new(limit: usize) -> Self {
         Self {
             limit,
@@ -1059,6 +1061,9 @@ impl Router {
         global_access_log: Option<Arc<crate::logging::AccessLog>>,
         global_error_log: Arc<crate::logging::ErrorLog>,
     ) -> Result<Self, Box<dyn Error + Send + Sync>> {
+        // Only hosted vhosts resolve worker identities.
+        #[cfg(not(feature = "hosting"))]
+        let _ = identity_cache;
         validate_vhost_declarations(&file.vhost)?;
         validate_vhost_waf_declarations(&file.vhost, waf.is_some())?;
         let main_entries = file.vhost.clone();

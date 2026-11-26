@@ -1,12 +1,11 @@
 //! Drops master privileges and narrows process capabilities.
 
-#[cfg(any(feature = "acme", feature = "hosting"))]
-use std::io;
 #[cfg(feature = "acme")]
 use std::path::Path;
 use std::{
     error::Error,
     ffi::{CStr, CString},
+    io,
 };
 #[cfg(feature = "hosting")]
 use std::{os::unix::process::CommandExt, process::Command};
@@ -15,7 +14,7 @@ use std::{os::unix::process::CommandExt, process::Command};
 use caps::{CapSet, Capability, CapsHashSet};
 #[cfg(target_os = "linux")]
 use nix::sys::prctl::set_keepcaps;
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "hosting", target_os = "linux"))]
 use nix::unistd::setgroups;
 use nix::unistd::{Group, User, geteuid, setgid, setuid};
 
@@ -183,12 +182,12 @@ pub(crate) fn initialize_groups(user_name: &CStr, gid: nix::unistd::Gid) -> io::
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "hosting", target_os = "linux"))]
 pub(crate) fn set_groups(groups: &[nix::unistd::Gid]) -> io::Result<()> {
     nix::unistd::setgroups(groups).map_err(io::Error::from)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(feature = "hosting", target_os = "macos"))]
 #[allow(unsafe_code)]
 pub(crate) fn set_groups(groups: &[nix::unistd::Gid]) -> io::Result<()> {
     let groups = groups
