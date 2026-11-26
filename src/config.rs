@@ -1692,7 +1692,7 @@ pub(crate) fn validate_env_key(key: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub const DEFAULT_WORKER_THREADS: usize = 2;
+pub const DEFAULT_WORKER_THREADS: usize = 1;
 pub const MAX_THREADS: usize = 1024;
 pub const MAX_FASTCGI_APP_WORKERS: usize = 256;
 pub const DEFAULT_FASTCGI_APP_MIN_WORKERS: usize = 1;
@@ -2599,7 +2599,7 @@ mod tests {
             panic!("expected config")
         };
         assert_eq!(defaults.threads, None);
-        assert_eq!(defaults.worker_threads, 2);
+        assert_eq!(defaults.worker_threads, 1);
         assert_eq!(defaults.worker_idle_timeout, Duration::from_secs(300));
 
         let parsed = Config::parse([

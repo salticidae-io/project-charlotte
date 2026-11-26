@@ -914,6 +914,11 @@ active requests by default; set `--worker-idle-timeout SECS` to change the
 default, or use `worker_idle_timeout: SECS` on a vhost. Set either value to `0`
 to keep workers alive indefinitely. If the master cannot inspect a root because
 of filesystem permissions, it defers that access check to the worker user.
+Workers use one runtime thread by default; set `--worker-threads N` or
+`worker_threads: N` to change the count. When the sibling `charlotte-worker`
+executable is installed, hosted sites use it instead of the full server binary;
+the master executable remains a fallback when it is absent. Release builds of
+the worker omit the unused ModSecurity runtime dependency.
 
 Hosted workers can optionally be placed in a cgroup v2 group under
 `/sys/fs/cgroup`. Set `--worker-cgroup PATH` and any of

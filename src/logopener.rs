@@ -829,7 +829,13 @@ fn validate_spawn_worker(request: &SpawnWorkerRequest) -> io::Result<()> {
 fn allowed_worker_environment(name: &[u8]) -> bool {
     matches!(
         name,
-        b"PATH" | b"TMPDIR" | b"LD_LIBRARY_PATH" | b"LANG" | b"TZ" | b"CHARLOTTE_FASTCGI_APP_ENV"
+        b"PATH"
+            | b"TMPDIR"
+            | b"LD_LIBRARY_PATH"
+            | b"LANG"
+            | b"TZ"
+            | b"MALLOC_ARENA_MAX"
+            | b"CHARLOTTE_FASTCGI_APP_ENV"
     )
 }
 
@@ -851,7 +857,7 @@ fn spawn_worker_process(
     child_socket: OwnedFd,
     directories: &AllowedDirectories,
 ) -> io::Result<Child> {
-    let mut command = Command::new(std::env::current_exe()?);
+    let mut command = Command::new(crate::worker_executable()?);
     command
         .args(&request.args)
         .env_clear()
@@ -1796,6 +1802,7 @@ mod tests {
             })
         };
         assert!(request(1000, worker_args(1000, 1001), "TZ", None).is_ok());
+        assert!(request(1000, worker_args(1000, 1001), "MALLOC_ARENA_MAX", None).is_ok());
         // Root, another account's arguments, and a non-worker command line.
         assert!(request(0, worker_args(0, 1001), "TZ", None).is_err());
         assert!(request(1000, worker_args(1002, 1001), "TZ", None).is_err());

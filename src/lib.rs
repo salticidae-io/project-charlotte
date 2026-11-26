@@ -106,6 +106,9 @@ mod fuzz_support;
 
 use std::{error::Error, net::SocketAddr, sync::Arc, time::Duration};
 
+#[cfg(feature = "hosting")]
+use std::{io, path::PathBuf};
+
 use http::StatusCode;
 use hyper::{Request, service::service_fn};
 use hyper_util::{
@@ -260,8 +263,6 @@ pub fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         return Err(diagnostics.join("\n").into());
     }
     #[cfg(feature = "hosting")]
-    let mut config = config;
-    #[cfg(feature = "hosting")]
     {
         fastcgi::set_keepalive_limit(config.fastcgi_keepalive);
         handler::set_static_cache_ttl(config.static_cache_ttl);
@@ -326,20 +327,7 @@ pub fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     let startup_result = (move || -> Result<(), Box<dyn Error + Send + Sync>> {
         #[cfg(feature = "hosting")]
         if config.worker {
-            crate::log_debug!("Starting in virtual-host worker mode");
-            if let Ok(app_env) = std::env::var(config::WORKER_APP_ENV) {
-                config.apply_fastcgi_app_env(&app_env)?;
-            }
-            worker::drop_privileges(&config)?;
-            crate::log_debug!(
-                "Starting worker runtime with {} thread(s)",
-                config.worker_threads
-            );
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(config.worker_threads)
-                .enable_all()
-                .build()?;
-            return runtime.block_on(worker::run(config));
+            return run_worker_mode(config);
         }
         crate::log_debug!("Starting master process");
         logopener::start(&config)?;
@@ -371,6 +359,67 @@ pub fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     }
     logging::flush_logs();
     startup_result
+}
+
+/// Runs a virtual-host worker using the process command-line arguments.
+#[cfg(feature = "hosting")]
+pub fn run_worker() -> Result<(), Box<dyn Error + Send + Sync>> {
+    let cli_args = std::env::args().skip(1).collect::<Vec<_>>();
+    let config = match Config::parse(cli_args)? {
+        ParseResult::Help => {
+            println!("{}", Config::usage());
+            return Ok(());
+        }
+        ParseResult::Config(config) => *config,
+    };
+    if !config.worker {
+        return Err("the --worker option is required".into());
+    }
+
+    fastcgi::set_keepalive_limit(config.fastcgi_keepalive);
+    handler::set_static_cache_ttl(config.static_cache_ttl);
+    logging::set_global_error_log(Arc::new(logging::ErrorLog::new(
+        logging::LogTarget::stderr(),
+        logging::ErrorFormat::parse(&config.error_log_format)?,
+    )));
+    logging::set_debug(config.debug);
+    let result = run_worker_mode(config);
+    logging::flush_logs();
+    result
+}
+
+#[cfg(feature = "hosting")]
+fn run_worker_mode(mut config: Config) -> Result<(), Box<dyn Error + Send + Sync>> {
+    crate::log_debug!("Starting in virtual-host worker mode");
+    if let Ok(app_env) = std::env::var(config::WORKER_APP_ENV) {
+        config.apply_fastcgi_app_env(&app_env)?;
+    }
+    worker::drop_privileges(&config)?;
+    crate::log_debug!(
+        "Starting worker runtime with {} thread(s)",
+        config.worker_threads
+    );
+    let mut builder = if config.worker_threads == 1 {
+        tokio::runtime::Builder::new_current_thread()
+    } else {
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        builder.worker_threads(config.worker_threads);
+        builder
+    };
+    let runtime = builder.enable_all().build()?;
+    runtime.block_on(worker::run(config))
+}
+
+#[cfg(feature = "hosting")]
+pub(crate) fn worker_executable() -> io::Result<PathBuf> {
+    let current_executable = std::env::current_exe()?;
+    let worker_executable = current_executable
+        .with_file_name(format!("charlotte-worker{}", std::env::consts::EXE_SUFFIX));
+    if worker_executable.is_file() {
+        Ok(worker_executable)
+    } else {
+        Ok(current_executable)
+    }
 }
 
 async fn run_master(

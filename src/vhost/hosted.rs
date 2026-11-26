@@ -238,6 +238,9 @@ impl Worker {
             .iter()
             .filter_map(|name| std::env::var_os(name).map(|value| (OsString::from(name), value)))
             .collect::<Vec<_>>();
+        if std::env::var_os("MALLOC_ARENA_MAX").is_none() {
+            environment.push((OsString::from("MALLOC_ARENA_MAX"), OsString::from("1")));
+        }
         if let Some(app_env) = worker_app_env(&self.fastcgi) {
             environment.push((
                 OsString::from(crate::config::WORKER_APP_ENV),
@@ -256,7 +259,7 @@ impl Worker {
                 OwnedFd::from(child_socket),
             )?)
         } else {
-            let mut command = Command::new(std::env::current_exe()?);
+            let mut command = Command::new(crate::worker_executable()?);
             command
                 .args(&args)
                 .env_clear()
@@ -661,7 +664,14 @@ fn spawned_app(backend: &FastCgiBackend) -> Option<&FastCgiApp> {
 
 /// Variables a worker keeps from the server's environment. Everything else,
 /// including whatever credentials the server was started with, is withheld.
-const WORKER_INHERITED_ENV: [&str; 5] = ["PATH", "TMPDIR", "LD_LIBRARY_PATH", "LANG", "TZ"];
+const WORKER_INHERITED_ENV: [&str; 6] = [
+    "PATH",
+    "TMPDIR",
+    "LD_LIBRARY_PATH",
+    "LANG",
+    "TZ",
+    "MALLOC_ARENA_MAX",
+];
 
 fn format_backend(backend: &FastCgiBackend) -> String {
     match &backend.address {

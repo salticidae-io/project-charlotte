@@ -19,6 +19,11 @@ proxy = ["dep:hyper-rustls", "dep:tower-service", "hyper/client", "hyper-util/cl
 # Optional Redis-backed access checks compatible with logchomper.
 swarm = ["dep:redis"]
 
+[[bin]]
+name = "charlotte-worker"
+path = "src/bin/charlotte-worker.rs"
+required-features = ["hosting"]
+
 [dependencies]
 axum = "0.8"
 base64 = "0.22"
@@ -95,6 +100,7 @@ maintainer-scripts = "packaging"
 systemd-units = { unit-scripts = "packaging/systemd", unit-name = "project-charlotte", enable = true }
 assets = [
     ["target/release/project-charlotte", "usr/bin/", "755"],
+    ["target/release/charlotte-worker", "usr/bin/", "755"],
     ["target/release/charlotte-ctl", "usr/bin/", "755"],
     ["target/release/apache2charlotte", "usr/bin/", "755"],
     ["target/release/nginx2charlotte", "usr/bin/", "755"],

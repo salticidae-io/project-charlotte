@@ -28,8 +28,9 @@
 # Bot detection is enabled with `--bot-detection` or `--bot-config FILE`; a
 # vhost can override it with `bot: off` or a policy map.
 #
-# Worker-backed virtual hosts run in their own worker process, re-executing
-# this binary with `--worker` and dropping privileges to the configured user
+# Worker-backed virtual hosts run in their own worker process, normally using
+# the sibling `charlotte-worker` executable (or re-executing this binary with
+# `--worker` if it is absent) and dropping privileges to the configured user
 # and group. Proxy virtual hosts use `proxy_pass` and run in the master without
 # a document root or worker user. A request whose Host header matches no
 # virtual host is served by the master from `--root`, unless a virtual host is
