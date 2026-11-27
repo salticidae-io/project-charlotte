@@ -182,6 +182,33 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
+      - name: Upload coverage artifact
+        if: success() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report-rust
+          path: project-charlotte/target/coverage/cobertura.xml
+
+  upload-coverage-rust:
+    name: Upload coverage report (Rust)
+    needs: coverage
+    if: ${{ !cancelled() && needs.coverage.result == 'success' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      code-quality: write
+    steps:
+      - name: Download coverage artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-report-rust
+
+      - uses: actions/upload-code-coverage@v1
+        with:
+          file: cobertura.xml
+          language: Rust
+          label: code-coverage-agent
+
   features:
     name: Feature combinations
     runs-on: ubuntu-24.04
