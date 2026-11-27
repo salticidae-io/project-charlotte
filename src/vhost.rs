@@ -590,7 +590,7 @@ impl Router {
             let config_dir = path
                 .parent()
                 .filter(|parent| !parent.as_os_str().is_empty())
-                .unwrap_or(std::path::Path::new("."));
+                .unwrap_or(Path::new("."));
             if config_dir.is_absolute() {
                 config_dir.to_path_buf()
             } else {
@@ -828,7 +828,7 @@ impl Router {
                     Ok(_) => {
                         std::fs::remove_file(path)
                             .path_context("remove virtual-host config", path)?;
-                        std::fs::File::open(dir)
+                        File::open(dir)
                             .path_context("open virtual-host directory", dir)?
                             .sync_all()
                             .path_context("sync virtual-host directory", dir)?;
@@ -1277,7 +1277,7 @@ impl Router {
                     .iter()
                     .map(|value| crate::config::parse_fastcgi_backend(value))
                     .collect::<Result<Vec<_>, _>>()?;
-                let mut extensions = std::collections::HashSet::new();
+                let mut extensions = HashSet::new();
                 for backend in &fastcgi {
                     if !extensions.insert(backend.extension.clone()) {
                         return Err(format!(
