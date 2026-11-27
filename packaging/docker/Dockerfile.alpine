@@ -1,0 +1,68 @@
+# syntax=docker/dockerfile:1.7
+
+FROM alpine:3.24 AS modsec
+
+ARG MODSECURITY_VERSION=3.0.14
+ARG CRS_VERSION=4.25.0
+
+RUN apk add --no-cache \
+      autoconf automake bison build-base curl curl-dev flex git libtool libxml2-dev \
+      linux-headers lmdb-dev pcre2-dev pkgconf yajl-dev zlib-dev
+
+WORKDIR /src/modsecurity
+RUN git clone --depth 1 --branch "v${MODSECURITY_VERSION}" --recurse-submodules \
+      --shallow-submodules https://github.com/owasp-modsecurity/ModSecurity.git . \
+    && sed -i '1i#include <stdint.h>' headers/modsecurity/collection/collection.h \
+    && ./build.sh \
+    && ./configure --prefix=/usr/local --with-pcre2 --with-lmdb \
+    && make -j2 \
+    && make install \
+    && mkdir -p /out/usr/share/modsecurity-crs \
+    && curl -fsSL "https://github.com/coreruleset/coreruleset/archive/refs/tags/v${CRS_VERSION}.tar.gz" \
+      | tar -xz --strip-components=1 -C /out/usr/share/modsecurity-crs
+
+FROM rust:1-alpine3.24 AS builder
+
+RUN apk add --no-cache \
+      build-base clang cmake libcurl libstdc++ libxml2 lmdb \
+      musl-dev pcre2 pkgconf yajl zlib
+
+COPY --from=modsec /usr/local/include/ /usr/local/include/
+COPY --from=modsec /usr/local/lib/ /usr/local/lib/
+
+WORKDIR /build
+COPY . /build
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/build/target \
+    PKG_CONFIG_PATH=/usr/local/lib/pkgconfig \
+    RUSTFLAGS="-C target-feature=-crt-static" \
+    cargo build --release --locked \
+    && install -D -m 755 target/release/project-charlotte /out/usr/local/bin/project-charlotte \
+    && install -D -m 755 target/release/charlotte-worker /out/usr/local/bin/charlotte-worker \
+    && install -D -m 755 target/release/charlotte-ctl /out/usr/local/bin/charlotte-ctl \
+    && install -D -m 755 target/release/apache2charlotte /out/usr/local/bin/apache2charlotte \
+    && install -D -m 755 target/release/nginx2charlotte /out/usr/local/bin/nginx2charlotte \
+    && install -D -m 755 target/release/charlotte-configure /out/usr/local/bin/charlotte-configure \
+    && install -D -m 755 target/release/charlotte-admin /out/usr/local/bin/charlotte-admin
+
+FROM alpine:3.24 AS runtime
+
+RUN apk add --no-cache \
+      ca-certificates libcurl libstdc++ libxml2 lmdb pcre2 php84-cgi yajl zlib \
+    && adduser -S -D -H -u 82 -G www-data www-data \
+    && ln -s /usr/bin/php-cgi84 /usr/local/bin/php-cgi \
+    && install -d -o www-data -g www-data \
+      /run/charlotte /var/lib/charlotte/acme /var/www/html
+
+COPY --from=builder /out/usr/local/bin/ /usr/local/bin/
+COPY --from=builder /build/README.md /usr/share/doc/project-charlotte/README.md
+COPY --from=builder /build/examples/ /usr/share/doc/project-charlotte/examples/
+COPY --from=modsec /usr/local/lib/ /usr/local/lib/
+COPY --from=modsec /out/usr/share/modsecurity-crs/ /usr/share/modsecurity-crs/
+COPY --chmod=0644 packaging/docker/charlotte.yaml /etc/charlotte/charlotte.yaml
+
+WORKDIR /var/www/html
+EXPOSE 80 443 443/udp
+ENTRYPOINT ["/usr/local/bin/project-charlotte"]
+CMD ["--user", "www-data", "--config", "/etc/charlotte/charlotte.yaml", "--bind", "0.0.0.0:80", "--root", "/var/www/html", "--no-listing", "--control-socket", "/run/charlotte/control.sock"]

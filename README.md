@@ -108,6 +108,41 @@ the configuration is present. After creating it, start the service with
 `/etc/default/project-charlotte` to change the command-line options passed to
 the server; this file is preserved as a conffile during package upgrades.
 
+### Container images
+
+The repository includes multi-stage Dockerfiles for a full server image and a
+smaller reverse-proxy-only image. Build from the repository root so the source
+tree is available as the context:
+
+```sh
+docker build -f packaging/docker/Dockerfile -t project-charlotte:latest .
+docker build -f packaging/docker/Dockerfile.proxy -t project-charlotte:proxy .
+docker build -f packaging/docker/Dockerfile.alpine -t project-charlotte:alpine .
+```
+
+The full image includes the default Cargo features, `charlotte-worker`, and
+`php-cgi` for hosted CGI/FastCGI applications. The proxy image is built with
+`--no-default-features --features acme,http3,proxy`, so hosting options and
+worker binaries are not included. Both images contain the ModSecurity runtime,
+CRS rules, CA certificates, example documentation, and a minimal empty vhost
+configuration. The default command listens on port 80; publish it locally with:
+
+```sh
+docker run --rm -p 8080:80 project-charlotte:latest
+curl -i http://localhost:8080/
+```
+
+The empty configuration returns `404` until you add virtual hosts or, for the
+full image, files under `/var/www/html`. Mount your own configuration at
+`/etc/charlotte/charlotte.yaml` to configure the server. Ports `443/tcp` and
+`443/udp` are also exposed for TLS and HTTP/3; publish them when using those
+listeners. The container starts as root to bind low ports, then the server
+drops privileges to `www-data` as configured by default.
+
+The Alpine image uses musl and builds ModSecurity from its pinned upstream
+release because Alpine does not package libModSecurity. It also includes the
+OWASP Core Rule Set and PHP CGI for hosted applications.
+
 ### Apache configuration conversion
 
 `apache2charlotte` converts an Apache configuration file to Charlotte's

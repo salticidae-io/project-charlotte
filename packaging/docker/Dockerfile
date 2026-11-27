@@ -1,0 +1,39 @@
+# syntax=docker/dockerfile:1.7
+
+FROM rust:1-trixie AS builder
+
+WORKDIR /build
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      clang cmake libmodsecurity-dev pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY . /build
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/build/target \
+    cargo build --release --locked \
+    && install -D -m 755 target/release/project-charlotte /out/usr/local/bin/project-charlotte \
+    && install -D -m 755 target/release/charlotte-worker /out/usr/local/bin/charlotte-worker \
+    && install -D -m 755 target/release/charlotte-ctl /out/usr/local/bin/charlotte-ctl \
+    && install -D -m 755 target/release/apache2charlotte /out/usr/local/bin/apache2charlotte \
+    && install -D -m 755 target/release/nginx2charlotte /out/usr/local/bin/nginx2charlotte \
+    && install -D -m 755 target/release/charlotte-configure /out/usr/local/bin/charlotte-configure \
+    && install -D -m 755 target/release/charlotte-admin /out/usr/local/bin/charlotte-admin
+
+FROM debian:trixie-slim AS runtime
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates libmodsecurity3t64 modsecurity-crs php-cgi \
+    && rm -rf /var/lib/apt/lists/* \
+    && install -d -o www-data -g www-data \
+      /run/charlotte /var/lib/charlotte/acme /var/www/html
+
+COPY --from=builder /out/usr/local/bin/ /usr/local/bin/
+COPY --from=builder /build/README.md /usr/share/doc/project-charlotte/README.md
+COPY --from=builder /build/examples/ /usr/share/doc/project-charlotte/examples/
+COPY --chmod=0644 packaging/docker/charlotte.yaml /etc/charlotte/charlotte.yaml
+
+WORKDIR /var/www/html
+EXPOSE 80 443 443/udp
+ENTRYPOINT ["/usr/local/bin/project-charlotte"]
+CMD ["--user", "www-data", "--config", "/etc/charlotte/charlotte.yaml", "--bind", "0.0.0.0:80", "--root", "/var/www/html", "--no-listing", "--control-socket", "/run/charlotte/control.sock"]
