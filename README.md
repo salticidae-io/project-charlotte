@@ -1069,6 +1069,16 @@ SSL-terminating reverse proxy configuration with automated certificate
 provisioning, or [`examples/charlotte.yaml`](examples/charlotte.yaml) for the
 general server configuration.
 
+## Distribution packages
+
+CI runs the complete test suite on Ubuntu 24.04 and 26.04, Debian 12 and 13,
+and CentOS Stream 9. CentOS Stream 10 is not included because the required
+ModSecurity development package is not available there. After every required
+test job succeeds, CI builds `.deb` packages for both Ubuntu releases and both
+Debian releases, plus `.rpm` packages for CentOS Stream 9. Each format has a
+full server package and a reverse-proxy-only variant; tagged releases attach
+the packages to the GitHub release.
+
 ## Development
 
 Run tests with [cargo-nextest](https://nexte.st/) (install it with

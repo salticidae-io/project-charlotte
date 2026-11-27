@@ -1,6 +1,6 @@
 [package]
 name = "project-charlotte"
-version = "0.9.0"
+version = "0.99.0"
 edition = "2024"
 default-run = "project-charlotte"
 description = "General-purpose webserver and reverse proxy meant for large-scale environments"
@@ -133,3 +133,57 @@ assets = [
     ["examples/charlotte.yaml", "usr/share/doc/project-charlotte-proxy/examples/charlotte.yaml", "644"],
     ["examples/reverse-proxy-acme.yaml", "usr/share/doc/project-charlotte-proxy/examples/reverse-proxy-acme.yaml", "644"],
 ]
+
+[package.metadata.generate-rpm]
+name = "project-charlotte"
+release = "1.el9"
+license = "Apache-2.0"
+post_install_script = "packaging/rpm/post-install.sh"
+pre_uninstall_script = "packaging/rpm/pre-uninstall.sh"
+post_uninstall_script = "packaging/rpm/post-uninstall.sh"
+assets = [
+    { source = "target/release/project-charlotte", dest = "/usr/bin/project-charlotte", mode = "755" },
+    { source = "target/release/charlotte-worker", dest = "/usr/bin/charlotte-worker", mode = "755" },
+    { source = "target/release/charlotte-ctl", dest = "/usr/bin/charlotte-ctl", mode = "755" },
+    { source = "target/release/apache2charlotte", dest = "/usr/bin/apache2charlotte", mode = "755" },
+    { source = "target/release/nginx2charlotte", dest = "/usr/bin/nginx2charlotte", mode = "755" },
+    { source = "target/release/charlotte-configure", dest = "/usr/bin/charlotte-configure", mode = "755" },
+    { source = "target/release/charlotte-admin", dest = "/usr/bin/charlotte-admin", mode = "755" },
+    { source = "packaging/default/project-charlotte", dest = "/etc/default/project-charlotte", mode = "644", config = true },
+    { source = "packaging/systemd/project-charlotte.service", dest = "/usr/lib/systemd/system/project-charlotte.service", mode = "644" },
+    { source = "README.md", dest = "/usr/share/doc/project-charlotte/README.md", mode = "644", doc = true },
+    { source = "examples/charlotte.yaml", dest = "/usr/share/doc/project-charlotte/examples/charlotte.yaml", mode = "644", doc = true },
+]
+
+[package.metadata.generate-rpm.requires]
+systemd = ""
+
+[package.metadata.generate-rpm.conflicts]
+project-charlotte-proxy = ""
+
+[package.metadata.generate-rpm.variants.proxy]
+name = "project-charlotte-proxy"
+release = "1.el9"
+license = "Apache-2.0"
+post_install_script = "packaging/rpm/post-install.sh"
+pre_uninstall_script = "packaging/rpm/pre-uninstall.sh"
+post_uninstall_script = "packaging/rpm/post-uninstall.sh"
+assets = [
+    { source = "target/release/project-charlotte", dest = "/usr/bin/project-charlotte", mode = "755" },
+    { source = "target/release/charlotte-ctl", dest = "/usr/bin/charlotte-ctl", mode = "755" },
+    { source = "target/release/apache2charlotte", dest = "/usr/bin/apache2charlotte", mode = "755" },
+    { source = "target/release/nginx2charlotte", dest = "/usr/bin/nginx2charlotte", mode = "755" },
+    { source = "target/release/charlotte-configure", dest = "/usr/bin/charlotte-configure", mode = "755" },
+    { source = "target/release/charlotte-admin", dest = "/usr/bin/charlotte-admin", mode = "755" },
+    { source = "packaging/default/project-charlotte-proxy", dest = "/etc/default/project-charlotte", mode = "644", config = true },
+    { source = "packaging/systemd/project-charlotte.service", dest = "/usr/lib/systemd/system/project-charlotte.service", mode = "644" },
+    { source = "README.md", dest = "/usr/share/doc/project-charlotte-proxy/README.md", mode = "644", doc = true },
+    { source = "examples/charlotte.yaml", dest = "/usr/share/doc/project-charlotte-proxy/examples/charlotte.yaml", mode = "644", doc = true },
+    { source = "examples/reverse-proxy-acme.yaml", dest = "/usr/share/doc/project-charlotte-proxy/examples/reverse-proxy-acme.yaml", mode = "644", doc = true },
+]
+
+[package.metadata.generate-rpm.variants.proxy.requires]
+systemd = ""
+
+[package.metadata.generate-rpm.variants.proxy.conflicts]
+project-charlotte = ""
