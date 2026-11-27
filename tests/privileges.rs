@@ -103,7 +103,7 @@ fn parse_caps(pid: u32, name: &str) -> u64 {
 }
 
 #[test]
-#[ignore = "requires root; run in the privileged CI job with cargo test -- --ignored"]
+#[ignore = "requires root; run in the privileged CI job with cargo nextest run --run-ignored only"]
 fn master_drop_uses_target_groups_and_removes_identity_capabilities() {
     let (user, group) = nobody();
     let root = temp_root("master-groups");
@@ -145,7 +145,7 @@ fn master_drop_uses_target_groups_and_removes_identity_capabilities() {
 }
 
 #[tokio::test]
-#[ignore = "requires root; run in the privileged CI job with cargo test -- --ignored"]
+#[ignore = "requires root; run in the privileged CI job with cargo nextest run --run-ignored only"]
 async fn hosted_worker_uses_the_configured_users_supplementary_groups() {
     let (user, group) = nobody();
     let base = temp_root("worker-groups");
@@ -229,7 +229,7 @@ async fn hosted_worker_uses_the_configured_users_supplementary_groups() {
 }
 
 #[tokio::test]
-#[ignore = "requires root and a writable cgroup v2 hierarchy; run in the privileged CI job with cargo test -- --ignored"]
+#[ignore = "requires root and a writable cgroup v2 hierarchy; run in the privileged CI job with cargo nextest run --run-ignored only"]
 async fn hosted_worker_joins_its_configured_cgroup_before_exec() {
     let (user, group) = nobody();
     let base = temp_root("worker-cgroup");

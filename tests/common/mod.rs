@@ -2,6 +2,12 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(not(target_os = "linux"))]
+use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
+};
+
 use std::{
     fs,
     net::{SocketAddr, TcpListener, UdpSocket},
@@ -157,25 +163,18 @@ pub fn shutdown(server: &mut Child) {
 
 #[allow(dead_code)]
 pub fn descendants_with_argument(root_pid: u32, argument: &str) -> Vec<u32> {
-    let Ok(processes) = fs::read_dir("/proc") else {
-        return Vec::new();
-    };
+    let processes = process_snapshot();
+    let by_pid = processes
+        .iter()
+        .map(|process| (process.pid, process))
+        .collect::<std::collections::HashMap<_, _>>();
     processes
-        .flatten()
-        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
-        .filter(|pid| {
-            let Ok(command_line) = fs::read(format!("/proc/{pid}/cmdline")) else {
-                return false;
-            };
-            if !command_line
-                .split(|byte| *byte == 0)
-                .any(|value| value == argument.as_bytes())
-            {
-                return false;
-            }
-            let mut current = *pid;
+        .iter()
+        .filter(|process| process.args.iter().any(|arg| arg == argument))
+        .filter(|process| {
+            let mut current = process.pid;
             for _ in 0..32 {
-                let Some(parent) = process_parent(current) else {
+                let Some(parent) = by_pid.get(&current).map(|process| process.ppid) else {
                     return false;
                 };
                 if parent == root_pid {
@@ -188,12 +187,175 @@ pub fn descendants_with_argument(root_pid: u32, argument: &str) -> Vec<u32> {
             }
             false
         })
+        .map(|process| process.pid)
         .collect()
 }
 
-fn process_parent(pid: u32) -> Option<u32> {
-    let status = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
-    status
+#[allow(dead_code)]
+pub fn process_parent(pid: u32) -> Option<u32> {
+    process_snapshot_for(pid).map(|process| process.ppid)
+}
+
+#[derive(Debug)]
+struct ProcessSnapshot {
+    pid: u32,
+    ppid: u32,
+    state: char,
+    start: u64,
+    args: Vec<String>,
+}
+
+#[allow(dead_code)]
+pub fn process_children(pid: u32) -> Vec<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        let task_path = format!("/proc/{pid}/task");
+        let Ok(tasks) = fs::read_dir(task_path) else {
+            return Vec::new();
+        };
+        return tasks
+            .flatten()
+            .filter_map(|task| fs::read_to_string(task.path().join("children")).ok())
+            .flat_map(|children| {
+                children
+                    .split_whitespace()
+                    .filter_map(|child| child.parse::<u32>().ok())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    process_snapshot()
+        .into_iter()
+        .filter(|process| process.ppid == pid)
+        .map(|process| process.pid)
+        .collect()
+}
+
+#[allow(dead_code)]
+pub fn process_args(pid: u32) -> Vec<String> {
+    #[cfg(target_os = "linux")]
+    {
+        return fs::read(format!("/proc/{pid}/cmdline"))
+            .unwrap_or_default()
+            .split(|byte| *byte == 0)
+            .filter(|arg| !arg.is_empty())
+            .map(|arg| String::from_utf8_lossy(arg).into_owned())
+            .collect();
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    process_snapshot_for(pid)
+        .map(|process| process.args)
+        .unwrap_or_default()
+}
+
+#[allow(dead_code)]
+pub fn process_state_and_start(pid: u32) -> Option<(char, u64)> {
+    process_snapshot_for(pid).map(|process| (process.state, process.start))
+}
+
+#[cfg(target_os = "linux")]
+fn process_snapshot() -> Vec<ProcessSnapshot> {
+    let Ok(processes) = fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    processes
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+        .filter_map(process_snapshot_for)
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn process_snapshot_for(pid: u32) -> Option<ProcessSnapshot> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let mut fields = stat.rsplit_once(") ")?.1.split_whitespace();
+    let state = fields.next()?.chars().next()?;
+    let ppid = fields.next()?.parse().ok()?;
+    let start = fields.nth(17)?.parse().ok()?;
+    let args = fs::read(format!("/proc/{pid}/cmdline"))
+        .unwrap_or_default()
+        .split(|byte| *byte == 0)
+        .filter(|arg| !arg.is_empty())
+        .map(|arg| String::from_utf8_lossy(arg).into_owned())
+        .collect();
+    Some(ProcessSnapshot {
+        pid,
+        ppid,
+        state,
+        start,
+        args,
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_snapshot_for(pid: u32) -> Option<ProcessSnapshot> {
+    let output = std::process::Command::new("ps")
+        .args([
+            "-ww",
+            "-p",
+            &pid.to_string(),
+            "-o",
+            "pid=",
+            "-o",
+            "ppid=",
+            "-o",
+            "stat=",
+            "-o",
+            "lstart=",
+            "-o",
+            "command=",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
         .lines()
-        .find_map(|line| line.strip_prefix("PPid:")?.trim().parse().ok())
+        .find_map(parse_process_line)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_snapshot() -> Vec<ProcessSnapshot> {
+    let Ok(output) = std::process::Command::new("ps")
+        .args([
+            "-ww", "-A", "-o", "pid=", "-o", "ppid=", "-o", "stat=", "-o", "lstart=", "-o",
+            "command=",
+        ])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(parse_process_line)
+        .collect()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn parse_process_line(line: &str) -> Option<ProcessSnapshot> {
+    let mut fields = line.split_whitespace();
+    let pid = fields.next()?.parse().ok()?;
+    let ppid = fields.next()?.parse().ok()?;
+    let state = fields.next()?.chars().next()?;
+    let start = fields.by_ref().take(5).collect::<Vec<_>>().join(" ");
+    if start.is_empty() {
+        return None;
+    }
+    let command = fields.collect::<Vec<_>>().join(" ");
+    let mut hasher = DefaultHasher::new();
+    start.hash(&mut hasher);
+    Some(ProcessSnapshot {
+        pid,
+        ppid,
+        state,
+        start: hasher.finish(),
+        args: command.split_whitespace().map(str::to_owned).collect(),
+    })
 }

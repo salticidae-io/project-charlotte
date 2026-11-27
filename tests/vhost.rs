@@ -461,25 +461,12 @@ fn decode_length(input: &mut &[u8]) -> usize {
 }
 
 fn worker_process_ids(server_pid: u32) -> Vec<u32> {
-    let task_path = format!("/proc/{server_pid}/task");
-    let Ok(tasks) = std::fs::read_dir(task_path) else {
-        return Vec::new();
-    };
-    tasks
-        .flatten()
-        .filter_map(|task| std::fs::read_to_string(task.path().join("children")).ok())
-        .flat_map(|children| {
-            children
-                .split_whitespace()
-                .filter_map(|pid| pid.parse::<u32>().ok())
-                .collect::<Vec<_>>()
-        })
+    common::process_children(server_pid)
+        .into_iter()
         .filter(|pid| {
-            std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|command_line| {
-                command_line
-                    .split(|byte| *byte == 0)
-                    .any(|argument| argument == b"--worker")
-            })
+            common::process_args(*pid)
+                .iter()
+                .any(|arg| arg == "--worker")
         })
         .collect()
 }

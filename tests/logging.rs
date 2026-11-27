@@ -280,7 +280,7 @@ fn startup_errors_default_to_stderr_without_an_error_log() {
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
-#[ignore = "requires root; run in the privileged CI job with cargo test -- --ignored"]
+#[ignore = "requires root; run in the privileged CI job with cargo nextest run --run-ignored only"]
 async fn root_helper_opens_vhost_logs_after_master_drops_privileges() {
     use std::os::unix::fs::MetadataExt;
 

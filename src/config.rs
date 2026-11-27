@@ -305,7 +305,7 @@ struct Cli {
     /// Trusted reverse-proxy address or CIDR; may be repeated
     #[arg(long, value_name = "CIDR", allow_hyphen_values = true)]
     trusted_proxy: Vec<String>,
-    /// Redis URL containing logchomper's access data
+    /// Redis URL for swarm access data
     #[arg(long, value_name = "URL", hide = !SWARM, allow_hyphen_values = true)]
     swarm_redis: Option<String>,
     /// Local Redis URL containing customer blocklists
@@ -350,6 +350,33 @@ struct Cli {
     /// Positive-result cache idle lifetime in seconds
     #[arg(long, value_name = "SECS", hide = !SWARM, allow_hyphen_values = true)]
     swarm_pos_cache_tti: Option<u64>,
+    /// Disable writing swarm access records to Redis
+    #[arg(long, hide = !SWARM)]
+    swarm_no_record: bool,
+    /// Milliseconds between swarm Redis write batches
+    #[arg(long, value_name = "MS", hide = !SWARM, allow_hyphen_values = true)]
+    swarm_flush_ms: Option<u64>,
+    /// Malicious request filename; may be repeated
+    #[arg(long, value_name = "FILE", hide = !SWARM, allow_hyphen_values = true)]
+    swarm_malicious_file: Vec<String>,
+    /// Dynamic request extension; may be repeated
+    #[arg(long, value_name = "EXT", hide = !SWARM, allow_hyphen_values = true)]
+    swarm_dynamic_extension: Vec<String>,
+    /// Spam URL substring; may be repeated
+    #[arg(long, value_name = "SUBSTRING", hide = !SWARM, allow_hyphen_values = true)]
+    swarm_spam_substring: Vec<String>,
+    /// Enable nftables allow and deny sets
+    #[arg(long, hide = !SWARM)]
+    swarm_nft: bool,
+    /// nftables allow set name; may be repeated
+    #[arg(long, value_name = "SET", hide = !SWARM, allow_hyphen_values = true)]
+    swarm_nft_allow_set: Vec<String>,
+    /// nftables deny set name; may be repeated
+    #[arg(long, value_name = "SET", hide = !SWARM, allow_hyphen_values = true)]
+    swarm_nft_deny_set: Vec<String>,
+    /// Seconds between nftables ruleset refreshes
+    #[arg(long, value_name = "SECS", hide = !SWARM, allow_hyphen_values = true)]
+    swarm_nft_refresh_secs: Option<u64>,
     /// Write access-log records to stdout
     #[arg(long)]
     access_log: bool,
@@ -500,6 +527,15 @@ const FEATURE_OPTIONS: &[(&str, bool, &[&str])] = &[
             "swarm_neg_cache_ttl",
             "swarm_pos_cache_ttl",
             "swarm_pos_cache_tti",
+            "swarm_no_record",
+            "swarm_flush_ms",
+            "swarm_malicious_file",
+            "swarm_dynamic_extension",
+            "swarm_spam_substring",
+            "swarm_nft",
+            "swarm_nft_allow_set",
+            "swarm_nft_deny_set",
+            "swarm_nft_refresh_secs",
         ],
     ),
 ];
@@ -662,6 +698,15 @@ impl Config {
                     cli.swarm_neg_cache_ttl,
                     cli.swarm_pos_cache_ttl,
                     cli.swarm_pos_cache_tti,
+                    !cli.swarm_no_record,
+                    cli.swarm_flush_ms,
+                    cli.swarm_malicious_file.clone(),
+                    cli.swarm_dynamic_extension.clone(),
+                    cli.swarm_spam_substring.clone(),
+                    cli.swarm_nft,
+                    cli.swarm_nft_allow_set.clone(),
+                    cli.swarm_nft_deny_set.clone(),
+                    cli.swarm_nft_refresh_secs,
                 )?)
             }
             None if cli.swarm_local_redis.is_some()
@@ -677,7 +722,16 @@ impl Config {
                 || cli.swarm_timeout_ms.is_some()
                 || cli.swarm_neg_cache_ttl.is_some()
                 || cli.swarm_pos_cache_ttl.is_some()
-                || cli.swarm_pos_cache_tti.is_some() =>
+                || cli.swarm_pos_cache_tti.is_some()
+                || cli.swarm_no_record
+                || cli.swarm_flush_ms.is_some()
+                || !cli.swarm_malicious_file.is_empty()
+                || !cli.swarm_dynamic_extension.is_empty()
+                || !cli.swarm_spam_substring.is_empty()
+                || cli.swarm_nft
+                || !cli.swarm_nft_allow_set.is_empty()
+                || !cli.swarm_nft_deny_set.is_empty()
+                || cli.swarm_nft_refresh_secs.is_some() =>
             {
                 return Err("swarm options require --swarm-redis".to_owned());
             }

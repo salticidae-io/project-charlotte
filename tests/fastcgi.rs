@@ -371,6 +371,7 @@ where
     let mut keep_conn = false;
     let mut encoded_params = Vec::new();
     let mut params_done = false;
+    let mut empty_stdin_terminators = 0;
     let mut stdin = Vec::new();
     loop {
         let mut header = [0; 8];
@@ -391,6 +392,13 @@ where
             1 => keep_conn = content.get(2).is_some_and(|flags| flags & 1 != 0),
             4 if content.is_empty() => params_done = true,
             4 => encoded_params.extend_from_slice(&content),
+            5 if content.is_empty()
+                && params_done
+                && stdin.is_empty()
+                && empty_stdin_terminators == 0 =>
+            {
+                empty_stdin_terminators += 1;
+            }
             5 if content.is_empty() && params_done => break,
             5 => stdin.extend_from_slice(&content),
             _ => {}

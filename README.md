@@ -46,7 +46,7 @@ Build and run the test suite from the project directory:
 
 ```sh
 cargo build --release
-cargo test
+cargo nextest run
 ```
 
 ## Build features
@@ -60,7 +60,7 @@ default; leave some out to build a smaller server.
 | `proxy` | Virtual hosts with `proxy_pass`. | Virtual hosts with `proxy_pass` are refused. |
 | `acme` | ACME certificate provisioning (`--acme-*`). | The ACME options and `acme: true` are refused. |
 | `http3` | The HTTP/3 listener (`--http3-bind`). | TLS is served over TCP only. |
-| `swarm` | Redis-backed client access checks compatible with logchomper. | Swarm options and vhost `swarm` settings are refused. |
+| `swarm` | Redis-backed client access checks and request recording, with optional nftables sets. | Swarm options and vhost `swarm` settings are refused. |
 
 TLS termination, SNI certificate selection, ModSecurity, `--user`/`--group`,
 and virtual-host reloading are part of every build. A build refuses the
@@ -311,25 +311,38 @@ agent to stdout; quotes, backslashes, and control characters are escaped.
 
 ### Swarm access checks
 
-The optional `swarm` feature checks each resolved client IP against the Redis
-data populated by logchomper's `redis-accessproxy`. Enable it with
-`--swarm-redis URL` (or `swarm_redis` in the main config's `options` mapping).
-The default vhost threshold is 1000; `--swarm-vhost-threshold` can override it.
-Other `--swarm-*` options configure a second Redis URL for customer
-blocklists, classification thresholds, whitelist CIDRs, the machine blocklist
-key, the Redis timeout, and cache lifetimes. See `project-charlotte --help`
-for the complete option list.
+The optional `swarm` feature checks each resolved client IP against Redis and
+records eligible requests back to Redis. Enable it with `--swarm-redis URL`
+(or `swarm_redis` in the main config's `options` mapping). The default vhost
+threshold is 1000; `--swarm-vhost-threshold` can override it. A local Redis
+instance can provide `customer_blocklist_<ip>` entries; these return `403`,
+while other blocks return `429` with a `block-reason` header. The client
+address honors `--trusted-proxy`, and a vhost can opt out of both checks and
+recording with `swarm: false`.
 
-Charlotte reads, but does not write, logchomper's keys: `<ip>_vhosts`,
-`<HHMM>_hits`, `<HHMM>_<ip>_classes`, `blocklist:global`, and the configured
-machine key. A local Redis instance can provide `customer_blocklist_<ip>`
-entries; these return `403`, while other blocks return `429` with a
-`block-reason` header. The client address honors `--trusted-proxy`, and a vhost
-can opt out with `swarm: false`. Redis connection errors and timeouts fail open;
-the failed Redis instance is temporarily skipped. Nftables allow/deny sets and
-traffic recording are not implemented here—logchomper remains responsible
-for populating the shared data. This feature is included in the default build;
-builds without it reject `--swarm-*` options and vhost `swarm` settings.
+Recording is enabled by default and uses a bounded non-blocking request queue;
+records are batched and flushed every 10 seconds. Writes update `<HHMM>_hits`,
+`<ip>_vhosts`, `<HHMM>_<ip>_ua`, `<HHMM>_<ip>_urls`,
+`<HHMM>_<ip>_classes`, `daily_bycode_<YYYY-MM-DD>`, and the daily 418/429 keys.
+Whitelisted clients use the `wl_` daily key variants. Short-term keys receive
+a 10-minute expiry and daily keys receive a 7-day expiry, set with Redis
+`EXPIRE NX`. `--swarm-no-record` disables writes; `--swarm-flush-ms MS` changes
+the batch interval. Classification inputs are configurable with repeated
+`--swarm-malicious-file FILE`, `--swarm-dynamic-extension EXT` (defaults to
+`php` and `cgi`), and `--swarm-spam-substring SUBSTRING` options.
+
+`--swarm-nft` enables nftables allow/deny set checks. Charlotte reads the
+ruleset as JSON at startup and refreshes it hourly by default; override the
+refresh with `--swarm-nft-refresh-secs SECS` and configure repeated set names
+with `--swarm-nft-allow-set SET` and `--swarm-nft-deny-set SET`. Members may be
+individual IPs, address ranges, or prefix CIDRs. Allow members short-circuit
+swarm checks; deny members produce a cached `429`. Missing nftables support
+fails open and is logged once. Redis connection errors and timeouts also fail
+open, with the failed Redis instance temporarily skipped. Other `--swarm-*`
+options configure Redis thresholds, whitelist CIDRs, blocklist keys, timeout,
+and cache lifetimes; see `project-charlotte --help` for the complete list.
+This feature is included in the default build; builds without it reject
+`--swarm-*` options and vhost `swarm` settings.
 
 ### Logging
 
@@ -1058,12 +1071,17 @@ general server configuration.
 
 ## Development
 
-Run tests with `cargo test`. Tests that need a feature are compiled only when
-it is enabled, so a reduced build is tested with the same feature flags it is
-built with, for example
-`cargo test --no-default-features --features proxy,acme,http3`. On Linux, the
-root-only tests are marked ignored in ordinary runs; after building as the
-normal user, run them with `sudo -E env PATH="$PATH" cargo test -- --ignored`.
+Run tests with [cargo-nextest](https://nexte.st/) (install it with
+`cargo install cargo-nextest --locked`): `cargo nextest run`. Nextest runs
+each test in its own process and terminates a test that hangs; its settings
+are in `.config/nextest.toml`, and CI uses `--profile ci`, which retries a
+failed test once. Tests that need a feature are compiled only when it is
+enabled, so a reduced build is tested with the same feature flags it is built
+with, for example
+`cargo nextest run --no-default-features --features proxy,acme,http3`. On
+Linux, the root-only tests are marked ignored in ordinary runs; after building
+as the normal user, run them with
+`sudo -E env PATH="$PATH" cargo nextest run --run-ignored only`.
 The privileged tests copy the server executable into a temporary directory so
 workers running as other accounts can execute it; that directory and its
 ancestors must be traversable by those accounts.

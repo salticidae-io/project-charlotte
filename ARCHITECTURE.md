@@ -21,7 +21,7 @@ server:
 | `proxy` | `proxy`; `hyper-rustls` and the Hyper client. |
 | `acme` | `acme`; `instant-acme`, `x509-parser`. |
 | `http3` | `http3`; `quinn`, `h3`, `h3-quinn`. |
-| `swarm` | `swarm`; optional Redis-backed access checks compatible with logchomper. |
+| `swarm` | `swarm`; Redis-backed access checks and request recording, with optional nftables sets. |
 
 `main`, `config`, `control`, `bot`, `cgroup`, `forwarded`, `ja4`, `logging`,
 `logopener`, `pathctx`, `privileges`, `ratelimit`, `reload`, `response`, `tls`,
@@ -290,7 +290,7 @@ batched writes, while stdout and stderr logging remains synchronous.
 | `bot` | Bot policy parsing, request scoring, crawler checks, challenges, and cookies. |
 | `ja4` | Bounded TLS ClientHello capture, parsing, and JA4 fingerprinting. |
 | `cgroup` | Validation and setup for worker cgroup v2 paths and resource limits. |
-| `swarm` | Feature-gated Redis lookups for logchomper-compatible access decisions. |
+| `swarm` | Feature-gated Redis access checks and batched request writes, plus optional nftables set refresh and matching. |
 | `ratelimit` | Bounded per-client GCRA request buckets and `429` responses. |
 | `forwarded` | Trusted-proxy CIDR matching and XFF resolution/sanitization. |
 | `logging` | Apache-compatible formats, request timing/context, synchronous console targets, and queued file writers. |
@@ -361,8 +361,9 @@ capabilities are permitted.
 
 Unit and integration tests cover routing, handlers, TLS, ACME, FastCGI, CGI,
 reverse proxying, ModSecurity, swarm checks, bot policy, limits, and shutdown.
-Root-only tests are marked ignored and run in the privileged CI job with
-`cargo test -- --ignored`. Feature-combination checks compile all five optional
+Tests run under cargo-nextest, configured in `.config/nextest.toml`. Root-only
+tests are marked ignored and run in the privileged CI job with
+`cargo nextest run --run-ignored only`. Feature-combination checks compile all five optional
 features in every combination. Fuzz targets exercise parsed inputs and
 request-handling paths; see [FUZZING.md](FUZZING.md) for target names, setup,
 and commands. HTTP wire parsing itself is delegated to Hyper and `h3` and is

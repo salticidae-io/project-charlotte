@@ -49,6 +49,9 @@ jobs:
         with:
           components: rustfmt
 
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
@@ -60,7 +63,7 @@ jobs:
 
       - name: Run all tests
         working-directory: project-charlotte
-        run: cargo test --locked
+        run: cargo nextest run --locked --profile ci
 
   root-tests:
     name: Privileged tests
@@ -90,6 +93,9 @@ jobs:
       - name: Install stable Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
@@ -97,11 +103,11 @@ jobs:
 
       - name: Build tests as the runner user
         working-directory: project-charlotte
-        run: cargo test --locked --no-run
+        run: cargo nextest run --locked --no-run
 
       - name: Run root-only tests
         working-directory: project-charlotte
-        run: sudo -E env "PATH=$PATH" "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" cargo test --locked -- --ignored
+        run: sudo -E env "PATH=$PATH" "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" cargo nextest run --locked --profile ci --run-ignored only
 
   coverage:
     name: Test coverage
@@ -203,6 +209,9 @@ jobs:
       - name: Install stable Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
@@ -215,11 +224,11 @@ jobs:
       # The feature set of the project-charlotte-proxy package.
       - name: Test the proxy-only build
         working-directory: project-charlotte
-        run: cargo test --locked --no-default-features --features acme,http3,proxy
+        run: cargo nextest run --locked --profile ci --no-default-features --features acme,http3,proxy
 
       - name: Test the no-default-features build
         working-directory: project-charlotte
-        run: cargo test --locked --no-default-features
+        run: cargo nextest run --locked --profile ci --no-default-features
 
   bench:
     name: Gungraun benchmarks

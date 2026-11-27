@@ -1605,6 +1605,32 @@ impl Router {
             started: request_started,
         });
         let request_traffic = traffic.clone();
+        #[cfg(feature = "swarm")]
+        let swarm_record = self
+            .swarm
+            .as_ref()
+            .filter(|swarm| {
+                swarm.recording_enabled()
+                    && selected.is_none_or(|index| table.vhosts[index].swarm_enabled)
+            })
+            .map(|swarm| {
+                (
+                    Arc::clone(swarm),
+                    client.ip(),
+                    server_name.clone(),
+                    request
+                        .uri()
+                        .path_and_query()
+                        .map_or("/", |value| value.as_str())
+                        .to_owned(),
+                    request
+                        .headers()
+                        .get(http::header::USER_AGENT)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default()
+                        .to_owned(),
+                )
+            });
         let request = request.map(|body| {
             crate::logging::CountedBody::new(
                 crate::traffic::TrafficBody::inbound(body, request_traffic),
@@ -1623,6 +1649,10 @@ impl Router {
             self.dispatch_inner(request, client, local, table, host, selected),
         )
         .await;
+        #[cfg(feature = "swarm")]
+        if let Some((swarm, ip, vhost, url, user_agent)) = swarm_record {
+            swarm.record(ip, vhost, url, user_agent, response.status());
+        }
         let mut response = response;
         let client_slot = response.extensions_mut().remove::<ClientSlot>();
         let bot_intervention = response

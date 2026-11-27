@@ -941,7 +941,6 @@ impl<S: AsyncRead + Unpin> AsyncRead for RecordGuard<S> {
         if buf.remaining() == 0 {
             return Poll::Ready(Ok(()));
         }
-
         loop {
             if this.header_read == FASTCGI_HEADER_LEN {
                 let count = buf.remaining().min(FASTCGI_HEADER_LEN - this.header_offset);

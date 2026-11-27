@@ -1,0 +1,18 @@
+# cargo-nextest configuration. Run the suite with `cargo nextest run`.
+# Nextest runs every test in its own process, so tests that share global
+# state or spawn server processes cannot interfere with each other.
+
+[profile.default]
+# Report tests that run longer than 30 seconds, and terminate a test after
+# 4 minutes so a hung server process cannot stall the whole run.
+slow-timeout = { period = "30s", terminate-after = 8, grace-period = "5s" }
+# Report a leaked server process after it has been given time to shut down.
+leak-timeout = "1s"
+fail-fast = false
+final-status-level = "fail"
+
+[profile.ci]
+# Integration tests start servers and worker pools; retry them once so a
+# loaded runner does not fail the build on a timing-sensitive check.
+retries = 1
+failure-output = "immediate-final"

@@ -1,4 +1,4 @@
-//! End-to-end compatibility checks for the logchomper Redis access data.
+//! End-to-end checks for swarm Redis reads and writes.
 
 #![forbid(unsafe_code)]
 #![cfg(all(feature = "swarm", feature = "hosting"))]
@@ -29,9 +29,11 @@ static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 #[derive(Default)]
 struct RedisData {
     sorted_scores: HashMap<(String, String), f64>,
+    sorted_members: HashSet<(String, String)>,
     vhost_counts: HashMap<String, u64>,
     class_counts: HashMap<String, [u64; 5]>,
     existing_keys: HashSet<String>,
+    write_commands: Vec<Vec<String>>,
 }
 
 struct MockRedis {
@@ -75,6 +77,14 @@ impl MockRedis {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         );
+    }
+
+    fn write_commands(&self) -> Vec<Vec<String>> {
+        self.data
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .write_commands
+            .clone()
     }
 }
 
@@ -211,6 +221,75 @@ fn redis_response(command: &[String], data: &Mutex<RedisData>) -> String {
                     .contains(key)
             });
             format!(":{}\r\n", u8::from(present))
+        }
+        "ZINCRBY" => {
+            let Some((key, increment, member)) = command
+                .get(1)
+                .zip(command.get(2))
+                .zip(command.get(3))
+                .map(|((key, increment), member)| (key, increment, member))
+            else {
+                return "-ERR wrong number of arguments\r\n".to_owned();
+            };
+            let mut data = data
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            data.write_commands.push(command.to_vec());
+            let entry = data
+                .sorted_scores
+                .entry((key.clone(), member.clone()))
+                .or_default();
+            *entry += increment.parse::<f64>().unwrap_or_default();
+            bulk_string(&entry.to_string())
+        }
+        "ZADD" => {
+            let Some(key) = command.get(1) else {
+                return "-ERR wrong number of arguments\r\n".to_owned();
+            };
+            let mut data = data
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            data.write_commands.push(command.to_vec());
+            let mut added = 0;
+            for pair in command.get(2..).unwrap_or_default().chunks_exact(2) {
+                if data.sorted_members.insert((key.clone(), pair[1].clone())) {
+                    added += 1;
+                    *data.vhost_counts.entry(key.clone()).or_default() += 1;
+                }
+            }
+            format!(":{added}\r\n")
+        }
+        "HINCRBY" => {
+            let Some((key, field, increment)) = command
+                .get(1)
+                .zip(command.get(2))
+                .zip(command.get(3))
+                .map(|((key, field), increment)| (key, field, increment))
+            else {
+                return "-ERR wrong number of arguments\r\n".to_owned();
+            };
+            let index = match field.as_str() {
+                "dynamic" => 0,
+                "malicious" => 1,
+                "spam" => 2,
+                "static" => 3,
+                "path" => 4,
+                _ => return "-ERR invalid hash field\r\n".to_owned(),
+            };
+            let mut data = data
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            data.write_commands.push(command.to_vec());
+            let counts = data.class_counts.entry(key.clone()).or_default();
+            counts[index] += increment.parse::<u64>().unwrap_or_default();
+            format!(":{}\r\n", counts[index])
+        }
+        "EXPIRE" => {
+            data.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .write_commands
+                .push(command.to_vec());
+            ":1\r\n".to_owned()
         }
         _ => "-ERR unsupported command\r\n".to_owned(),
     }
@@ -481,6 +560,45 @@ async fn unreachable_redis_fails_open() {
 
     let response = request(fixture.address, None).await;
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+}
+
+#[tokio::test]
+async fn request_flush_writes_hit_and_vhost_records_to_redis() {
+    let redis = MockRedis::start().await;
+    let fixture = Fixture::start_with_args(
+        &redis.url(),
+        None,
+        false,
+        None,
+        &["--swarm-flush-ms", "100"],
+    )
+    .await;
+
+    let response = request(fixture.address, None).await;
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let commands = redis.write_commands();
+        let wrote_hits = commands.iter().any(|command| {
+            command.first().is_some_and(|name| name == "ZINCRBY")
+                && command.get(1).is_some_and(|key| key.ends_with("_hits"))
+                && command.get(3).is_some_and(|ip| ip == "127.0.0.1")
+        });
+        let wrote_vhost = commands.iter().any(|command| {
+            command.first().is_some_and(|name| name == "ZADD")
+                && command.get(1).is_some_and(|key| key == "127.0.0.1_vhosts")
+                && command.iter().any(|argument| argument == "swarm.test")
+        });
+        if wrote_hits && wrote_vhost {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "swarm writer did not flush hit and vhost commands: {commands:?}"
+        );
+        sleep(Duration::from_millis(25)).await;
+    }
 }
 
 #[tokio::test]

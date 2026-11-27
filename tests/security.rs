@@ -252,7 +252,7 @@ fn packaged_defaults_run_unprivileged_with_systemd_sandboxing() {
 
 #[cfg(all(target_os = "linux", feature = "hosting"))]
 #[tokio::test]
-#[ignore = "requires root; run in the privileged CI job with cargo test -- --ignored"]
+#[ignore = "requires root; run in the privileged CI job with cargo nextest run --run-ignored only"]
 async fn root_helper_restricts_new_log_paths_after_master_drops_privileges() {
     use std::os::unix::fs::MetadataExt;
     use tokio::time::sleep;

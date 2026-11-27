@@ -1318,14 +1318,5 @@ fn process_is_running(pid: u32, start_time: u64) -> bool {
 }
 
 fn process_info(pid: u32) -> Option<(char, u64)> {
-    let stat = std::fs::read_to_string(
-        std::path::Path::new("/proc")
-            .join(pid.to_string())
-            .join("stat"),
-    )
-    .ok()?;
-    let mut fields = stat.rsplit_once(") ")?.1.split_whitespace();
-    let state = fields.next()?.chars().next()?;
-    let start_time = fields.nth(18)?.parse().ok()?;
-    Some((state, start_time))
+    common::process_state_and_start(pid)
 }
