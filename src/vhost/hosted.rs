@@ -33,7 +33,8 @@ use nix::{
 use tokio::{
     io::AsyncReadExt,
     net::UnixStream,
-    sync::{Mutex, Notify},
+    runtime::Handle,
+    sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore},
     time::timeout,
 };
 
@@ -49,10 +50,13 @@ const META_LOCAL: HeaderName = HeaderName::from_static("x-charlotte-local");
 const META_VERSION: HeaderName = HeaderName::from_static("x-charlotte-version");
 const META_TLS: HeaderName = HeaderName::from_static("x-charlotte-tls");
 const WORKER_READY_TIMEOUT: Duration = Duration::from_secs(10);
+const WORKER_START_QUEUE_WAIT: Duration = Duration::from_secs(5);
+const DEFAULT_MAX_WORKER_STARTS: usize = 16;
 /// How long a worker is given to shut down on its own before it is killed.
 const WORKER_SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 const WORKER_SHUTDOWN_POLL: Duration = Duration::from_millis(5);
 static WORKER_POOL: OnceLock<Arc<WorkerPool>> = OnceLock::new();
+static WORKER_START_LIMITER: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
 type WorkerRequestBody = UnsyncBoxBody<Bytes, io::Error>;
 type WorkerSender = SendRequest<WorkerRequestBody>;
@@ -79,8 +83,12 @@ pub(super) struct Worker {
 
 pub(super) struct WorkerProcess {
     pub(super) sender: WorkerSender,
-    pub(super) child: WorkerChild,
+    pub(super) child: Option<WorkerChild>,
     slot: Option<WorkerSlot>,
+}
+
+struct StartingChild {
+    child: Option<WorkerChild>,
 }
 
 struct WorkerPool {
@@ -119,6 +127,26 @@ impl std::fmt::Display for WorkerCapacityExhausted {
 }
 
 impl Error for WorkerCapacityExhausted {}
+
+#[derive(Debug)]
+struct WorkerStartsExhausted;
+
+impl std::fmt::Display for WorkerStartsExhausted {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("the worker start queue remained full for five seconds")
+    }
+}
+
+impl Error for WorkerStartsExhausted {}
+
+struct WorkerSpawn {
+    uid: u32,
+    gid: u32,
+    error_log_file: Option<PathBuf>,
+    cgroup: Option<CgroupSpec>,
+    args: Vec<OsString>,
+    environment: Vec<(OsString, OsString)>,
+}
 
 impl WorkerPool {
     fn new(limit: usize) -> Self {
@@ -244,6 +272,29 @@ pub(super) fn set_max_workers(limit: usize) {
     worker_pool().set_limit(limit);
 }
 
+pub(super) fn set_max_worker_starts(limit: usize) {
+    let permits = if limit == 0 {
+        Semaphore::MAX_PERMITS
+    } else {
+        limit
+    };
+    let _ = WORKER_START_LIMITER.set(Arc::new(Semaphore::new(permits)));
+}
+
+fn worker_start_limiter() -> &'static Arc<Semaphore> {
+    WORKER_START_LIMITER.get_or_init(|| Arc::new(Semaphore::new(DEFAULT_MAX_WORKER_STARTS)))
+}
+
+async fn acquire_worker_start(
+    semaphore: Arc<Semaphore>,
+    wait: Duration,
+) -> Result<OwnedSemaphorePermit, WorkerStartsExhausted> {
+    match timeout(wait, semaphore.acquire_owned()).await {
+        Ok(Ok(permit)) => Ok(permit),
+        Ok(Err(_)) | Err(_) => Err(WorkerStartsExhausted),
+    }
+}
+
 pub(super) enum WorkerChild {
     Direct(Child),
     Helper(u64),
@@ -261,6 +312,88 @@ impl WorkerChild {
             Self::Helper(id) => crate::logopener::stop_worker(*id, force),
             Self::Direct(child) => stop_direct_worker(child, force),
         }
+    }
+}
+
+impl StartingChild {
+    fn new(child: WorkerChild) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn id(&self) -> u64 {
+        self.child.as_ref().expect("starting child is present").id()
+    }
+
+    fn disarm(mut self) -> WorkerChild {
+        self.child.take().expect("starting child is present")
+    }
+}
+
+impl Drop for StartingChild {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.take() {
+            stop_worker_in_background(child, true);
+        }
+    }
+}
+
+impl WorkerSpawn {
+    fn spawn(self, child_socket: OwnedFd) -> Result<StartingChild, Box<dyn Error + Send + Sync>> {
+        let child = if crate::logopener::is_active() {
+            WorkerChild::Helper(crate::logopener::spawn_worker(
+                self.uid,
+                self.gid,
+                &self.args,
+                &self.environment,
+                self.error_log_file.as_deref(),
+                self.cgroup.as_ref(),
+                child_socket,
+            )?)
+        } else {
+            let mut command = Command::new(crate::worker_executable()?);
+            command
+                .args(&self.args)
+                .env_clear()
+                .envs(self.environment.iter().map(|(key, value)| (key, value)))
+                .stdin(Stdio::from(child_socket))
+                .current_dir("/");
+            if let Some(path) = &self.error_log_file {
+                let stderr = crate::logging::open_log_file(path)?;
+                command.stderr(Stdio::from(stderr));
+            }
+            if let Some(spec) = &self.cgroup {
+                let cgroup_procs = crate::cgroup::prepare(spec).map_err(|error| {
+                    io::Error::new(
+                        error.kind(),
+                        format!(
+                            "could not prepare worker cgroup {}: {error}",
+                            spec.path.display()
+                        ),
+                    )
+                })?;
+                crate::cgroup::apply_to_command(&mut command, cgroup_procs);
+            }
+            if crate::privileges::can_set_ids()? {
+                crate::privileges::apply_identity(&mut command, self.uid, self.gid)?;
+            }
+            let child = command.spawn()?;
+            crate::log_debug!("Started virtual-host worker with pid {}", child.id());
+            WorkerChild::Direct(child)
+        };
+        Ok(StartingChild::new(child))
+    }
+}
+
+fn stop_worker_in_background(mut child: WorkerChild, force: bool) {
+    let mut stop = move || {
+        if let Err(error) = child.stop(force) {
+            crate::log_error!("Could not stop virtual-host worker: {error}");
+        }
+    };
+    if let Ok(runtime) = Handle::try_current() {
+        runtime.spawn_blocking(stop);
+    } else {
+        stop();
     }
 }
 
@@ -291,8 +424,8 @@ fn stop_direct_worker(child: &mut Child, force: bool) -> io::Result<()> {
 
 impl Drop for WorkerProcess {
     fn drop(&mut self) {
-        if let Err(error) = self.child.stop(false) {
-            crate::log_error!("Could not stop virtual-host worker: {error}");
+        if let Some(child) = self.child.take() {
+            stop_worker_in_background(child, false);
         }
     }
 }
@@ -416,50 +549,23 @@ impl Worker {
             ));
         }
 
-        let mut child = if crate::logopener::is_active() {
-            WorkerChild::Helper(crate::logopener::spawn_worker(
-                self.uid,
-                self.gid,
-                &args,
-                &environment,
-                self.error_log_file.as_deref(),
-                self.cgroup.as_ref(),
-                OwnedFd::from(child_socket),
-            )?)
-        } else {
-            let mut command = Command::new(crate::worker_executable()?);
-            command
-                .args(&args)
-                .env_clear()
-                .envs(environment.iter().map(|(key, value)| (key, value)))
-                .stdin(Stdio::from(OwnedFd::from(child_socket)))
-                .current_dir("/");
-            if let Some(path) = &self.error_log_file {
-                let stderr = crate::logging::open_log_file(path)?;
-                command.stderr(Stdio::from(stderr));
-            }
-            if let Some(spec) = &self.cgroup {
-                let cgroup_procs = crate::cgroup::prepare(spec).map_err(|error| {
-                    io::Error::new(
-                        error.kind(),
-                        format!(
-                            "could not prepare worker cgroup {}: {error}",
-                            spec.path.display()
-                        ),
-                    )
-                })?;
-                crate::cgroup::apply_to_command(&mut command, cgroup_procs);
-            }
-            if crate::privileges::can_set_ids()? {
-                crate::privileges::apply_identity(&mut command, self.uid, self.gid)?;
-            }
-            let child = command.spawn()?;
-            crate::log_debug!("Started virtual-host worker with pid {}", child.id());
-            WorkerChild::Direct(child)
+        let worker_spawn = WorkerSpawn {
+            uid: self.uid,
+            gid: self.gid,
+            error_log_file: self.error_log_file.clone(),
+            cgroup: self.cgroup.clone(),
+            args,
+            environment,
         };
+        let child =
+            tokio::task::spawn_blocking(move || worker_spawn.spawn(OwnedFd::from(child_socket)))
+                .await
+                .map_err(|error| {
+                    io::Error::other(format!("worker spawn task failed: {error}"))
+                })??;
         let mut stream = UnixStream::from_std(parent)?;
         if let Err(reason) = wait_for_ready(&mut stream, WORKER_READY_TIMEOUT).await {
-            return Err(self.startup_failure(&mut child, &reason).into());
+            return Err(self.startup_failure(&child, &reason).into());
         }
         crate::log_debug!("Virtual-host worker {} is ready", child.id());
         let handshake = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
@@ -470,7 +576,7 @@ impl Worker {
             Ok(handshake) => handshake,
             Err(error) => {
                 let reason = format!("failed the HTTP/2 handshake: {error}");
-                return Err(self.startup_failure(&mut child, &reason).into());
+                return Err(self.startup_failure(&child, &reason).into());
             }
         };
         tokio::spawn(async move {
@@ -480,22 +586,18 @@ impl Worker {
         });
         Ok(WorkerProcess {
             sender,
-            child,
+            child: Some(child.disarm()),
             slot: Some(slot),
         })
     }
 
-    fn startup_failure(&self, child: &mut WorkerChild, reason: &str) -> String {
-        let status = child.stop(true).map_or_else(
-            |error| format!("stop failed: {error}"),
-            |_| "stopped".to_owned(),
-        );
+    fn startup_failure(&self, _child: &StartingChild, reason: &str) -> String {
         let error_target = self
             .error_log_file
             .as_deref()
             .map_or_else(|| "stderr".to_owned(), |path| path.display().to_string());
         format!(
-            "virtual host worker for root {} (uid {}, gid {}) {reason}: {status}; its error was written to {error_target}",
+            "virtual host worker for root {} (uid {}, gid {}) {reason}; it is being stopped and its error was written to {error_target}",
             self.root.display(),
             self.uid,
             self.gid
@@ -541,6 +643,9 @@ impl Worker {
                 if error.downcast_ref::<WorkerCapacityExhausted>().is_some() {
                     return worker_capacity_response();
                 }
+                if error.downcast_ref::<WorkerStartsExhausted>().is_some() {
+                    return worker_start_response();
+                }
                 crate::log_error!("virtual host worker failed: {error}");
                 response::error_response(StatusCode::BAD_GATEWAY, "Virtual host worker failed\n")
             }
@@ -561,6 +666,12 @@ impl Worker {
                 .is_none_or(|process| process.sender.is_closed())
             {
                 *process_guard = None;
+                let _start_permit = acquire_worker_start(
+                    Arc::clone(worker_start_limiter()),
+                    WORKER_START_QUEUE_WAIT,
+                )
+                .await
+                .map_err(|error| Box::new(error) as Box<dyn Error + Send + Sync>)?;
                 let reservation = worker_pool().reserve(self)?;
                 if let Some(evicted) = reservation.evicted {
                     tokio::task::spawn_blocking(move || drop(evicted));
@@ -595,8 +706,15 @@ impl Worker {
 }
 
 fn worker_capacity_response() -> Response<ResponseBody> {
-    let mut response =
-        response::error_response(StatusCode::SERVICE_UNAVAILABLE, "Too many active workers\n");
+    worker_unavailable_response("Too many active workers\n")
+}
+
+fn worker_start_response() -> Response<ResponseBody> {
+    worker_unavailable_response("Too many workers starting\n")
+}
+
+fn worker_unavailable_response(message: &'static str) -> Response<ResponseBody> {
+    let mut response = response::error_response(StatusCode::SERVICE_UNAVAILABLE, message);
     response
         .headers_mut()
         .insert(RETRY_AFTER, HeaderValue::from_static("1"));
@@ -892,8 +1010,9 @@ fn version_name(version: Version) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActivityGuard, WORKER_SHUTDOWN_GRACE, Worker, WorkerChild, WorkerPool, WorkerProcess,
-        stop_direct_worker, wait_for_ready, worker_capacity_response,
+        ActivityGuard, StartingChild, WORKER_SHUTDOWN_GRACE, Worker, WorkerChild, WorkerPool,
+        WorkerProcess, acquire_worker_start, stop_direct_worker, wait_for_ready,
+        worker_capacity_response, worker_start_response,
     };
     use bytes::Bytes;
     use http::{Request, Response, StatusCode, header::RETRY_AFTER};
@@ -1003,7 +1122,7 @@ mod tests {
         let pid = {
             let process = worker.process.lock().await;
             let Some(WorkerProcess {
-                child: WorkerChild::Direct(child),
+                child: Some(WorkerChild::Direct(child)),
                 ..
             }) = process.as_ref()
             else {
@@ -1100,9 +1219,60 @@ mod tests {
         assert!(pool.reserve(&requester).is_err());
     }
 
+    #[tokio::test]
+    async fn worker_start_limiter_times_out_when_all_slots_are_occupied() {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = semaphore.clone().acquire_owned().await.unwrap();
+
+        assert!(
+            acquire_worker_start(Arc::clone(&semaphore), Duration::from_millis(10))
+                .await
+                .is_err()
+        );
+        drop(permit);
+        assert!(
+            acquire_worker_start(semaphore, Duration::from_millis(10))
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_startup_stops_and_reaps_the_child() {
+        let child = Command::new("sleep").arg("60").spawn().unwrap();
+        let pid = child.id();
+        let starting = StartingChild::new(WorkerChild::Direct(child));
+        let task = tokio::spawn(async move {
+            let _starting = starting;
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+        task.abort();
+        let _ = task.await;
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cancelled worker startup should stop and reap its child");
+    }
+
     #[test]
     fn worker_capacity_exhaustion_returns_retryable_service_unavailable() {
         let response = worker_capacity_response();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers().get(RETRY_AFTER).unwrap(), "1");
+    }
+
+    #[test]
+    fn worker_start_exhaustion_returns_retryable_service_unavailable() {
+        let response = worker_start_response();
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.headers().get(RETRY_AFTER).unwrap(), "1");
@@ -1167,7 +1337,7 @@ mod tests {
             error_log_format: String::new(),
             process: Arc::new(Mutex::new(Some(WorkerProcess {
                 sender,
-                child: WorkerChild::Direct(child),
+                child: Some(WorkerChild::Direct(child)),
                 slot: None,
             }))),
             reaper_wake: Arc::new(tokio::sync::Notify::new()),

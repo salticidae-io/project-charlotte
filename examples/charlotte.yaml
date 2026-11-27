@@ -23,6 +23,7 @@
 #   debug: true
 #   index: [index.html, index.htm]
 #   max_workers: 6000  # 0 (the default) allows an unlimited number
+#   max_worker_starts: 16  # 0 allows unlimited concurrent worker starts
 # Relative option paths are resolved against this file's directory.
 # Set the global blocking response status with `modsecurity-block-status`;
 # a vhost may override it with `modsecurity_block_status` below.

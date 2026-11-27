@@ -234,6 +234,7 @@ pub(crate) fn fuzz_config(root: PathBuf) -> Config {
         worker_threads: 2,
         worker_idle_timeout: std::time::Duration::from_secs(300),
         max_workers: 0,
+        max_worker_starts: 16,
         worker_cgroup: None,
         rate_limit: None,
         #[cfg(feature = "swarm")]

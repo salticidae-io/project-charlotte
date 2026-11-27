@@ -106,6 +106,74 @@ mod fuzz_support;
 
 use std::{error::Error, net::SocketAddr, sync::Arc, time::Duration};
 
+fn raise_nofile_limit() {
+    use nix::sys::resource::{Resource, getrlimit, setrlimit};
+
+    let (soft, hard) = match getrlimit(Resource::RLIMIT_NOFILE) {
+        Ok(limits) => limits,
+        Err(error) => {
+            crate::log_error!("Could not inspect the open-file limit: {error}");
+            return;
+        }
+    };
+    if soft == hard {
+        return;
+    }
+    match setrlimit(Resource::RLIMIT_NOFILE, hard, hard) {
+        Ok(()) => crate::log_notice!("Raised the open-file soft limit to {hard}"),
+        Err(error) => {
+            #[cfg(target_os = "macos")]
+            {
+                if let Some(cap) = macos_open_file_limit() {
+                    let capped = hard.min(cap);
+                    if capped > soft {
+                        match setrlimit(Resource::RLIMIT_NOFILE, capped, hard) {
+                            Ok(()) => {
+                                crate::log_notice!(
+                                    "Raised the open-file soft limit to {capped} (macOS per-process cap)"
+                                );
+                                return;
+                            }
+                            Err(retry_error) => {
+                                crate::log_error!(
+                                    "Could not raise the open-file limit to {capped} after the macOS cap: {retry_error}"
+                                );
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+            crate::log_error!("Could not raise the open-file soft limit to {hard}: {error}");
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn macos_open_file_limit() -> Option<u64> {
+    let mut value: libc::c_int = 0;
+    let mut length = std::mem::size_of_val(&value);
+    // SAFETY: the name is NUL-terminated and the output pointers refer to
+    // writable values with their correct lengths.
+    let result = unsafe {
+        libc::sysctlbyname(
+            c"kern.maxfilesperproc".as_ptr(),
+            (&mut value as *mut libc::c_int).cast(),
+            &mut length,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    // SAFETY: sysconf has no pointer arguments and `_SC_OPEN_MAX` is valid on macOS.
+    let open_max = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
+    let kernel_cap = (result == 0 && value > 0).then_some(value as u64);
+    match (open_max > 0).then_some(open_max as u64) {
+        Some(open_max) => Some(kernel_cap.map_or(open_max, |cap| cap.min(open_max))),
+        None => kernel_cap,
+    }
+}
+
 #[cfg(feature = "hosting")]
 use std::{io, path::PathBuf};
 
@@ -267,6 +335,7 @@ pub fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         fastcgi::set_keepalive_limit(config.fastcgi_keepalive);
         handler::set_static_cache_ttl(config.static_cache_ttl);
         vhost::set_max_workers(config.max_workers);
+        vhost::set_max_worker_starts(config.max_worker_starts);
     }
     #[cfg(not(feature = "hosting"))]
     let config = config;
@@ -339,6 +408,7 @@ pub fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
             .as_deref()
             .map(vhost::read_trusted_config)
             .transpose()?;
+        raise_nofile_limit();
         privileges::drop_master(&config)?;
         let mut builder = tokio::runtime::Builder::new_multi_thread();
         if let Some(threads) = config.threads {

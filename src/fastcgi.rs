@@ -1320,6 +1320,7 @@ mod tests {
             worker_threads: 2,
             worker_idle_timeout: Duration::from_secs(300),
             max_workers: 0,
+            max_worker_starts: 16,
             worker_cgroup: None,
             rate_limit: None,
             #[cfg(feature = "swarm")]

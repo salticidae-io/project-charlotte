@@ -120,6 +120,7 @@ pub struct Config {
     pub worker_threads: usize,
     pub worker_idle_timeout: Duration,
     pub max_workers: usize,
+    pub max_worker_starts: usize,
     #[cfg(feature = "hosting")]
     pub worker_cgroup: Option<CgroupSpec>,
     pub(crate) rate_limit: Option<RateLimit>,
@@ -280,6 +281,9 @@ struct Cli {
     /// Maximum number of live hosted worker processes; 0 is unlimited
     #[arg(long, value_name = "N", default_value = "0", hide = !HOSTING, allow_hyphen_values = true)]
     max_workers: usize,
+    /// Maximum number of hosted workers that may start concurrently; 0 is unlimited
+    #[arg(long, value_name = "N", default_value = "16", hide = !HOSTING, allow_hyphen_values = true)]
+    max_worker_starts: usize,
     /// Cgroup v2 path for hosted workers, relative to /sys/fs/cgroup
     #[arg(long, value_name = "PATH", hide = !HOSTING, allow_hyphen_values = true)]
     worker_cgroup: Option<String>,
@@ -459,6 +463,7 @@ const FEATURE_OPTIONS: &[(&str, bool, &[&str])] = &[
             "worker_threads",
             "worker_idle_timeout",
             "max_workers",
+            "max_worker_starts",
             "worker_cgroup",
             "worker_cgroup_memory_max",
             "worker_cgroup_cpu_max",
@@ -840,6 +845,7 @@ impl Config {
             worker_threads,
             worker_idle_timeout,
             max_workers,
+            max_worker_starts,
             worker_cgroup,
             worker_cgroup_memory_max,
             worker_cgroup_cpu_max,
@@ -1118,6 +1124,7 @@ impl Config {
             worker_threads,
             worker_idle_timeout: Duration::from_secs(worker_idle_timeout),
             max_workers,
+            max_worker_starts,
             #[cfg(feature = "hosting")]
             worker_cgroup,
             rate_limit,
@@ -2655,7 +2662,7 @@ mod tests {
     #[test]
     fn parses_global_options_from_config_file_and_resolves_relative_paths() {
         let path = write_config_file(
-            "options:\n  bind: 127.0.0.1:8123\n  debug: true\n  https_redirect: true\n  index: [home.htm, index.html]\n  user: charlotte\n  threads: 4\n  max_workers: 12\n  access-log-file: logs/access.log\n  log-dir: [logs, audit]\n  tls-dir: certificates\n  worker_cgroup: charlotte/sites/{uid}/{name}\n  worker_cgroup_memory_max: 512M\n  worker_cgroup_cpu_max: 150%\n  worker_cgroup_pids_max: 64\n",
+            "options:\n  bind: 127.0.0.1:8123\n  debug: true\n  https_redirect: true\n  index: [home.htm, index.html]\n  user: charlotte\n  threads: 4\n  max_workers: 12\n  max_worker_starts: 3\n  access-log-file: logs/access.log\n  log-dir: [logs, audit]\n  tls-dir: certificates\n  worker_cgroup: charlotte/sites/{uid}/{name}\n  worker_cgroup_memory_max: 512M\n  worker_cgroup_cpu_max: 150%\n  worker_cgroup_pids_max: 64\n",
         );
         let parsed =
             Config::parse(["--config".to_owned(), path.to_string_lossy().into_owned()]).unwrap();
@@ -2670,6 +2677,7 @@ mod tests {
         assert_eq!(config.master_user.as_deref(), Some("charlotte"));
         assert_eq!(config.threads, Some(4));
         assert_eq!(config.max_workers, 12);
+        assert_eq!(config.max_worker_starts, 3);
         let cgroup = config.worker_cgroup.as_ref().unwrap();
         assert_eq!(cgroup.path, PathBuf::from("charlotte/sites/{uid}/{name}"));
         assert_eq!(cgroup.memory_max.as_deref(), Some("536870912"));
@@ -2691,6 +2699,22 @@ mod tests {
             [path.parent().unwrap().join("certificates")]
         );
         fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(feature = "hosting")]
+    #[test]
+    fn max_worker_starts_defaults_to_sixteen_and_accepts_zero() {
+        let ParseResult::Config(default) = Config::parse(Vec::<String>::new()).unwrap() else {
+            panic!("expected config")
+        };
+        assert_eq!(default.max_worker_starts, 16);
+
+        let ParseResult::Config(config) =
+            Config::parse(["--max-worker-starts".to_owned(), "0".to_owned()]).unwrap()
+        else {
+            panic!("expected config")
+        };
+        assert_eq!(config.max_worker_starts, 0);
     }
 
     #[test]

@@ -925,7 +925,13 @@ reached, Charlotte stops the least recently used idle worker before starting
 another. If every worker is handling a request, the new request receives `503`
 with `Retry-After: 1`. An evicted process can take up to 500 ms to shut down, so
 the process count may briefly exceed the configured limit during that grace
-period.
+period. Worker starts are limited to 16 concurrently by default; set
+`--max-worker-starts N` or `max_worker_starts: N` to change this, and use `0`
+for no start limit. Requests wait up to five seconds for a start slot before
+receiving `503 Service Unavailable` with `Retry-After: 1`. At startup Charlotte
+raises its soft open-file limit to the hard limit before dropping privileges;
+on macOS, if that value exceeds the per-process kernel limit, it retries with a
+platform-capped value.
 
 Hosted workers can optionally be placed in a cgroup v2 group under
 `/sys/fs/cgroup`. Set `--worker-cgroup PATH` and any of

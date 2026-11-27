@@ -12,7 +12,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{
-        Arc, RwLock,
+        Arc, OnceLock, RwLock,
         atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering},
     },
     time::Instant,
@@ -59,6 +59,11 @@ use hosted::*;
 #[cfg(feature = "hosting")]
 pub(crate) fn set_max_workers(limit: usize) {
     hosted::set_max_workers(limit);
+}
+
+#[cfg(feature = "hosting")]
+pub(crate) fn set_max_worker_starts(limit: usize) {
+    hosted::set_max_worker_starts(limit);
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -404,6 +409,7 @@ struct VhostTable {
     vhosts: Vec<Arc<Vhost>>,
     default: Option<usize>,
     exact_names: HashMap<String, usize>,
+    traffic: Vec<OnceLock<Arc<crate::traffic::Counters>>>,
 }
 
 impl VhostTable {
@@ -417,10 +423,25 @@ impl VhostTable {
             }
         }
         Self {
+            traffic: std::iter::repeat_with(OnceLock::new)
+                .take(vhosts.len())
+                .collect(),
             vhosts,
             default,
             exact_names,
         }
+    }
+
+    fn initialize_traffic(&self, traffic: &crate::traffic::Traffic) {
+        for (index, vhost) in self.vhosts.iter().enumerate() {
+            if let Some(name) = vhost.names.first() {
+                self.traffic[index].get_or_init(|| traffic.counters(name));
+            }
+        }
+    }
+
+    fn traffic_counters(&self, index: usize) -> Option<Arc<crate::traffic::Counters>> {
+        self.traffic.get(index)?.get().cloned()
     }
 }
 
@@ -792,6 +813,7 @@ impl Router {
         }
         let default = vhosts.iter().position(|vhost| vhost.default);
         let new_table = Arc::new(VhostTable::new(vhosts, default));
+        new_table.initialize_traffic(&self.traffic);
         let vhost_count = new_table.vhosts.len();
         let build_elapsed = build_started.elapsed();
         if !changed {
@@ -824,6 +846,13 @@ impl Router {
                 .table
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = new_table;
+            let snapshot = self.snapshot();
+            let active_names = snapshot
+                .vhosts
+                .iter()
+                .filter_map(|vhost| vhost.names.first().map(String::as_str))
+                .collect::<HashSet<_>>();
+            self.traffic.retain(&active_names);
         }
         let swap_elapsed = swap_started.elapsed();
         crate::log_notice!(
@@ -1423,9 +1452,12 @@ impl Router {
         }
 
         let vhosts = vhosts.into_iter().map(Arc::new).collect::<Vec<_>>();
+        let traffic = crate::traffic::Traffic::default();
+        let table = Arc::new(VhostTable::new(vhosts.clone(), default));
+        table.initialize_traffic(&traffic);
         Ok(Self {
             fallback,
-            table: RwLock::new(Arc::new(VhostTable::new(vhosts.clone(), default))),
+            table: RwLock::new(table),
             sources: Mutex::new(SourceState {
                 main_entries,
                 main_vhosts: Some(vhosts),
@@ -1441,7 +1473,7 @@ impl Router {
             access_log: global_access_log,
             error_log: global_error_log,
             https_port: AtomicU16::new(0),
-            traffic: crate::traffic::Traffic::default(),
+            traffic,
             #[cfg(feature = "acme")]
             acme: None,
         })
@@ -1531,11 +1563,9 @@ impl Router {
             .and_then(|host| Self::select_vhost(&table, host))
             .or(table.default);
         let vhost = selected.map(|index| &table.vhosts[index]);
-        let traffic = self.traffic.start(
-            vhost
-                .and_then(|vhost| vhost.names.first())
-                .map(String::as_str),
-        );
+        let traffic = self
+            .traffic
+            .start_with(selected.and_then(|index| table.traffic_counters(index)));
         let server_name = vhost
             .and_then(|vhost| vhost.names.first())
             .cloned()

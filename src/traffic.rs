@@ -1,11 +1,10 @@
 //! Process-lifetime traffic counters for the whole server and each virtual host.
 //!
-//! Counters are keyed by a vhost's primary name rather than stored on the
-//! vhost itself, so they survive configuration reloads. Only configured names
-//! are used as keys, which keeps the map bounded by the configuration.
+//! Counters are keyed by a vhost's primary name so they survive configuration
+//! reloads. Tables cache each counter, keeping requests off the map lock.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -64,11 +63,17 @@ pub(crate) struct RequestTraffic {
 
 impl Traffic {
     /// Records the start of a request routed to `vhost` (if any).
+    #[cfg(test)]
     pub(crate) fn start(&self, vhost: Option<&str>) -> RequestTraffic {
-        let vhost = vhost.map(|name| {
-            let mut vhosts = self.vhosts.lock().unwrap_or_else(|e| e.into_inner());
-            Arc::clone(vhosts.entry(name.to_owned()).or_default())
-        });
+        self.start_with(vhost.map(|name| self.counters(name)))
+    }
+
+    pub(crate) fn counters(&self, name: &str) -> Arc<Counters> {
+        let mut vhosts = self.vhosts.lock().unwrap_or_else(|e| e.into_inner());
+        Arc::clone(vhosts.entry(name.to_owned()).or_default())
+    }
+
+    pub(crate) fn start_with(&self, vhost: Option<Arc<Counters>>) -> RequestTraffic {
         let traffic = RequestTraffic {
             total: Arc::clone(&self.total),
             vhost,
@@ -78,7 +83,13 @@ impl Traffic {
     }
 
     pub(crate) fn snapshot(&self) -> serde_json::Value {
-        let vhosts = self.vhosts.lock().unwrap_or_else(|e| e.into_inner());
+        let vhosts = self
+            .vhosts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(name, counters)| (name.clone(), Arc::clone(counters)))
+            .collect::<Vec<_>>();
         serde_json::json!({
             "total": self.total.json(),
             "vhosts": vhosts
@@ -86,6 +97,13 @@ impl Traffic {
                 .map(|(name, counters)| (name.clone(), counters.json()))
                 .collect::<serde_json::Map<_, _>>(),
         })
+    }
+
+    pub(crate) fn retain(&self, names: &HashSet<&str>) {
+        self.vhosts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|name, _| names.contains(name.as_str()));
     }
 }
 
@@ -217,5 +235,21 @@ mod tests {
         assert_eq!(vhost["bot_blocks"], 1);
         assert_eq!(vhost["bot_logged"], 1);
         assert_eq!(vhost["bytes_out"], 5);
+    }
+
+    #[test]
+    fn cached_counters_are_shared_and_removed_vhosts_are_pruned() {
+        let traffic = Traffic::default();
+        let cached = traffic.counters("retained.example");
+        traffic.start_with(Some(Arc::clone(&cached)));
+        assert!(Arc::ptr_eq(&cached, &traffic.counters("retained.example")));
+
+        let retired = traffic.counters("retired.example");
+        traffic.start_with(Some(retired));
+        traffic.retain(&HashSet::from(["retained.example"]));
+
+        let snapshot = traffic.snapshot();
+        assert!(snapshot["vhosts"].get("retained.example").is_some());
+        assert!(snapshot["vhosts"].get("retired.example").is_none());
     }
 }
