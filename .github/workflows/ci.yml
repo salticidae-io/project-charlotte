@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - main
+    tags:
+      - "v*"
   pull_request:
   workflow_dispatch:
     inputs:
@@ -108,6 +110,47 @@ jobs:
       - name: Run root-only tests
         working-directory: project-charlotte
         run: sudo -E env "PATH=$PATH" "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" cargo nextest run --locked --profile ci --run-ignored only
+
+  distro-tests:
+    name: Tests (${{ matrix.distro.name }})
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ matrix.distro.image }}
+      options: --init
+    strategy:
+      fail-fast: false
+      matrix:
+        distro:
+          - name: Ubuntu 24.04
+            image: ubuntu:noble
+          - name: Ubuntu 26.04
+            image: ubuntu:resolute
+          - name: Debian 12
+            image: debian:bookworm
+          - name: Debian 13
+            image: debian:trixie
+          - name: CentOS Stream 9
+            image: quay.io/centos/centos:stream9
+    steps:
+      - name: Check out project-charlotte
+        uses: actions/checkout@v4
+        with:
+          path: project-charlotte
+
+      - name: Check out modsecurity-rs
+        uses: actions/checkout@v4
+        with:
+          repository: fzylogic/modsecurity-rs
+          token: ${{ secrets.MODSECURITY_RS_TOKEN || github.token }}
+          path: modsecurity-rs
+
+      - name: Install system dependencies
+        working-directory: project-charlotte
+        run: bash scripts/ci-distro.sh deps
+
+      - name: Run tests as an unprivileged user
+        working-directory: project-charlotte
+        run: bash scripts/ci-distro.sh test
 
   coverage:
     name: Test coverage
@@ -277,6 +320,8 @@ jobs:
       - coverage
       - features
       - bench
+      - distro-tests
+      - fuzz
     runs-on: ubuntu-24.04
     steps:
       - name: Require all validation jobs to succeed
@@ -286,17 +331,49 @@ jobs:
           COVERAGE_RESULT: ${{ needs.coverage.result }}
           FEATURES_RESULT: ${{ needs.features.result }}
           BENCH_RESULT: ${{ needs.bench.result }}
+          DISTRO_TESTS_RESULT: ${{ needs.distro-tests.result }}
+          FUZZ_RESULT: ${{ needs.fuzz.result }}
         run: |
           echo "Tests: $TEST_RESULT"
           echo "Privileged tests: $ROOT_TEST_RESULT"
           echo "Coverage: $COVERAGE_RESULT"
           echo "Feature combinations: $FEATURES_RESULT"
           echo "Benchmarks: $BENCH_RESULT"
+          echo "Distro tests: $DISTRO_TESTS_RESULT"
+          echo "Fuzzing: $FUZZ_RESULT"
           test "$TEST_RESULT" = success
           test "$ROOT_TEST_RESULT" = success
           test "$COVERAGE_RESULT" = success
           test "$FEATURES_RESULT" = success
           test "$BENCH_RESULT" = success
+          test "$DISTRO_TESTS_RESULT" = success
+          test "$FUZZ_RESULT" = success
+
+  packages:
+    if: github.event_name != 'schedule' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    needs: required
+    uses: ./.github/workflows/packages.yml
+    secrets: inherit
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: packages
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download packages
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Attach packages to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.deb
+            dist/*.rpm
 
   fuzz:
     name: Fuzz targets

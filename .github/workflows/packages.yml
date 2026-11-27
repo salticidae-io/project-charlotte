@@ -1,0 +1,145 @@
+name: Packages
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  deb:
+    name: Build ${{ matrix.variant.package }} .deb (${{ matrix.distro.codename }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    container:
+      image: ${{ matrix.distro.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        distro:
+          - name: Ubuntu 24.04
+            image: ubuntu:noble
+            codename: noble
+          - name: Ubuntu 26.04
+            image: ubuntu:resolute
+            codename: resolute
+          - name: Debian 12
+            image: debian:bookworm
+            codename: bookworm
+          - name: Debian 13
+            image: debian:trixie
+            codename: trixie
+        variant:
+          - package: project-charlotte
+            args: ""
+            features: acme, hosting, http3, proxy, swarm
+          - package: project-charlotte-proxy
+            args: --variant proxy
+            features: acme, http3, proxy
+    steps:
+      - name: Check out project-charlotte
+        uses: actions/checkout@v4
+        with:
+          path: project-charlotte
+
+      - name: Check out modsecurity-rs
+        uses: actions/checkout@v4
+        with:
+          repository: fzylogic/modsecurity-rs
+          token: ${{ secrets.MODSECURITY_RS_TOKEN || github.token }}
+          path: modsecurity-rs
+
+      - name: Install build dependencies
+        working-directory: project-charlotte
+        run: bash scripts/ci-distro.sh deps
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb --locked
+
+      - name: Build Debian package
+        working-directory: project-charlotte
+        run: cargo deb ${{ matrix.variant.args }} --deb-revision "1~${{ matrix.distro.codename }}" -- --locked
+
+      - name: Check package name and compiled features
+        working-directory: project-charlotte
+        run: |
+          test "$(dpkg-deb --field target/debian/*.deb Package)" = "${{ matrix.variant.package }}"
+          target/release/project-charlotte --help |
+            grep -Fx "Compiled features: ${{ matrix.variant.features }}"
+
+      - name: Upload Debian package
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.variant.package }}-${{ matrix.distro.codename }}-deb
+          path: project-charlotte/target/debian/*.deb
+          if-no-files-found: error
+          retention-days: 14
+
+  rpm:
+    name: Build ${{ matrix.variant.package }} .rpm (CentOS Stream 9)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    container:
+      image: quay.io/centos/centos:stream9
+    strategy:
+      fail-fast: false
+      matrix:
+        variant:
+          - package: project-charlotte
+            build_args: ""
+            rpm_args: ""
+            features: acme, hosting, http3, proxy, swarm
+          - package: project-charlotte-proxy
+            build_args: --no-default-features --features acme,http3,proxy
+            rpm_args: --variant proxy
+            features: acme, http3, proxy
+    steps:
+      - name: Check out project-charlotte
+        uses: actions/checkout@v4
+        with:
+          path: project-charlotte
+
+      - name: Check out modsecurity-rs
+        uses: actions/checkout@v4
+        with:
+          repository: fzylogic/modsecurity-rs
+          token: ${{ secrets.MODSECURITY_RS_TOKEN || github.token }}
+          path: modsecurity-rs
+
+      - name: Install build dependencies
+        working-directory: project-charlotte
+        run: bash scripts/ci-distro.sh deps
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-generate-rpm
+        run: cargo install cargo-generate-rpm --locked
+
+      - name: Build release binary
+        working-directory: project-charlotte
+        run: cargo build --release --locked ${{ matrix.variant.build_args }}
+
+      - name: Build RPM
+        working-directory: project-charlotte
+        run: cargo generate-rpm ${{ matrix.variant.rpm_args }}
+
+      - name: Check package name and compiled features
+        working-directory: project-charlotte
+        run: |
+          set -- target/generate-rpm/*.rpm
+          test "$#" -eq 1
+          test "$(rpm -qp --qf '%{NAME}' "$1")" = "${{ matrix.variant.package }}"
+          target/release/project-charlotte --help |
+            grep -Fx "Compiled features: ${{ matrix.variant.features }}"
+
+      - name: Upload RPM package
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.variant.package }}-stream9-rpm
+          path: project-charlotte/target/generate-rpm/*.rpm
+          if-no-files-found: error
+          retention-days: 14

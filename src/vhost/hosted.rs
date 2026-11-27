@@ -1134,7 +1134,15 @@ mod tests {
         worker.reap_idle(timeout).await;
 
         assert!(!worker.process_is_running().await);
-        assert!(!PathBuf::from(format!("/proc/{pid}")).exists());
+        // The worker is stopped on a blocking task (SIGTERM, a grace period,
+        // then SIGKILL), so its pid disappears asynchronously.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while PathBuf::from(format!("/proc/{pid}")).exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("idle worker child should be reaped");
     }
 
     #[tokio::test]
